@@ -1,4 +1,4 @@
-# The StrikeEdge access gate
+# The GTS Algo Research access gate
 
 A single **site passcode** gates the whole application. This document is the
 contract for how that gate works, what it protects, and — just as importantly —
@@ -130,7 +130,7 @@ data-leak. A foreign origin receives no ACAO header at all.
 ## Roles
 
 `getOperatorRole` returns `"full"` for a valid session and `null` otherwise. The
-type keeps CalSpread's two-role shape (`"full" | "trade" | null`) so
+type keeps the predecessor codebase's two-role shape (`"full" | "trade" | null`) so
 `src/box/routes.ts` ports with a one-line import change, but the passcode gate
 only ever mints `"full"`.
 
@@ -165,6 +165,6 @@ bounded, secret-free form is logged server-side only.
 | `FRONTEND_URL` | the single exact CORS origin |
 
 `SITE_ACCESS_SECRET` is deliberately distinct from every broker/token secret
-(`KITE_TOKEN_BROKER_PASSCODE`, `DHAN_TOKEN_BROKER_PASSCODE`, the CalSpread
+(`KITE_TOKEN_BROKER_PASSCODE`, `DHAN_TOKEN_BROKER_PASSCODE`, the external CalSpread
 `TOKEN_ROUTE_SECRET`, `KITE_API_SECRET`, any broker access token) and is never
 reused for them.

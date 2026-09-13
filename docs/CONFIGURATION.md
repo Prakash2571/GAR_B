@@ -1,6 +1,6 @@
-# StrikeEdge configuration
+# GTS Algo Research configuration
 
-Every variable StrikeEdge reads, grouped by concern. Defaults are the code
+Every variable GTS Algo Research reads, grouped by concern. Defaults are the code
 fallbacks (from `src/config.ts`, `src/box/config.ts`, `src/pg/pool.ts`,
 `src/outbox/mongo.ts`, `src/brokers/*`). Configuration is validated at boot and
 **fails closed** with the full list of problems.
@@ -56,7 +56,7 @@ they are what is running.
 | --- | --- | --- | --- | --- |
 | `SITE_ACCESS_SECRET` | — | yes | The site passcode, hashed into a session. **Arms nothing** — UI access only. | Unset ⇒ nobody can pass the access gate. |
 | `SITE_SESSION_TTL_HOURS` | `24` | no | Session lifetime (hours). | Outside `0 < h <= 720` fails boot. |
-| `SESSION_COOKIE_NAME` | `strikedge_session` | no | HttpOnly session cookie name. | Illegal chars fail boot. |
+| `SESSION_COOKIE_NAME` | `gts_session` | no | HttpOnly session cookie name. | Illegal chars fail boot. |
 | `CSRF_ALLOWED_ORIGIN` | `FRONTEND_URL` | no | Origin required on mutating requests. | Non-absolute origin fails boot. |
 
 ## PostgreSQL (`src/pg/pool.ts`, `src/config.ts`)
@@ -68,7 +68,7 @@ they are what is running.
 | `PG_STATEMENT_TIMEOUT_MS` | `5000` | no | Per-statement timeout applied on connect. | Too low ⇒ legitimate statements abort; too high ⇒ a wedged statement can stall the execution path. |
 | `PG_LOCK_TIMEOUT_MS` | `2000` | no | Lock-acquisition timeout. | Too high ⇒ contention stalls. |
 | `PG_MIGRATE_ON_BOOT` | `true` | no | Apply migrations at boot vs assert-only. | `false` ⇒ boot refuses if schema is behind (run `npm run migrate`). |
-| `PG_APPLICATION_NAME` | `strikedge` | no | `application_name` in `pg_stat_activity`. | Cosmetic. |
+| `PG_APPLICATION_NAME` | `gts` | no | `application_name` in `pg_stat_activity`. | Cosmetic. |
 
 ## Token encryption (`src/brokerState/tokenCrypto.ts`)
 
@@ -80,8 +80,8 @@ they are what is running.
 
 | Variable | Default | Req? | What it does | If wrong |
 | --- | --- | --- | --- | --- |
-| `KITE_TOKEN_BROKER_URL` | `https://calspread.online/api/kite/token` | no | CalSpread's Zerodha token endpoint. | Wrong URL ⇒ token fetch fails; no Zerodha trading. |
-| `KITE_TOKEN_BROKER_PASSCODE` | — | yes (Zerodha) | Shared passcode for CalSpread token routes. | Unset/wrong ⇒ token fetch rejected. |
+| `KITE_TOKEN_BROKER_URL` | `https://calspread.online/api/kite/token` | no | the external CalSpread Zerodha token endpoint. | Wrong URL ⇒ token fetch fails; no Zerodha trading. |
+| `KITE_TOKEN_BROKER_PASSCODE` | — | yes (Zerodha) | Shared passcode for the external CalSpread token routes. | Unset/wrong ⇒ token fetch rejected. |
 | `KITE_API_KEY` | — | yes (Zerodha-live) | Zerodha API key used by the live order adapter (`src/brokers/zerodha/liveAdapter.ts`). Distinct from `KITE_API_KEY_EXPECTED`. | Unset ⇒ Zerodha live execution throws "KITE_API_KEY is missing" and refuses to go live. |
 | `KITE_API_KEY_EXPECTED` | — | prod | If set, fetched token's api_key must equal this. | Mismatch ⇒ token rejected as foreign (a safety feature). |
 
@@ -89,7 +89,7 @@ they are what is running.
 
 | Variable | Default | Req? | What it does | If wrong |
 | --- | --- | --- | --- | --- |
-| `DHAN_TOKEN_URL` | `https://calspread.online/api/dhan/token` | no | CalSpread's Dhan token endpoint. | Wrong URL ⇒ no Dhan trading. |
+| `DHAN_TOKEN_URL` | `https://calspread.online/api/dhan/token` | no | the external CalSpread Dhan token endpoint. | Wrong URL ⇒ no Dhan trading. |
 | `DHAN_TOKEN_BROKER_PASSCODE` | — | yes (Dhan) | Shared passcode for the Dhan token route. | Unset/wrong ⇒ token fetch rejected. |
 | `DHAN_API_KEY` | — | yes (Dhan-live) | Dhan app API key. Read by `readDhanCredentials()` and required for Dhan live readiness. | Unset ⇒ Dhan reports "not configured"; Dhan live is blocked. |
 | `DHAN_API_SECRET` | — | yes (Dhan-live) | Dhan app secret. Same credential check as above; never leaves the server. | Unset ⇒ Dhan "not configured"; Dhan live blocked. |
@@ -100,7 +100,7 @@ they are what is running.
 | Variable | Default | Req? | What it does | If wrong |
 | --- | --- | --- | --- | --- |
 | `BROKER_TOKEN_POLL_START` | `09:00` | no | IST HH:MM the morning poll starts. | Bad format ⇒ falls back to default. |
-| `BROKER_TOKEN_POLL_INTERVAL_MS` | `60000` | no | Re-poll interval until a token is obtained. | Too small ⇒ hammers CalSpread. |
+| `BROKER_TOKEN_POLL_INTERVAL_MS` | `60000` | no | Re-poll interval until a token is obtained. | Too small ⇒ hammers the external CalSpread provider. |
 | `BROKER_TOKEN_REQUEST_TIMEOUT_MS` | `10000` | no | Per-request token-fetch timeout. | Too low ⇒ spurious failures on a slow morning. |
 
 ## Broker selection (`src/brokers/registry.ts`, `src/brokerRoutes.ts`)
@@ -204,9 +204,17 @@ default (`0.15`) differs from the Dhan card default (`0.1`).**
 `CALSPREAD_DEPLOYMENT_ID` and `CALSPREAD_INSTANCE_ID` are read by the **reservation
 layer** — these are the actual names the code reads (`identity.ts` resolves the
 lock namespace from `CALSPREAD_DEPLOYMENT_ID`, falling back to `NODE_ENV`, and the
-instance label from `CALSPREAD_INSTANCE_ID`, falling back to the hostname). They
-retain the `CALSPREAD_` prefix on purpose: the durable owner-id format is
-unchanged from CalSpread so a mixed fleet reads the same keys.
+instance label from `CALSPREAD_INSTANCE_ID`, falling back to the hostname).
+
+> **These two names were deliberately NOT renamed in the GTS Algo Research rebrand.**
+> They are compatibility-sensitive. `CALSPREAD_DEPLOYMENT_ID` is the namespace
+> component of the **durable owner id** written into the PostgreSQL reservation
+> rows, and owner-verified release compares that id byte-for-byte. Renaming the
+> variable would make a restarted process resolve a *different* namespace: it would
+> no longer recognise its own outstanding reservations, and could release or
+> "renew" a lease it does not own. That is a multi-process safety mechanism, not a
+> label — so the prefix stays, the durable owner-id format stays unchanged, and a
+> mixed fleet keeps reading the same keys. Set the values; do not rename the keys.
 
 | Variable | Default | Req? | What it does | If wrong |
 | --- | --- | --- | --- | --- |
@@ -262,26 +270,45 @@ validates and clamps each one and fails closed. The full annotated list lives in
 
 ---
 
-## CalSpread variables that were REMOVED
+## Identifiers the GTS Algo Research rebrand deliberately did NOT rename
 
-StrikeEdge deliberately **does not read** the following CalSpread variables. They
+Renaming an identifier that something durable depends on is how a rebrand turns into an
+outage. These were audited individually and **left alone on purpose**:
+
+| Identifier | Where | Why it must not change |
+| --- | --- | --- |
+| `CALSPREAD_DEPLOYMENT_ID`, `CALSPREAD_INSTANCE_ID` | env vars, `src/box/reservations/identity.ts` | Namespace components of the **durable owner id** in the PostgreSQL reservation rows. Owner-verified release compares that id byte-for-byte, so a rename makes a restarted process stop recognising its own leases. See §Reservation identity. |
+| `migrations/*.sql` (contents, **including comments**) | `src/pg/migrate.ts` | Each applied migration's **sha256 is recorded** in `schema_migrations`, and editing an applied file is a HARD BOOT ERROR ("Migration … was modified after it was applied"). Even a comment edit changes the hash and would refuse to start the process. The historical terminology in those comments therefore stays. |
+| PostgreSQL role / database name (`DATABASE_URL`) | deployment | Names a live database holding every order intent, reservation, trade and session. Renaming it is a migration with downtime, not a rebrand. |
+| MongoDB reporting-replica database name (`MONGO_EXPORT_DB` fallback) | `src/outbox/mongo.ts` | Names a live database holding the reporting replica. A change would silently start writing into a new empty database while the populated one went stale. |
+| `calspread:box:pnl:day:*` | `src/box/pnlCache.ts` | The durable day-key prefix already written by earlier deployments. A rename orphans archived P&L days instead of failing loudly. |
+| `strikedge-access-breadcrumb` | `src/access/sessionStore.ts` | Part of a hash input. Changing it changes every digest, so breadcrumbs already stored no longer correlate with new ones. |
+| `strikedge-<group>-<leg>` | `src/boxSupport.ts` | A correlation token inside one charge-pricing round trip, matched byte-for-byte against the broker response. On the charge-pricing path, which the rebrand does not touch. |
+| `calspread.online` token routes | `KITE_TOKEN_BROKER_URL`, `DHAN_TOKEN_URL` | A **real external third-party service** this backend is a client of. Renaming it would be factually wrong and would break token acquisition. |
+| `/api/box/*`, `/api/access/*`, `/api/broker/*` | HTTP surface | Stable API contract. There is no benefit to changing a working path for branding. |
+
+---
+
+## Predecessor variables that were REMOVED
+
+This backend deliberately **does not read** the following predecessor variables. They
 belong to features that were left behind in the extraction, so shipping them in
 `.env.example` would be a lie about what the process does. If any appear in a
 copied `.env`, they are silently ignored.
 
 | Removed variable(s) | Why it is gone |
 | --- | --- |
-| `KITE_API_SECRET` | StrikeEdge performs no Zerodha OAuth; it fetches a ready token from CalSpread. No secret is exchanged. |
+| `KITE_API_SECRET` | This backend performs no Zerodha OAuth; it fetches a ready token from the external CalSpread provider. No secret is exchanged. |
 | `ADMIN_SECRET` | The full-admin login is replaced by the site passcode session (`SITE_ACCESS_SECRET`) plus the runtime arming controls. |
 | `ACCESS_SECRET` | The separate trade-access password is replaced by the single site passcode. |
 | `INTERNAL_TOKEN_SECRET` | The `/api/internal/kite-token` route that fed a separate market-data recorder is gone. |
-| `TOKEN_ROUTE_SECRET` | StrikeEdge does not host token routes; it is a **client** of CalSpread's, using `KITE_TOKEN_BROKER_PASSCODE` / `DHAN_TOKEN_BROKER_PASSCODE`. |
+| `TOKEN_ROUTE_SECRET` | This backend does not host token routes; it is a **client** of the external CalSpread routes, using `KITE_TOKEN_BROKER_PASSCODE` / `DHAN_TOKEN_BROKER_PASSCODE`. |
 | `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` | Upstash Redis is removed entirely; the P&L and closed-trade caches are PostgreSQL-backed. |
 | `TRADE_LOG_URI` | The calendar-spread ledger is out of scope. |
 | `NSE_FNO_ARCHIVE_URI`, `NSE_FNO_CURRENT_URI`, `NSE_FNO_SPREAD_URI` | Historical F&O capture / spread computation are calendar-scanner features, not Box. |
 | `EXTRA_SESSION_DAYS` | Only the intraday capture (removed) consumed the special-session list. |
 | `BOX_MONGODB_URI` | Mongo is no longer the operational store; PostgreSQL (`DATABASE_URL`) is. Mongo is reporting-only via `MONGODB_URI`. |
-| `DHAN_REDIRECT_URL`, `DHAN_POSTBACK_URL` | Read only by the disabled Dhan OAuth consent flow (`src/brokers/dhan/auth.ts`), which StrikeEdge never invokes. Setting them does nothing. |
+| `DHAN_REDIRECT_URL`, `DHAN_POSTBACK_URL` | Read only by the disabled Dhan OAuth consent flow (`src/brokers/dhan/auth.ts`), which this backend never invokes. Setting them does nothing. |
 
 > **Correction (2026-09 audit).** `DHAN_API_KEY` and `DHAN_API_SECRET` are NOT
 > inert. `readDhanCredentials()` (`src/brokers/dhan/auth.ts`) reads
@@ -290,7 +317,7 @@ copied `.env`, they are silently ignored.
 > are unset, Dhan reports **"not configured"** and Dhan **live readiness is
 > blocked** (`dhan_configured=false`). Only the browser *consent* flow
 > (`generateDhanConsent` / `consumeDhanConsent`) is disabled — the token itself
-> still comes from CalSpread's Dhan route. So these two are required for Dhan
+> still comes from the external CalSpread Dhan route. So these two are required for Dhan
 > live; they are documented in the Dhan section, not here. `DHAN_REDIRECT_URL` /
 > `DHAN_POSTBACK_URL` are the only genuinely inert ones (consent-flow only).
 

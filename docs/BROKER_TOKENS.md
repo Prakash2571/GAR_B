@@ -1,7 +1,7 @@
 # Broker token acquisition, storage and the active-broker record
 
-StrikeEdge never performs its own broker OAuth. Both access tokens are fetched from
-CalSpread, validated hard, encrypted with AES-256-GCM and stored in PostgreSQL. Only
+This backend never performs its own broker OAuth. Both access tokens are fetched from
+the external CalSpread token provider, validated hard, encrypted with AES-256-GCM and stored in PostgreSQL. Only
 one broker is ever *active*; the other may hold a valid standby token but opens no
 socket. This document is the contract for the modules under `src/tokens/*`,
 `src/brokerState/*`, migrations `005`–`006` and the ported `ActiveBrokerManager`.
@@ -11,10 +11,10 @@ socket. This document is the contract for the modules under `src/tokens/*`,
 | Variable | Meaning | Default |
 | --- | --- | --- |
 | `APP_TIMEZONE` | Must be `Asia/Kolkata`; every day/time decision is an IST decision | `Asia/Kolkata` |
-| `KITE_TOKEN_BROKER_URL` | CalSpread Zerodha token route | `https://calspread.online/api/kite/token` |
+| `KITE_TOKEN_BROKER_URL` | External CalSpread Zerodha token route | `https://calspread.online/api/kite/token` |
 | `KITE_TOKEN_BROKER_PASSCODE` | Passcode for the Zerodha route (own variable) | — |
 | `KITE_API_KEY_EXPECTED` | If set, the returned `api_key` must equal it | — |
-| `DHAN_TOKEN_URL` | CalSpread Dhan token route | `https://calspread.online/api/dhan/token` |
+| `DHAN_TOKEN_URL` | External CalSpread Dhan token route | `https://calspread.online/api/dhan/token` |
 | `DHAN_TOKEN_BROKER_PASSCODE` | Passcode for the Dhan route (own variable) | — |
 | `DHAN_CLIENT_ID_EXPECTED` | If set, the returned `client_id` must equal it | — |
 | `BROKER_TOKEN_POLL_START` | IST time to begin each morning's acquisition | `09:00` |
@@ -111,7 +111,7 @@ separate. Columns: `encrypted_access_token`, `encryption_iv`,
   never silently returns "no session" and never returns a wrong token.
 - `brokerSessions.ts` exports `loadDhanSession`, `saveDhanSession`,
   `clearDhanSession`, `loadActiveBroker`, `saveActiveBroker` (plus the Zerodha
-  equivalents) with the CalSpread signatures, so `ActiveBrokerManager` is ported by
+  equivalents) with the predecessor codebase's signatures, so `ActiveBrokerManager` is ported by
   changing a single import line from `../db.js` to
   `../brokerState/brokerSessions.js`.
 

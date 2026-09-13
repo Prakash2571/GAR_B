@@ -1,6 +1,6 @@
 # Dead-surface audit — "a claim that nothing verifies"
 
-Auditor pass over the pushed StrikeEdge backend (`Strikedge_B`) hunting the defect class
+Auditor pass over the pushed GTS Algo Research backend (`GTSAlgoResearch_B`) hunting the defect class
 that produced the two known bugs (the frontend contract drift where every field was
 optional, and the Dhan token persisted-but-never-loaded): a surface — a symbol, a status
 field, a projected field, an error message — that the 1,613-test green suite never checks,
@@ -42,11 +42,11 @@ No suite regressed. The +7 is the new `tests/pg/outboxPayloadContract.test.mjs`.
 
 ### DELETED — `dhanLoginUrl` (`src/brokers/dhan/auth.ts`)
 
-- **Where it came from.** CalSpread's Dhan browser-consent OAuth flow. There it was called
+- **Where it came from.** the predecessor codebase's Dhan browser-consent OAuth flow. There it was called
   once, by `generateDhanConsent` (`.../dhan/auth.ts:171` in the read-only source), which
   returned `{ consentAppId, loginUrl: dhanLoginUrl(consentAppId) }`.
-- **Why it is dead now.** StrikeEdge neutralised the consent flow: `generateDhanConsent` is a
-  throwing stub ("Dhan consent login is disabled in StrikeEdge…"). With its only caller
+- **Why it is dead now.** This backend neutralised the consent flow: `generateDhanConsent` is a
+  throwing stub ("Dhan consent login is disabled in this backend…"). With its only caller
   neutralised, `dhanLoginUrl` had **zero references** anywhere in `src/**` or `tests/**`
   (verified by whole-tree token search). This is exactly the category "functions kept alive
   only by a neutralised OAuth stub."
@@ -63,7 +63,7 @@ No suite regressed. The +7 is the new `tests/pg/outboxPayloadContract.test.mjs`.
 ### KEPT — frozen repository surface (Seam 1)
 
 `INTERNAL_SEAMS.md` Seam 1 declares `src/box/repository.ts`'s exported names/signatures
-**frozen** — they are the CalSpread surface the 1,488 ported unit tests are written against.
+**frozen** — they are the predecessor codebase's surface the 1,488 ported unit tests are written against.
 The following are currently unreferenced by `src/**`/`tests/**` but must stay:
 
 | Symbol | Why kept |
@@ -95,7 +95,7 @@ helpers, or narrow module surfaces. Recorded as candidates rather than removed:
 | `isCheckViolation`, `isRetryableTxError` | `pg/pool.ts` | PostgreSQL error-classification helpers; natural pool surface. |
 | `createDisabledTimingRecorder` | `box/executionTiming.ts` | Disabled-recorder factory paired with the enabled one. |
 | `zerodhaOnlyLiveAdapterFactory` | `brokers/zerodha/liveAdapter.ts` | Broker adapter factory surface. |
-| `historicalQueueDepth` | `kite.ts` | Kite historical-charts diagnostic; StrikeEdge does not ship history. |
+| `historicalQueueDepth` | `kite.ts` | Kite historical-charts diagnostic; this backend does not ship history. |
 | `buildChargeLegsFromEvaluations`, `sameChargeLegs` | `box/charges.ts` | Charge-leg helpers. |
 | `keysEqual` | `brokerState/tokenCrypto.ts` | Constant-time key compare. |
 | `isIstWeekend` | `tokens/istClock.ts`, `isExpiryToday` `box/instruments.ts`, `isFeedUsable` `brokers/feedHealth.ts`, `laneLabel` `brokers/marketDataLane.ts`, `isPaperExecutionMode` `box/types.ts` | Small pure predicates. |
@@ -127,7 +127,7 @@ honestly. **But the config comment is a stale claim (see Section D / note below)
   which tracks the ACTIVE broker's auth. ✓
 - `hub_subscribed` / `hub_connected` = `brokerManager.subscribedCount()` /
   `feedConnected()` (`index.ts:283–284`). These map to the active broker's real feed state —
-  **not** a stranded constant from the removed CalSpread SSE hub. ✓
+  **not** a stranded constant from the removed the predecessor codebase SSE hub. ✓
 
 No misleading always-constant status field was found in the sampled extraction-affected
 fields (redis/mongo/hub/analytics/calendar/subscriptions/market-data-session names).
@@ -198,10 +198,10 @@ nothing verified. It is **pinned** by the last test in `outboxPayloadContract.te
 proves a daily-P&L archive write produces **zero** `box_daily_pnl` outbox rows.
 
 **Not "fixed" by adding a projection**, deliberately: whether daily P&L *should* reach the
-Mongo reporting replica in StrikeEdge (where PostgreSQL is authoritative and holds the durable
+Mongo reporting replica in this backend (where PostgreSQL is authoritative and holds the durable
 `box_daily_pnl` archive + day-proof) is a product decision for the module owners, not an
 auditor's unilateral behaviour change. The config comment (`config.ts`) additionally describes
-a CalSpread-era Redis-mirror-then-nightly-Mongo-drain flow that no longer exists (Redis
+a predecessor-era Redis-mirror-then-nightly-Mongo-drain flow that no longer exists (Redis
 removed); it is a stale claim. `config.ts` is owned by this agent's editable surface, but the
 correct remedy (project daily_pnl, or drop it from the allow-list/doc/config claim) is a
 decision, not a mechanical fix — flagged here for an explicit follow-up.
@@ -214,19 +214,19 @@ decision, not a mechanical fix — flagged here for an explicit follow-up.
 
 - **The bug.** `authHeader()` threw, on any unauthenticated Kite API call:
   `"Not authenticated. Complete the Zerodha login flow first (/login)."`
-- **Why it cannot work.** StrikeEdge removed the Zerodha OAuth login entirely
+- **Why it cannot work.** GTS Algo Research removed the Zerodha OAuth login entirely
   (`index.ts:7`: "the Zerodha OAuth login … is gone"); there is **no `/login` route**
   (verified: zero matches for a `/login` handler in `src/**`). The token is provisioned by
-  the CalSpread token acquisition service and installed via `installProvidedToken`. The
+  the external CalSpread token acquisition service and installed via `installProvidedToken`. The
   message sent an operator to a flow that does not exist — the exact sibling of the fixed
   "set MONGODB_URI when PostgreSQL was the real cause" scanner-start bug. `generateSession`
   right beside it was correctly updated at extraction; `authHeader` was missed.
-- **Provenance.** Confirmed the string is copied unchanged from CalSpread
+- **Provenance.** Confirmed the string is copied unchanged from the predecessor codebase
   (`Cal_Spread_Backend/src/kite.ts:469`), where `/login` was a real route
-  (`KITE_LOGIN_ROOT = https://kite.zerodha.com/connect/login`). No StrikeEdge test pins the
+  (`KITE_LOGIN_ROOT = https://kite.zerodha.com/connect/login`). No GTS Algo Research test pins the
   string.
 - **Fix.** Rewrote the message to state the real cause and the real remedy: the token is
-  installed by the token acquisition service, StrikeEdge has no interactive login flow, and
+  installed by the token acquisition service, this backend has no interactive login flow, and
   the operator should watch `GET /api/runtime/status`. HTTP status unchanged (401).
 
 ### JUDGED CLEAN — no second-error-while-handling-first, other subsystem strings are honest
@@ -234,7 +234,7 @@ decision, not a mechanical fix — flagged here for an explicit follow-up.
 - Scanner-start refusals (`engine.ts:1382`): the PostgreSQL-not-Mongo message is already the
   fixed version, pinned by `tests/box/scannerStartRefusals.test.mjs`. ✓
 - `generateSession` (`kite.ts`) / `generateDhanConsent` + `consumeDhanConsent`
-  (`brokers/dhan/auth.ts`): throwing stubs whose messages correctly name the CalSpread token
+  (`brokers/dhan/auth.ts`): throwing stubs whose messages correctly name the external CalSpread token
   provider as the source of truth. ✓
 - The many Redis/Mongo mentions in `box/pnlCache.ts`, `box/closedCache.ts`, `box/config.ts`,
   `box/engine.ts` comments are **doc comments describing the removal**, not user-facing error

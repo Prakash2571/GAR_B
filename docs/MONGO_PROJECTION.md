@@ -1,10 +1,10 @@
 # MongoDB projection (the async reporting replica)
 
-StrikeEdge's authoritative operational store is PostgreSQL. MongoDB Atlas is an
+this backend's authoritative operational store is PostgreSQL. MongoDB Atlas is an
 **async reporting replica**, fed by a transactional outbox. It is never on the
 execution hot path, never awaited before a broker POST, and never consulted to
 decide whether an order may be submitted. If Atlas is down, misconfigured, or
-disabled, StrikeEdge keeps trading — only the reporting replica falls behind.
+disabled, GTS Algo Research keeps trading — only the reporting replica falls behind.
 
 ## The two halves
 

@@ -7,7 +7,7 @@ backend response-shape change **fail CI** instead of silently going stale.
 ## Why this exists
 
 The frontend's contract tests used to rely on **manually captured JSON fixtures**
-(`Strikedge_F tests/fixtures/*.json`). Those drift silently: the backend changes a
+(`GTSAlgoResearch_F tests/fixtures/*.json`). Those drift silently: the backend changes a
 field, the frontend fixture keeps the old shape, and **both repos keep passing
 independently** while production is broken. This contract closes that gap
 mechanically:
@@ -89,7 +89,7 @@ version-bump procedure below.
 
 When you change an API response shape, do this **in order**:
 
-1. **Change the backend serializer / route.** Make the code change in `Strikedge_B`
+1. **Change the backend serializer / route.** Make the code change in `GTSAlgoResearch_B`
    (`src/box/serialize.ts`, `src/box/engine.ts`, `src/runtime/statusRoutes.ts`,
    `src/brokerRoutes.ts`, `src/access/routes.ts`, `src/box/routes.ts`, …).
 2. **Update the schema.** Edit the matching `contract/schemas/*.schema.json` so it
@@ -105,9 +105,9 @@ When you change an API response shape, do this **in order**:
    `npm run test:contract` — this validates the **real** new responses against the
    updated schemas and runs the negative controls. Fix until green.
 6. **Copy `contract/` into the frontend and update the pinned SHA + digest.** In
-   `Strikedge_F`, replace its vendored copy of this directory and update its pin to
+   `GTSAlgoResearch_F`, replace its vendored copy of this directory and update its pin to
    the **backend commit SHA** and the **`schemas_sha256`** from step 4.
-7. **Run the frontend contract tests.** In `Strikedge_F`, run its contract suite so
+7. **Run the frontend contract tests.** In `GTSAlgoResearch_F`, run its contract suite so
    its decoders are checked against the new schemas. Fix the frontend until green.
 8. **Merge order: backend FIRST, then frontend.** The backend change is what
    produces the new bytes; merging the frontend first would point it at a shape the

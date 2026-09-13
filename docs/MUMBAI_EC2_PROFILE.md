@@ -1,11 +1,11 @@
 # Conservative Mumbai EC2 profile (`ap-south-1`)
 
-The deliberately over-cautious starting posture for StrikeEdge live box arbitrage on a
+The deliberately over-cautious starting posture for GTS Algo Research live box arbitrage on a
 Mumbai EC2 host. It is designed so the FIRST live session risks as little as possible
 while producing the broker observations you actually need — not so it trades often.
 
 Read `docs/DEPLOYMENT.md` for PostgreSQL install, migrations, PM2, nginx and the
-CalSpread cutover; `docs/RUNBOOK.md` for the trading day; `docs/CONFIGURATION.md` for
+the predecessor codebase cutover; `docs/RUNBOOK.md` for the trading day; `docs/CONFIGURATION.md` for
 every variable and its precedence. This document is the *profile* and the Mumbai/EC2
 concerns. The machine-readable starting point is
 `deploy/mumbai-ec2-conservative.env.example`.
@@ -314,9 +314,9 @@ reconciliation; the stream is an additional fast observation path, never the aut
 
 ---
 
-## 12. CalSpread must be disabled first
+## 12. the predecessor codebase must be disabled first
 
-**Requirement:** CalSpread Box execution MUST be disabled before activating StrikeEdge
+**Requirement:** the predecessor codebase Box execution MUST be disabled before activating GTS Algo Research
 live execution against a shared broker account. Both place orders through the same broker
 credentials. If both run:
 
@@ -326,17 +326,17 @@ credentials. If both run:
   they hold the only active box.
 - Reconciliation may adopt or cancel orders it did not create.
 
-StrikeEdge cannot detect requests made by another application on the same account. This
+GTS Algo Research cannot detect requests made by another application on the same account. This
 is **operational coordination**, not a code guarantee.
 
 **How an operator verifies it before cutover:**
 
-1. Confirm the CalSpread process is stopped: `pm2 list` shows no CalSpread app online (or
-   the CalSpread host/service is down).
-2. Confirm CalSpread holds no open box or working order on the shared account — check the
-   broker console order book and the CalSpread status page; the account order book must
-   show no CalSpread-tagged working orders.
-3. Only then arm StrikeEdge. See the cutover procedure in `docs/DEPLOYMENT.md`.
+1. Confirm the predecessor codebase's process is stopped: `pm2 list` shows no the predecessor codebase app online (or
+   the predecessor codebase's host/service is down).
+2. Confirm the predecessor codebase holds no open box or working order on the shared account — check the
+   broker console order book and the predecessor codebase's status page; the account order book must
+   show no the predecessor codebase-tagged working orders.
+3. Only then arm GTS Algo Research. See the cutover procedure in `docs/DEPLOYMENT.md`.
 
 ---
 
