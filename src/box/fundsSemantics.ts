@@ -139,6 +139,30 @@ export interface UsableFundsVerdict {
   readonly semanticsUnverified: boolean;
   /** True when the encumbrance was needed but not supplied. */
   readonly encumbranceMissing: boolean;
+  /**
+   * Whether `value_rupees` is ALREADY reduced by the account's encumbrance.
+   *
+   * THE ANTI-DOUBLE-COUNT FLAG, and the reason it exists:
+   *
+   * `value_rupees` is always intended to be SPENDABLE funds — what is left after everything
+   * already blocked on the account. This function reaches that figure two different ways: for a
+   * `net_of_encumbrance` broker the reported `available` already IS spendable, and for
+   * `gross_of_encumbrance` / `unverified` brokers the utilisation is subtracted here.
+   *
+   * The funding model, meanwhile, was independently ADDING the same utilisation into the
+   * requirement it compares against this figure. Adding U to the requirement is only valid if the
+   * funds figure is GROSS. Because it is net either way, the account was being charged for its
+   * existing encumbrance twice:
+   *     available(A − U)  ≥  requirement(R + U)   ⟺   A ≥ R + 2U
+   * which refuses affordable entries by an amount that grows with unrelated activity on the
+   * account. Consumers must consult this flag and add the encumbrance to the requirement ONLY
+   * when it is false.
+   *
+   * Note this is about CONSISTENCY, not laxity: the fail-closed behaviour when the encumbrance is
+   * required but missing still lives here (see the `gross_of_encumbrance` and `unverified` arms,
+   * which return `value_rupees: null`), which is the correct side of the comparison for it.
+   */
+  readonly encumbranceNettedFromAvailable: boolean;
 }
 
 /**
@@ -168,6 +192,8 @@ export function usableFundsRupees(args: {
         `funds cannot be established; applying another broker's semantics would be a guess about money`,
       semanticsUnverified: true,
       encumbranceMissing: args.utilisedRupees === null,
+      // No figure was produced, so there is nothing for a consumer to double-count.
+      encumbranceNettedFromAvailable: false,
     };
   }
   const available = args.availableRupees;
@@ -179,6 +205,7 @@ export function usableFundsRupees(args: {
       basis: `${args.broker}: no available-funds figure was supplied (${semantics.availableField} missing)`,
       semanticsUnverified: semantics.availableIsNetOfEncumbrance === "unverified",
       encumbranceMissing: utilised === null,
+      encumbranceNettedFromAvailable: false,
     };
   }
 
@@ -192,6 +219,8 @@ export function usableFundsRupees(args: {
           `encumbrances, so ${semantics.utilisedField} is NOT subtracted again`,
         semanticsUnverified: false,
         encumbranceMissing: false,
+        // The BROKER already netted it. Spendable, therefore the requirement must not add it.
+        encumbranceNettedFromAvailable: true,
       };
 
     case "gross_of_encumbrance": {
@@ -206,6 +235,7 @@ export function usableFundsRupees(args: {
             `${semantics.utilisedField} was not supplied, so spendable funds cannot be established`,
           semanticsUnverified: false,
           encumbranceMissing: true,
+          encumbranceNettedFromAvailable: false,
         };
       }
       return {
@@ -215,6 +245,8 @@ export function usableFundsRupees(args: {
           `${semantics.utilisedField} ₹${utilised}`,
         semanticsUnverified: false,
         encumbranceMissing: false,
+        // Subtracted HERE, so the requirement must not add it again.
+        encumbranceNettedFromAvailable: true,
       };
     }
 
@@ -232,6 +264,7 @@ export function usableFundsRupees(args: {
             `not supplied, so spendable funds cannot be established conservatively`,
           semanticsUnverified: true,
           encumbranceMissing: true,
+          encumbranceNettedFromAvailable: false,
         };
       }
       return {
@@ -244,6 +277,8 @@ export function usableFundsRupees(args: {
           `read-only funds read; see docs/BROKER_LIMITS.md.`,
         semanticsUnverified: true,
         encumbranceMissing: false,
+        // Subtracted HERE under the conservative reading, so the requirement must not add it too.
+        encumbranceNettedFromAvailable: true,
       };
     }
   }

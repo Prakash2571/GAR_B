@@ -222,13 +222,72 @@ function emptyLaneStats(lane: MarketDataLane, wanted: number, generation: number
  * hedge-aware figure that is merely missing its premium component rather than an
  * over-statement several times too large.
  */
-function pickLegPrice(order: BoxMarginOrder): number {
+function pickLegPrice(order: BoxMarginOrder): number | null {
   for (const candidate of [order.reference_price, order.price]) {
     if (typeof candidate === "number" && Number.isFinite(candidate) && candidate > 0) {
       return candidate;
     }
   }
-  return 0.05;
+  return null;
+}
+
+/**
+ * Read a REQUIRED rupee figure out of a broker payload, or return null.
+ *
+ * Replaces `Number(value) || 0`, which was the mechanism of defect A: it mapped `undefined`,
+ * `null`, `""`, `"abc"`, `NaN`, `{}` and `false` all to 0 and folded that 0 into a running total,
+ * so a MALFORMED response silently LOWERED the margin requirement. `|| 0` additionally cannot
+ * distinguish a documented, explicit ₹0 from an absent field.
+ *
+ * Rules, applied deliberately:
+ *   * A finite number ≥ 0 is the value — INCLUDING an explicit 0, which is a real answer.
+ *   * A numeric STRING is validated and accepted (brokers do send numbers as JSON strings), but
+ *     only when the whole trimmed token parses finitely; `""` and `"abc"` are rejected, not 0.
+ *   * NEGATIVE is rejected: a margin requirement cannot be below zero, so a negative value means
+ *     the field does not mean what we think it means.
+ *   * Non-finite (NaN / ±Infinity) is rejected.
+ *   * Any other type (boolean, object, array) is rejected rather than coerced.
+ * `null` from this function means UNUSABLE, never zero.
+ */
+function requiredMarginRupees(raw: unknown): number | null {
+  if (typeof raw === "number") return Number.isFinite(raw) && raw >= 0 ? raw : null;
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (trimmed === "") return null;
+    const parsed = Number(trimmed);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+  }
+  return null;
+}
+
+/**
+ * An UNUSABLE basket-margin result: no figure, and the reason why.
+ *
+ * Every incomplete outcome funnels through here so the shape is identical whether the cause was
+ * an unresolved instrument, a failed request, a missing field, or an invalid number. `total` is
+ * null rather than 0 — "unknown" and "free" are different claims, and only one of them is safe.
+ */
+function unusableBasketMargin(args: {
+  source: BoxMarginSource;
+  legsRequested: number;
+  legsPriced: number;
+  reason: string;
+  span?: number | null;
+  exposure?: number | null;
+}): BoxBasketMargin {
+  return {
+    initial: null,
+    final: null,
+    total: null,
+    source: args.source,
+    complete: false,
+    legs_requested: args.legsRequested,
+    legs_priced: args.legsPriced,
+    incomplete_reason: args.reason,
+    hedge_benefit: null,
+    span: args.span ?? null,
+    exposure: args.exposure ?? null,
+  };
 }
 
 /**
@@ -1359,7 +1418,32 @@ export class ActiveBrokerManager {
             })),
           );
           this.lastMarginSource = "kite_basket";
-          return { ...res, source: "kite_basket" as const };
+          // PRESENCE, not just value. `kite.getBasketMargin` already tracks whether Zerodha
+          // actually sent each block, but the old `{ ...res }` spread dropped
+          // `initial_available` / `final_available` / `total_basis` on the floor — so a response
+          // missing the `initial` block arrived here as a numeric 0 and was forwarded as an
+          // ESTABLISHED requirement of ₹0. Map the flags onto the nullable contract instead.
+          //
+          // Zerodha's DOCUMENTED meanings are preserved exactly: `data.initial.total` is the
+          // margin required to execute the orders, `data.final.total` is the margin with the
+          // spread benefit. These meanings are Zerodha's and are not transferred to Dhan.
+          const initialUsable = res.initial_available === true;
+          const finalUsable = res.final_available === true;
+          const totalUsable = res.total_basis !== "unavailable";
+          return {
+            initial: initialUsable ? res.initial : null,
+            final: finalUsable ? res.final : null,
+            total: totalUsable ? res.total : null,
+            source: "kite_basket" as const,
+            // Kite's basket endpoint margins the whole basket in one call, so completeness is
+            // simply whether it returned a usable headline figure.
+            complete: totalUsable,
+            legs_requested: orders.length,
+            legs_priced: totalUsable ? orders.length : 0,
+            incomplete_reason: totalUsable
+              ? null
+              : "Zerodha's basket-margin response contained neither an `initial` nor a `final` total",
+          };
         }
         return this.dhanBasketMargin(orders);
       },
@@ -1379,10 +1463,24 @@ export class ActiveBrokerManager {
    * `MARGIN` (carry-forward) product; sending them one-directionally would defeat the
    * hedge recognition this call exists for.
    *
-   * FALLBACK, clearly labelled: if the multi endpoint genuinely fails, the per-leg sum
-   * is used and tagged `dhan_per_leg_fallback`. That is a conservative UPPER bound, so
-   * a failed multi call can never produce an UNDERSTATED figure — the direction of the
-   * error matters, and understating margin is the one outcome worth avoiding.
+   * FALLBACK, clearly labelled: if the multi endpoint genuinely fails, the per-leg sum is used
+   * and tagged `dhan_per_leg_fallback`. That is a conservative UPPER bound ONLY WHEN IT COVERS
+   * EVERY REQUESTED LEG. This is the correctness boundary that defect A crossed: the old code
+   * counted successes and refused only the "nothing priced at all" case, so a sum over 1 of 4
+   * legs — or over the subset that happened to resolve to a security id — was returned in the
+   * same shape as a complete four-leg sum. A sum over fewer legs than requested is an
+   * UNDER-statement, and it was accepted as live-admission evidence.
+   *
+   * So completeness is now a RESULT, not an assumption. Every requested leg must resolve to a
+   * security id AND answer with a structurally valid `totalMargin`. Anything less returns an
+   * unusable figure (`complete: false`, `total: null`) carrying the reason, and the engine's
+   * admission path refuses it. Displaying a partial figure is fine; funding new exposure on one
+   * is not.
+   *
+   * INITIAL IS NOT DERIVED HERE. Dhan publishes no field documented as the margin required to
+   * EXECUTE the orders, so `initial` is `null` (UNKNOWN). SPAN and exposure are reported as
+   * labelled components. Promoting SPAN to `initial` — and `?? 0` when SPAN was absent — was
+   * defect B; see `BoxBasketMargin.initial`.
    */
   private async dhanBasketMargin(orders: BoxMarginOrder[]): Promise<BoxBasketMargin> {
     await this.dhanInstruments.load().catch(() => undefined);
@@ -1402,10 +1500,24 @@ export class ActiveBrokerManager {
       securityId: string;
       price: number;
     }[] = [];
+    const unresolved: string[] = [];
+    const unpriced: string[] = [];
     for (const order of orders) {
       const inst = bySymbol.get(`${order.exchange}:${order.tradingsymbol}`);
       const segment = inst?.dhan_segment ?? dhanSegmentFor(order.exchange);
-      if (!inst || !segment) continue;
+      if (!inst || !segment) {
+        unresolved.push(`${order.exchange}:${order.tradingsymbol}`);
+        continue;
+      }
+      // An UNPRICED leg is a hole in the evidence, not a rounding problem. The nominal ₹0.05
+      // that used to be substituted here kept the request alive at the cost of margining a
+      // premium that is not the one being traded, and that figure then flowed into live
+      // admission. A leg we cannot price is a leg we cannot margin.
+      const legPrice = pickLegPrice(order);
+      if (legPrice === null) {
+        unpriced.push(`${order.exchange}:${order.tradingsymbol}`);
+        continue;
+      }
       legs.push({
         exchangeSegment: segment,
         transactionType: order.transaction_type,
@@ -1416,21 +1528,39 @@ export class ActiveBrokerManager {
         securityId: String(inst.dhan_security_id),
         // Dhan prices each leg from THIS field; unlike Kite's basket endpoint there is
         // no `order_type`, so a MARKET order's price is not resolved server-side from
-        // the LTP. Prefer the real per-leg price the caller supplies, fall back to the
-        // order price, and only then to a nominal non-zero value — Dhan rejects a zero
-        // price outright, so the last resort exists to keep the basket call alive rather
-        // than to be accurate.
-        price: pickLegPrice(order),
+        // the LTP. The caller's real per-leg price is required — see `pickLegPrice`.
+        price: legPrice,
       });
     }
-    if (legs.length === 0) {
-      return { initial: 0, final: 0, total: 0, source: "unavailable" };
+
+    // ---- FAIL CLOSED before any request: the basket must be whole ----
+    //
+    // Checked BEFORE the multi call, not after, because a partial basket must never be sent:
+    // the hedge benefit of three legs is not the hedge benefit of four, and a netted figure for
+    // a subset is a smaller number that looks entirely plausible.
+    const allResolved = legs.length === orders.length;
+    if (!allResolved) {
+      const detail = [
+        unresolved.length > 0 ? `${unresolved.length} leg(s) did not resolve to a Dhan security id (${unresolved.join(", ")})` : null,
+        unpriced.length > 0 ? `${unpriced.length} leg(s) had no usable price (${unpriced.join(", ")})` : null,
+      ]
+        .filter((part): part is string => part !== null)
+        .join("; ");
+      console.warn(
+        `[Dhan] basket margin UNAVAILABLE: only ${legs.length}/${orders.length} legs are margin-able — ${detail}. ` +
+          "A margin figure covering a SUBSET of the basket understates the requirement, so no figure is reported.",
+      );
+      this.lastMarginSource = "unavailable";
+      return unusableBasketMargin({
+        source: "unavailable",
+        legsRequested: orders.length,
+        legsPriced: 0,
+        reason: `only ${legs.length} of ${orders.length} basket legs are margin-able: ${detail}`,
+      });
     }
 
-    const allResolved = legs.length === orders.length;
-
     // ---- preferred path: one hedge-aware multi-order request ----
-    if (allResolved) {
+    {
       try {
         const raw = await this.dhanClient.calculateMultiMargin(legs, {
           // The figure must describe THIS basket. Netting against held positions would
@@ -1445,10 +1575,22 @@ export class ActiveBrokerManager {
         if (normalized) {
           this.lastMarginSource = "dhan_multi";
           return {
-            initial: Math.round(normalized.span ?? 0),
+            // UNKNOWN, not SPAN. Dhan documents no "margin required to execute the orders"
+            // figure, and SPAN is a component of the requirement rather than a statement about
+            // any intermediate point of the execution sequence. `Math.round(span ?? 0)` both
+            // mislabelled a present SPAN and turned an absent one into an established ₹0.
+            initial: null,
+            // The netted figure for THIS basket of orders IS the completed-basket requirement.
             final: Math.round(normalized.total),
             total: Math.round(normalized.total),
             source: "dhan_multi",
+            // A netted basket call is all-or-nothing: `normalizeDhanMultiMargin` already
+            // rejected an unreadable or non-positive total, so reaching here means all legs
+            // were margined together.
+            complete: true,
+            legs_requested: orders.length,
+            legs_priced: orders.length,
+            incomplete_reason: null,
             hedge_benefit: normalized.hedgeBenefit,
             span: normalized.span,
             exposure: normalized.exposure,
@@ -1469,43 +1611,81 @@ export class ActiveBrokerManager {
           err,
         );
       }
-    } else {
-      console.warn(
-        `[Dhan] only ${legs.length}/${orders.length} basket legs resolved to a security id — ` +
-          "using the conservative per-leg sum rather than margining a partial basket.",
-      );
     }
 
-    // ---- fallback: sum standalone legs. Conservative by construction. ----
+    // ---- fallback: sum standalone legs. Conservative ONLY IF COMPLETE. ----
+    //
+    // EVERY requested leg must be resolved before this sum is evidence of anything. The old
+    // loop swallowed each failure with a `console.warn`, counted successes, and accepted any
+    // count above zero — which is how a 1-of-4 sum became a basket margin.
     let total = 0;
-    let span = 0;
+    let spanTotal = 0;
     let priced = 0;
+    let spanKnownForEveryLeg = true;
+    const legFailures: string[] = [];
     for (const leg of legs) {
+      let res: Awaited<ReturnType<typeof this.dhanClient.calculateMargin>>;
       try {
-        const res = await this.dhanClient.calculateMargin(leg);
-        total += Number(res.totalMargin) || 0;
-        span += Number(res.spanMargin) || 0;
-        priced++;
+        res = await this.dhanClient.calculateMargin(leg);
       } catch (err) {
-        console.warn(`[Dhan] per-leg margin failed for securityId ${leg.securityId}:`, err);
+        legFailures.push(`securityId ${leg.securityId}: request failed (${String(err)})`);
+        continue;
       }
+      // STRUCTURAL VALIDATION, not coercion. A missing/malformed/negative/non-finite
+      // totalMargin invalidates the leg instead of contributing 0 to the sum.
+      const legTotal = requiredMarginRupees((res as { totalMargin?: unknown }).totalMargin);
+      if (legTotal === null) {
+        legFailures.push(
+          `securityId ${leg.securityId}: totalMargin is missing or not a valid non-negative number`,
+        );
+        continue;
+      }
+      total += legTotal;
+      // SPAN is an optional COMPONENT. It never becomes `initial`, and a leg that omits it does
+      // not invalidate the basket — but a partial SPAN sum would be a misleading component, so
+      // the component is only reported when every leg supplied it.
+      const legSpan = requiredMarginRupees((res as { spanMargin?: unknown }).spanMargin);
+      if (legSpan === null) spanKnownForEveryLeg = false;
+      else spanTotal += legSpan;
+      priced++;
     }
-    if (priced === 0) {
-      // Nothing priced at all. Report UNAVAILABLE rather than ₹0, so the dashboard
-      // counts it as unknown instead of treating the box as margin-free.
+
+    if (priced !== orders.length) {
+      // INCOMPLETE. Report no figure rather than an understated one. This covers "nothing
+      // priced at all" and every partial case in between, which the old `priced === 0` guard
+      // let through.
+      console.warn(
+        `[Dhan] basket margin UNAVAILABLE: only ${priced}/${orders.length} legs produced a valid ` +
+          `standalone margin. A partial sum UNDERSTATES a four-leg basket, so no figure is ` +
+          `reported. Failures: ${legFailures.join(" | ")}`,
+      );
       this.lastMarginSource = "unavailable";
-      return { initial: 0, final: 0, total: 0, source: "unavailable" };
+      return unusableBasketMargin({
+        source: "unavailable",
+        legsRequested: orders.length,
+        legsPriced: priced,
+        reason:
+          `only ${priced} of ${orders.length} legs produced a valid standalone margin` +
+          (legFailures.length > 0 ? ` (${legFailures.join("; ")})` : ""),
+      });
     }
+
     this.lastMarginSource = "dhan_per_leg_fallback";
     return {
-      initial: Math.round(span),
+      // Summed standalone SPANs are not an execution-stage requirement either — see the
+      // `initial` contract. UNKNOWN.
+      initial: null,
       final: Math.round(total),
       total: Math.round(total),
       source: "dhan_per_leg_fallback",
+      complete: true,
+      legs_requested: orders.length,
+      legs_priced: priced,
+      incomplete_reason: null,
       // No hedge benefit is recognised in this path — that is precisely why it is a
       // fallback, and stating null is more honest than implying zero benefit exists.
       hedge_benefit: null,
-      span,
+      span: spanKnownForEveryLeg ? spanTotal : null,
       exposure: null,
     };
   }

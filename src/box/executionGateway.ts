@@ -1559,6 +1559,14 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
               // preserved as null so the funding gate refuses rather than assuming the account is
               // otherwise idle — other applications trading the same account are exactly that hazard.
               encumbranceRupees: fundsObs.value?.utilisedRupees ?? marginValue.encumbranceRupees ?? null,
+              // ...AND REPORTED, NOT RE-CHARGED. `usableFunds` above came from `usableFundsRupees`,
+              // which already returns SPENDABLE funds for every broker — passing `available`
+              // through when the broker documents it as net, and subtracting the utilisation when
+              // it does not (or when the semantics are unverified). Adding that same utilisation
+              // into the requirement as well made the comparison `A − U ≥ R + U`, i.e. it demanded
+              // `A ≥ R + 2U`: the account was charged twice for rupees blocked once. The
+              // encumbrance is still surfaced in the picture for diagnostics.
+              encumbranceNettedFromAvailableFunds: usableFunds.encumbranceNettedFromAvailable,
               recoveryReserveRupees: this.deps.cfg.liveRecoveryReserveRupees,
             },
           }

@@ -273,13 +273,25 @@ test("the REAL per-leg price is preferred over the order price", async () => {
   assert.ok(calls.multiLegs.every((l) => l.price === 12.5));
 });
 
-test("a zero-priced leg is never sent, because Dhan rejects one", async () => {
-  // A rejected basket call degrades to the per-leg sum, so the nominal price keeps the
-  // hedge-aware path alive rather than pretending to be accurate.
+test("an UNPRICED leg makes the basket unavailable instead of being margined at a nominal price", async () => {
+  // CHANGED DELIBERATELY. This used to assert that an unpriced leg was still sent, at a nominal
+  // ₹0.05, "to keep the hedge-aware path alive". Dhan margins against whatever price it is
+  // handed, so that produced a figure for a basket whose premium component is not the one being
+  // traded — and that figure then flowed into live admission as broker-confirmed evidence.
+  //
+  // A leg we cannot price is a leg we cannot margin. The basket is now reported unavailable and
+  // NO request is sent, which is both honest and cheaper.
   const { m, calls } = marginManager();
   activateDhan(m);
-  await m.margins().basketMargin(BOX_ORDERS.map((o) => ({ ...o, price: 0, reference_price: null })));
-  assert.ok(calls.multiLegs.every((l) => l.price > 0));
+  const res = await m.margins().basketMargin(
+    BOX_ORDERS.map((o) => ({ ...o, price: 0, reference_price: null })),
+  );
+  assert.equal(calls.multi, 0, "a basket with an unpriced leg is never sent");
+  assert.equal(calls.perLeg, 0);
+  assert.equal(res.source, "unavailable");
+  assert.equal(res.complete, false);
+  assert.equal(res.total, null, "no figure at all, rather than one priced off a placeholder");
+  assert.match(String(res.incomplete_reason), /price/i);
 });
 
 test("the hedge-adjusted total is returned, with span/exposure/benefit preserved", async () => {
@@ -345,7 +357,11 @@ test("when NOTHING can be priced the result is `unavailable`, not zero margin", 
   activateDhan(m);
   const res = await m.margins().basketMargin(BOX_ORDERS);
   assert.equal(res.source, "unavailable");
-  assert.equal(res.total, 0);
+  // STRENGTHENED: the total is now null, not 0. A numeric 0 still had to be defended against by
+  // every consumer ("is this zero real?"); null cannot be mistaken for a requirement of nothing.
+  assert.equal(res.total, null);
+  assert.equal(res.complete, false);
+  assert.equal(res.legs_priced, 0);
 });
 
 test("Zerodha still uses its own basket API, labelled kite_basket", async () => {

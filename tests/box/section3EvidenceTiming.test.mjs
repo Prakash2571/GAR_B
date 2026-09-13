@@ -336,7 +336,12 @@ test("a BACKWARD wall-clock step between the read and the evaluation does not tu
       // the evaluation instant is taken. Wall-clock aging would now compute age = -30_000 for the
       // funds figure and call a perfectly fresh number stale.
       clock.skewWall(-30_000);
-      return null;
+      // A USABLE margin figure. This stub used to return null, and the funds-cover check then
+      // silently compared funds against the gross option premium (`worst_case_entry`). That
+      // substitution has been removed — premium does not bound short-option margin — so a real
+      // requirement must be supplied for this test to exercise what it is actually about: that a
+      // wall-clock step does not fabricate staleness.
+      return { marginRupees: 50_000, observedAt: clock.wall() };
     },
   });
   const entry = await runEntry(h);
@@ -359,7 +364,9 @@ test("a FORWARD wall-clock step does not fabricate staleness in the ECONOMIC dec
     // The host clock jumps 10 minutes forward after the funds read, before evaluation.
     plannedMargin: async () => {
       clock.skewWall(600_000);
-      return null;
+      // Stamped AFTER the jump, i.e. "just observed" on the corrected clock. A usable figure is
+      // required now that funds cover no longer falls back to gross option premium.
+      return { marginRupees: 50_000, observedAt: clock.wall() };
     },
   });
   await runEntry(h);
@@ -380,6 +387,9 @@ test("send-boundary aging is MONOTONIC: a wall jump does not expire evidence, re
     clock,
     config: { liveRequireFundsCover: true, liveFundsFreshnessMaxAgeMs: 1_000 },
     funds: delayedFunds(clock, { delayMs: 20 }),
+    // A real broker margin figure, so the funds-cover comparison has an actual requirement to
+    // compare against rather than the gross-premium substitute that has been removed.
+    plannedMargin: delayedMargin(clock, { delayMs: 10 }),
   });
   const entry = await runEntry(h);
   assert.equal(entry.ok, true, "admitted on fresh evidence");
@@ -496,6 +506,9 @@ test("evidence that EXPIRES between admission and the send boundary blocks the P
       liveFundsFreshnessMaxAgeMs: 1_000,
     },
     funds: delayedFunds(clock, { delayMs: 20 }),
+    // Supplies the funding requirement. Previously omitted, which made this test depend on the
+    // gross-premium fallback that has since been removed from funds cover.
+    plannedMargin: delayedMargin(clock, { delayMs: 10 }),
   });
   const entry = await runEntry(h);
   assert.equal(entry.ok, true, "admission itself succeeded on fresh evidence");

@@ -114,14 +114,71 @@ export type BoxMarginSource =
   | "unavailable";
 
 export interface BoxBasketMargin {
-  initial: number;
-  final: number;
-  total: number;
+  /**
+   * The margin required to EXECUTE the orders, or `null` when that is UNKNOWN.
+   *
+   * NULLABLE ON PURPOSE. This field previously could not express "unknown", so callers had to
+   * invent a stand-in, and both brokers invented ZERO:
+   *   * Dhan mapped `initial: Math.round(normalized.span ?? 0)` — promoting SPAN, which is a
+   *     COMPONENT of an F&O margin, to a statement about execution-stage funding, and turning an
+   *     ABSENT span into an established requirement of ₹0.
+   *   * Zerodha's client returns `0` for a `data.initial` block the API did not send, and its
+   *     `initial_available` presence flag was discarded on the way here.
+   * Downstream, `Number.isFinite(0)` is true, so a fabricated zero was indistinguishable from a
+   * real figure and `buildFundingStages` collapsed the intermediate requirement to the gross
+   * option premium — which does not bound the margin a short option requires.
+   *
+   * Only a value the broker DOCUMENTS as the execute-the-orders margin belongs here. Zerodha
+   * documents `data.initial.total`. Dhan publishes no equivalent field, so for Dhan this is
+   * `null` and strict stage-funded entry refuses rather than guessing. `null` means UNKNOWN and
+   * must never be coerced to 0.
+   */
+  initial: number | null;
+  /**
+   * The margin required to HOLD the completed, hedged basket, or `null` when UNKNOWN.
+   * Zerodha documents `data.final.total` (the spread-benefit figure). Same null contract.
+   */
+  final: number | null;
+  /**
+   * The headline requirement, or `null` when no figure could be established.
+   *
+   * `null` rather than `0`: a zero total reads as "this box is margin-free", which for a
+   * four-leg F&O basket containing short options is never true.
+   */
+  total: number | null;
   /** Which calculation produced `total`. */
   source: BoxMarginSource;
+  /**
+   * Whether EVERY requested leg was resolved and answered with a structurally valid figure.
+   *
+   * THE COMPLETENESS FLAG. Its absence was defect A: the Dhan per-leg fallback counted
+   * successes and refused only the all-zero case, so a sum over 1 of 4 legs was returned as
+   * `{ total: 1000, source: "dhan_per_leg_fallback" }` — shaped exactly like a complete
+   * four-leg sum. A partial sum is an UNDER-statement, not the "conservative upper bound" the
+   * fallback claims to be, and no consumer could tell the difference.
+   *
+   * `false` means the figure is NOT admissible evidence for taking new exposure. It may still
+   * be displayed, provided it is labelled.
+   */
+  complete: boolean;
+  /** How many legs the caller asked about. */
+  legs_requested: number;
+  /**
+   * How many legs produced a valid figure. Equal to `legs_requested` iff `complete`.
+   * For a netted basket call this is all-or-nothing; for the per-leg sum it is a real count.
+   */
+  legs_priced: number;
+  /** Why the evidence is incomplete, for an operator-facing refusal. `null` when complete. */
+  incomplete_reason: string | null;
   /** Benefit attributable to offsetting legs (₹), when the broker reports it. */
   hedge_benefit?: number | null;
+  /**
+   * SPAN margin, as a LABELLED COMPONENT only.
+   *
+   * Reported for display and diagnosis. Deliberately NOT usable as `initial`: see that field.
+   */
   span?: number | null;
+  /** Exposure margin, likewise a labelled component and not a stage requirement. */
   exposure?: number | null;
 }
 

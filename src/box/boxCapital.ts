@@ -628,20 +628,32 @@ export function buildFundingStages(args: {
 
     // While hedges are going out, the completed-basket spread benefit does NOT exist. Only the
     // FINAL stage — every leg on the book — may use the `final` figure.
+    //
+    // A figure is usable as a stage basis only when it is a CREDIBLE requirement: present,
+    // finite, and strictly positive. The positivity test is load-bearing, not cosmetic. A
+    // four-leg box always contains SHORT options, so a required margin of exactly ₹0 is not a
+    // real answer — it is what a fabricated stand-in looks like. Defect B fabricated exactly
+    // that (`span ?? 0`), and because `Number.isFinite(0)` is true the old test admitted it,
+    // took `margin_basis: "initial_basket"`, and then computed
+    // `Math.max(0, cumulative BUY premium)` — the gross premium, which this very function's
+    // other branch correctly says "does NOT bound a margin requirement". The adapter no longer
+    // manufactures that zero; this guard means the stage model cannot be fooled by one from any
+    // future source either. Zerodha's own basket example uses the same convention
+    // (`normalizeDhanMultiMargin` already rejects a non-positive total).
     const isFinalStage = index === ordered.length - 1;
+    const usableFigure = (value: number | null): number | null =>
+      value !== null && Number.isFinite(value) && value > 0 ? value : null;
+    const finalFigure = usableFigure(args.finalMarginRupees);
+    const initialFigure = usableFigure(args.initialMarginRupees);
     const marginBasis: FundingStage["margin_basis"] = isFinalStage
-      ? args.finalMarginRupees !== null && Number.isFinite(args.finalMarginRupees)
+      ? finalFigure !== null
         ? "final_basket"
         : "unknown"
-      : args.initialMarginRupees !== null && Number.isFinite(args.initialMarginRupees)
+      : initialFigure !== null
         ? "initial_basket"
         : "unknown";
     const marginRupees =
-      marginBasis === "final_basket"
-        ? (args.finalMarginRupees as number)
-        : marginBasis === "initial_basket"
-          ? (args.initialMarginRupees as number)
-          : null;
+      marginBasis === "final_basket" ? finalFigure : marginBasis === "initial_basket" ? initialFigure : null;
 
     const premiumDue = priced || request === undefined ? fromPaise(debitPaise) : null;
     let requirement: number | null = null;
@@ -751,6 +763,12 @@ export function buildEconomicPicture(args: {
     readonly finalMarginRupees: number | null;
     /** ₹ blocked by existing open orders/positions, when observable. Null ⇒ unknown, not zero. */
     readonly encumbranceRupees: number | null;
+    /**
+     * Whether `availableFundsRupees` above already has the encumbrance deducted. Forwarded to
+     * {@link buildFundingPicture}; see its `encumbranceNettedFromAvailableFunds` for why counting
+     * the same blocked rupees on both sides of the comparison was wrong.
+     */
+    readonly encumbranceNettedFromAvailableFunds?: boolean;
     /** Operator-configured reserve kept back for recovery actions (₹). */
     readonly recoveryReserveRupees: number;
   };
@@ -823,6 +841,28 @@ export function buildFundingPicture(args: {
   readonly initialMarginRupees: number | null;
   readonly finalMarginRupees: number | null;
   readonly encumbranceRupees: number | null;
+  /**
+   * Whether the AVAILABLE-FUNDS figure this requirement will be compared against has ALREADY had
+   * the encumbrance deducted from it.
+   *
+   * ANTI-DOUBLE-COUNT. `usableFundsRupees` always yields SPENDABLE funds — it passes `available`
+   * through for a broker documented as net of encumbrance, and subtracts the utilisation for a
+   * broker that is gross or whose semantics are unverified. Adding the same utilisation into the
+   * requirement as well charged the account twice for money that was blocked once:
+   *     available(A − U) ≥ requirement(R + U)   ⟺   A ≥ R + 2U
+   * The error is conservative in direction, so it never admitted an unaffordable entry — but it
+   * refused affordable ones by an amount that grows with unrelated activity on the same account,
+   * and it made the published arithmetic wrong, which is worse in a figure operators reason with.
+   *
+   * `true` (what the production gateway passes, because it derives funds via `usableFundsRupees`)
+   * means the encumbrance is reported for diagnostics but NOT re-added here. `false` preserves the
+   * additive behaviour for a caller that supplies a genuinely GROSS available figure.
+   *
+   * The fail-closed property is unchanged and simply lives on the correct side of the comparison:
+   * when a broker's semantics require the encumbrance and it is missing, `usableFundsRupees`
+   * returns no funds figure at all, so admission still refuses.
+   */
+  readonly encumbranceNettedFromAvailableFunds?: boolean;
   readonly recoveryReserveRupees: number;
   readonly plannedMarginAged: AgedEvidence;
   readonly planFingerprint: string | null;
@@ -955,13 +995,19 @@ export function buildFundingPicture(args: {
   };
 
   // The BINDING requirement. Deliberately conservative and additive across INDEPENDENT costs:
-  // the worst execution stage, plus charges, plus the recovery reserve, plus whatever is already
-  // encumbered. Unknown encumbrance does NOT silently become zero — it makes the total unknown.
+  // the worst execution stage, plus charges, plus the recovery reserve.
+  //
+  // THE ENCUMBRANCE IS INCLUDED ONLY IF IT IS NOT ALREADY NETTED OUT OF AVAILABLE FUNDS. See
+  // `encumbranceNettedFromAvailableFunds`: counting it on both sides charged the account twice for
+  // the same blocked rupees. When it IS already netted, an unknown encumbrance no longer has to
+  // poison this total either — because in that case the funds side is the thing that fails closed,
+  // and it does.
+  const encumbranceCountedHere = args.encumbranceNettedFromAvailableFunds !== true;
   const parts: (number | null)[] = [
     intermediate_stage_requirement.usable ? intermediate_stage_requirement.value_rupees : null,
     estimated_charges.value_rupees,
     recovery_reserve.value_rupees,
-    encumbrance.value_rupees,
+    ...(encumbranceCountedHere ? [encumbrance.value_rupees] : []),
   ];
   const binding = parts.some((p) => p === null)
     ? null
@@ -970,8 +1016,11 @@ export function buildFundingPicture(args: {
     ? unknownFigure(
         "the binding funding requirement is UNKNOWN because at least one component is unknown " +
           `(worst stage: ${intermediate_stage_requirement.value_rupees ?? "unknown"}, charges: ` +
-          `${estimated_charges.value_rupees ?? "unknown"}, encumbrance: ${encumbrance.value_rupees ?? "unknown"}). ` +
-          "The supervised entry profile must be refused rather than admitted on a guess.",
+          `${estimated_charges.value_rupees ?? "unknown"}` +
+          (encumbranceCountedHere
+            ? `, encumbrance: ${encumbrance.value_rupees ?? "unknown"}`
+            : " — the encumbrance is already netted out of available funds and is not a component here") +
+          "). The supervised entry profile must be refused rather than admitted on a guess.",
       )
     : {
         value_rupees: binding,
@@ -984,9 +1033,13 @@ export function buildFundingPicture(args: {
         plan_fingerprint: args.planFingerprint,
         note:
           `worst stage ₹${intermediate_stage_requirement.value_rupees} + charges ` +
-          `₹${estimated_charges.value_rupees} + recovery reserve ₹${recovery_reserve.value_rupees} + ` +
-          `encumbrance ₹${encumbrance.value_rupees} = ₹${binding}. This is what available funds are ` +
-          "compared against — NOT the completed-basket final margin.",
+          `₹${estimated_charges.value_rupees} + recovery reserve ₹${recovery_reserve.value_rupees}` +
+          (encumbranceCountedHere
+            ? ` + encumbrance ₹${encumbrance.value_rupees}`
+            : ` (encumbrance ₹${encumbrance.value_rupees ?? "unknown"} is NOT added here — it is already ` +
+              "deducted from the available-funds figure, and counting it twice would overstate the requirement)") +
+          ` = ₹${binding}. This is what available funds are compared against — NOT the ` +
+          "completed-basket final margin.",
       };
 
   return {
@@ -1232,21 +1285,37 @@ export function evaluateEconomicAdmission(args: {
       //   3. the conservative worst-case entry cost
       // NEVER the (smaller) net debit, and never the FINAL completed-basket margin alone.
       const funding = picture.funding;
-      const need =
-        funding?.binding_requirement.usable && funding.binding_requirement.value_rupees !== null
-          ? funding.binding_requirement.value_rupees
-          : picture.planned_margin.usable && picture.planned_margin.value_rupees !== null
-            ? picture.planned_margin.value_rupees
-            : picture.worst_case_entry.value_rupees;
-      const basis =
-        funding?.binding_requirement.usable && funding.binding_requirement.value_rupees !== null
-          ? "binding hedge-first stage requirement"
-          : picture.planned_margin.usable
-            ? "broker margin"
-            : "worst-case entry cost";
+      const bindingUsable =
+        funding?.binding_requirement.usable === true && funding.binding_requirement.value_rupees !== null;
+      const marginUsable = picture.planned_margin.usable && picture.planned_margin.value_rupees !== null;
+      // THE GROSS-PREMIUM FALLBACK IS GONE.
+      //
+      // Step 3 used to be `picture.worst_case_entry.value_rupees` — the gross cost of the BUY
+      // legs. For a structure whose short legs are the reason margin exists at all, option
+      // premium does not bound the requirement: a box's premium outlay can be a small fraction
+      // of the margin its short options attract. Comparing funds against it and calling the
+      // result "funds cover" authorised entries the account could not fund, and did so with a
+      // number that looks like diligence.
+      //
+      // There are now exactly TWO admissible bases, both real requirements:
+      //   1. the section-8 binding stage requirement (worst stage + charges + reserve + encumbrance)
+      //   2. the broker basket margin, if usable
+      // With neither, the requirement is UNKNOWN and admission refuses `metric_incomplete`. That
+      // is a refusal to take new exposure, not a claim that the box is unaffordable.
+      const need = bindingUsable
+        ? (funding as NonNullable<typeof funding>).binding_requirement.value_rupees
+        : marginUsable
+          ? picture.planned_margin.value_rupees
+          : null;
+      const basis = bindingUsable ? "binding hedge-first stage requirement" : "broker margin";
       if (need === null) {
         reasons.push("metric_incomplete");
-        details.push("cannot compute a funding requirement: no usable stage model, margin or worst-case cost");
+        details.push(
+          "cannot compute a funding requirement: neither a usable hedge-first stage requirement nor a " +
+            "usable broker basket margin is available. Gross option premium is NOT used as a substitute — " +
+            "it does not bound the margin a short option requires — so entry is refused until real " +
+            "margin evidence is obtained.",
+        );
       } else if (picture.available_funds.value_rupees < need) {
         reasons.push("insufficient_available_funds");
         details.push(
