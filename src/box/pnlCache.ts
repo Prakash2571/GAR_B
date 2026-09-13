@@ -6,7 +6,7 @@
  * before draining to Mongo overnight. Redis was ALWAYS best-effort here: durable
  * archive correctness lived in Mongo, never in the cache.
  *
- * StrikeEdge makes PostgreSQL the durable P&L tier (`box_daily_pnl` and the day-state
+ * GTS Box makes PostgreSQL the durable P&L tier (`box_daily_pnl` and the day-state
  * proof, see `repository.ts`). The Redis mirror was therefore PURELY A CACHE, so it is
  * removed rather than reimplemented: every method degrades to the same neutral value it
  * already returned when Redis was unreachable, and the archiver/engine already fall back

@@ -1,7 +1,7 @@
 {
-  "name": "strikedge_backend",
+  "name": "gts-box-backend",
   "version": "1.0.0",
-  "description": "StrikeEdge \u2014 standalone Box-arbitrage backend (Zerodha + Dhan, PostgreSQL authoritative, MongoDB async replica)",
+  "description": "GTS Box \u2014 box-arbitrage research desk: the backend, and the sole trading authority (Zerodha + Dhan, PostgreSQL authoritative, MongoDB async replica)",
   "main": "dist/index.js",
   "type": "module",
   "scripts": {

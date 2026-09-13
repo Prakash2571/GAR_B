@@ -1,5 +1,5 @@
 /**
- * PostgreSQL persistence for box trades and the box event ledger — StrikeEdge's
+ * PostgreSQL persistence for box trades and the box event ledger — GTS Box's
  * operational authority.
  *
  * This is the rewrite of CalSpread's Mongoose repository. Its EXPORTED NAMES,

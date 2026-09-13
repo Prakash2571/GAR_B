@@ -1,22 +1,27 @@
-# StrikeEdge
+# GTS Box — backend
 
-StrikeEdge is a **Box-arbitrage trading backend**. It scans NSE F&O for four-leg
-option Box opportunities, prices them, and — only when deliberately and fully
-enabled — executes them at a broker. It is the extraction of the Box module from
-the larger CalSpread codebase into a standalone service whose single operational
-authority is PostgreSQL.
+**GTS Box is a box-arbitrage research desk for NSE F&O.** This repository is its backend and
+its **sole trading authority**: it scans NSE F&O for four-leg option box opportunities, prices
+them, decides whether each one clears the entry gate on its own arithmetic, and — only when
+deliberately and fully enabled — executes it at a broker. PostgreSQL is its single operational
+authority.
 
-It does **one thing**: Box arbitrage. The calendar-spread scanner, options/futures
-analytics, OI capture, historical charts and Yahoo dividend feeds that lived in
-CalSpread are **not** part of StrikeEdge.
+It does **one thing**, and the narrowness is the design: box arbitrage, one lot, with every
+refusal named and every number attributable. There is no calendar-spread scanner, no
+options/futures analytics, no OI capture, no historical charts and no dividend feed here.
+
+The backend is deliberately the only component that decides anything. The frontend
+(`Prakash2571/Strikedge_F`) renders what this service reports and holds no market logic, so a
+label in the UI can never disagree with the system's real state: the execution mode, the
+readiness verdict, the entry gate and the arming controls are all reported from here.
 
 ## Brokers
 
-StrikeEdge supports **Zerodha (Kite)** and **Dhan**, with **exactly one active at
+GTS Box supports **Zerodha (Kite)** and **Dhan**, with **exactly one active at
 a time**. The two are never live simultaneously; switching is an explicit,
 operator-driven action that is refused while there is live Box exposure.
 
-StrikeEdge performs **no broker OAuth**. It does not log a user into Zerodha or
+GTS Box performs **no broker OAuth**. It does not log a user into Zerodha or
 Dhan. Instead it fetches the day's access token from **CalSpread's token routes**
 (`/api/kite/token`, `/api/dhan/token`) using a shared passcode, decrypts/stores it
 under AES-256-GCM, and uses it for the trading day. Token acquisition runs on a
@@ -64,7 +69,7 @@ failure, or while shutting down (contentless beyond liveness/readiness). Runtime
 `GET /api/runtime/status`.
 Projection backlog: `GET /api/export/status`.
 
-For production (PostgreSQL setup, PM2, nginx/SSE, backup, the CalSpread→StrikeEdge
+For production (PostgreSQL setup, PM2, nginx/SSE, backup, the CalSpread→GTS Box
 cutover), read **`docs/DEPLOYMENT.md`**. For daily operations read
 **`docs/RUNBOOK.md`**. For every environment variable read
 **`docs/CONFIGURATION.md`**. For what was carried across from CalSpread read

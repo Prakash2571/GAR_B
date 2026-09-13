@@ -1,7 +1,7 @@
 # Legacy Box import (`npm run migrate:box-from-mongo`)
 
 A **one-time** cutover tool that reads the CalSpread Box collections from a legacy
-MongoDB and writes them into StrikeEdge's authoritative PostgreSQL tables. Run it
+MongoDB and writes them into GTS Box's authoritative PostgreSQL tables. Run it
 once, during cutover, to carry the historical Box book across.
 
 ## What it imports
@@ -47,11 +47,11 @@ LEGACY_BOX_MONGODB_URI="mongodb+srv://…/legacydb" npm run migrate:box-from-mon
    PostgreSQL for durable live markers:
    - an **armed trading session** — always blocks;
    - a **nonterminal order intent that is NOT in the legacy source** — blocks,
-     because it can only have been produced by a live StrikeEdge process. (Intents
+     because it can only have been produced by a live GTS Box process. (Intents
      that ARE in the legacy source are the ones being re-imported, so they do not
      block a re-run — this is what keeps the import idempotent.)
 
-   If a live marker is present the import aborts. **Stop all StrikeEdge processes
+   If a live marker is present the import aborts. **Stop all GTS Box processes
    and retry.**
 
    > `--force-with-live` exists but **MUST NOT** be used against a live deployment.

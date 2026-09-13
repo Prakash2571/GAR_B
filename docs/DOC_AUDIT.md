@@ -129,7 +129,7 @@ Every "verify X" step in DEPLOYMENT.md §11 names a real endpoint/command:
 
 No imaginary verification step found in the cutover. The required confirmation
 sentence is present **verbatim** in DEPLOYMENT.md §11:
-> "CalSpread Box live execution for both Zerodha and Dhan must remain disabled before and while StrikeEdge owns Box live execution. StrikeEdge PostgreSQL cannot fence orders submitted independently by the old CalSpread process."
+> "CalSpread Box live execution for both Zerodha and Dhan must remain disabled before and while GTS Box owns Box live execution. GTS Box PostgreSQL cannot fence orders submitted independently by the old CalSpread process."
 
 ---
 

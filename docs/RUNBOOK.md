@@ -1,11 +1,11 @@
-# StrikeEdge runbook
+# GTS Box runbook
 
-Day-in-the-life operations for StrikeEdge. Read `docs/DEPLOYMENT.md` for install
+Day-in-the-life operations for GTS Box. Read `docs/DEPLOYMENT.md` for install
 and the cutover; this document is what you keep open during a trading day.
 
 ## The trading day at a glance
 
-1. **~09:00 IST — token acquisition.** StrikeEdge's morning poll
+1. **~09:00 IST — token acquisition.** GTS Box's morning poll
    (`BROKER_TOKEN_POLL_START`, default `09:00`, retrying every
    `BROKER_TOKEN_POLL_INTERVAL_MS`) fetches the day's access token for the active
    broker from CalSpread's token route. Until a healthy token arrives, no trading
@@ -87,7 +87,7 @@ exactly one of these five values (`src/tokens/brokerTokenService.ts`,
 ### Zerodha `token_state: polling` with a `last_error` mentioning 409
 
 CalSpread has no live Zerodha session yet. **Action:** have the CalSpread operator
-complete the Zerodha login for the day. StrikeEdge keeps polling
+complete the Zerodha login for the day. GTS Box keeps polling
 (`BROKER_TOKEN_POLL_INTERVAL_MS`) and picks the token up automatically once
 CalSpread has it. Do **not** try to force a token in; there is nothing to force.
 
@@ -101,14 +101,14 @@ restart. A `configuration_error` is a credential problem, not a market problem.
 
 The token belongs to a previous IST day (or failed another identity check).
 **Action:** this means CalSpread served yesterday's session. It should refresh on
-CalSpread's side; StrikeEdge rejects the stale token (`invalid`) rather than
+CalSpread's side; GTS Box rejects the stale token (`invalid`) rather than
 trading on it. Confirm the CalSpread operator has done today's login. Never
 override the day check.
 
 ### Dhan expiry unknown
 
 If Dhan's `token_expires_at` is unknown/unparseable, treat the token as **not
-trustworthy for live** — StrikeEdge will not go live on an ambiguous expiry.
+trustworthy for live** — GTS Box will not go live on an ambiguous expiry.
 **Action:** re-fetch (next poll), and if it stays unknown, have CalSpread re-issue
 the Dhan session. Stay in paper on the Dhan side until expiry is known.
 
@@ -160,7 +160,7 @@ is deliberately asymmetric:
   protect an open position on a DB hiccup.
 
 **Action:** treat it as an incident. Check `GET /api/runtime/status` (PostgreSQL
-state + last error) and `/api/health`. Restore PostgreSQL. On recovery, StrikeEdge
+state + last error) and `/api/health`. Restore PostgreSQL. On recovery, GTS Box
 reconciles from the durable state. Do **not** restart repeatedly hoping it clears;
 fix the database.
 
@@ -189,7 +189,7 @@ When you need to get out now:
 
 ## What NOT to do
 
-- **Do NOT run CalSpread Box live execution while StrikeEdge owns it.** Two live
+- **Do NOT run CalSpread Box live execution while GTS Box owns it.** Two live
   scanners on one broker account can double-enter and race; neither store can
   fence the other. Keep CalSpread's `BOX_LIVE_TRADING_ENABLED=false` and
   `DHAN_LIVE_TRADING_ENABLED=false`.

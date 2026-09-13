@@ -1,10 +1,10 @@
 /**
- * The PostgreSQL connection pool — StrikeEdge's single operational authority.
+ * The PostgreSQL connection pool — GTS Box's single operational authority.
  *
  * WHY THIS FILE IS SMALL AND EXPLICIT
  * CalSpread's Box module reached Mongo through Mongoose models, which meant a
  * compare-and-set was expressed as a `findOneAndUpdate` filter and the durable
- * pre-write value had to be inferred from the returned document. StrikeEdge
+ * pre-write value had to be inferred from the returned document. GTS Box
  * replaces that with real SQL transactions and `UPDATE ... RETURNING`, so the
  * pre-write and post-write values are both authoritative and both come back from
  * the same statement. An ORM would obscure exactly the behaviour that matters, so
@@ -53,7 +53,7 @@ function positiveInt(raw: string | undefined, fallback: number): number {
 
 /**
  * `pg` returns `numeric` as a string to avoid silent float truncation. Every
- * money column in StrikeEdge is `numeric`, and the Box code expects JS numbers
+ * money column in GTS Box is `numeric`, and the Box code expects JS numbers
  * with the rounding the strategy already applied, so the parse is registered
  * once here rather than at each call site.
  *
@@ -129,7 +129,7 @@ export async function initPg(cfg: PgConfig = pgConfigFromEnv()): Promise<void> {
     readyState = "failed";
     lastError = "DATABASE_URL is not set";
     throw new PgUnavailableError(
-      "DATABASE_URL is not set. PostgreSQL is StrikeEdge's operational authority; it is not optional.",
+      "DATABASE_URL is not set. PostgreSQL is GTS Box's operational authority; it is not optional.",
     );
   }
   configured = cfg;

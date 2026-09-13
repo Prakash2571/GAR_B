@@ -1,9 +1,9 @@
-# StrikeEdge backend — test suites
+# GTS Box backend — test suites
 
-StrikeEdge is the standalone Box-arbitrage backend extracted from CalSpread. PostgreSQL is
+GTS Box is the standalone Box-arbitrage backend extracted from CalSpread. PostgreSQL is
 the operational authority; MongoDB is an async replica fed by a bounded outbox. The test
 suites below reflect that architecture. Where CalSpread proved a guarantee against MongoDB,
-StrikeEdge proves the SAME guarantee against PostgreSQL.
+GTS Box proves the SAME guarantee against PostgreSQL.
 
 Run everything with a local PostgreSQL and (for the outbox projector) MongoDB reachable:
 
@@ -145,20 +145,20 @@ closes the database-driver hole. **Keep both.**
 
 ## Test files removed during the extraction, and why
 
-Three ported CalSpread test files targeted modules that StrikeEdge deliberately did NOT copy.
+Three ported CalSpread test files targeted modules that GTS Box deliberately did NOT copy.
 Deleting them is correct: a test importing a `dist/*.js` that will never exist is not coverage.
 
 | Removed file | Why | Where the coverage lives now |
 |--------------|-----|------------------------------|
-| `tests/box/adminToken.test.mjs` | StrikeEdge REPLACED CalSpread's admin-token layer with the site passcode gate. `src/adminToken.ts` was not copied, so `dist/adminToken.js` never exists. | `tests/access/` (19 tests) — the passcode gate that supersedes the admin token bearer credential. |
-| `tests/box/tokenRouteAuth.test.mjs` | StrikeEdge is a CONSUMER of CalSpread's broker-token routes, not a host of them. `src/tokenRouteAuth.ts` was not copied. | `tests/tokens/providerClient.test.mjs` — the outbound counterpart (StrikeEdge calling the token provider). |
+| `tests/box/adminToken.test.mjs` | GTS Box REPLACED CalSpread's admin-token layer with the site passcode gate. `src/adminToken.ts` was not copied, so `dist/adminToken.js` never exists. | `tests/access/` (19 tests) — the passcode gate that supersedes the admin token bearer credential. |
+| `tests/box/tokenRouteAuth.test.mjs` | GTS Box is a CONSUMER of CalSpread's broker-token routes, not a host of them. `src/tokenRouteAuth.ts` was not copied. | `tests/tokens/providerClient.test.mjs` — the outbound counterpart (GTS Box calling the token provider). |
 | `tests/box/mongoReservationIntegration.test.mjs` | Exercised the DELETED `src/box/reservations/mongoStore.ts` (MI1–MI10). PostgreSQL owns reservations now; the Mongo store no longer exists, so these could never pass again. | `tests/pg/reservations.test.mjs` — see the one-to-one map below. |
 
 ### Tests trimmed (not deleted)
 
 - **`tests/box/dhanSupport.test.mjs`** — the six `/* history */` tests exercised
   `dhanCandlesToRows` / `chunkDateRange` from `src/brokers/history.ts`, the Kite historical-charts
-  provider that StrikeEdge does not ship. Only those six were removed:
+  provider that GTS Box does not ship. Only those six were removed:
   "Dhan's COLUMN-wise candles transpose into rows", "candles come back oldest-first",
   "a candle with a bad timestamp is dropped", "missing columns become 0",
   "long ranges chunk", "a range within the limit is a single chunk".

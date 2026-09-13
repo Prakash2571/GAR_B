@@ -1,6 +1,6 @@
 /**
  * tokenProviderClient — the ONLY outbound HTTP that fetches a broker access token
- * from CalSpread. StrikeEdge never performs its own broker OAuth: it asks the
+ * from CalSpread. GTS Box never performs its own broker OAuth: it asks the
  * CalSpread token route for the token CalSpread already holds, validates it hard,
  * and hands it to the session store to encrypt.
  *

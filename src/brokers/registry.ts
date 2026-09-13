@@ -717,7 +717,7 @@ export class ActiveBrokerManager {
    *
    * WHY THIS IS PUBLIC AND NOT JUST PART OF `restore()`
    * It used to be inlined in `restore()`, which runs ONCE at boot — and that was a
-   * real bug in the StrikeEdge token flow. The daily acquisition service persists a
+   * real bug in the GTS Box token flow. The daily acquisition service persists a
    * freshly fetched Dhan token to `broker_sessions` and then calls back to say it is
    * installed; with rehydration reachable only from boot, that callback had nothing to
    * call. The token was durable but the RUNNING manager still held

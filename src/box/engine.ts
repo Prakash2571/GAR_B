@@ -1378,7 +1378,7 @@ export class BoxEngine {
     if (this.started) return;
     this.started = true;
     try {
-    // Verify PostgreSQL — StrikeEdge's operational authority — is up and migrated
+    // Verify PostgreSQL — GTS Box's operational authority — is up and migrated
     // before the positions below are read from it.
     await ensureBoxPersistenceReady();
     // Crash-only recovery is safe only behind its explicitly established and verified partial
@@ -1811,7 +1811,7 @@ export class BoxEngine {
   /** RUN: start discovering qualified boxes; execution remains gated separately. */
   async start(): Promise<{ ok: boolean; error?: string }> {
     if (!this.deps.marketData.isAuthenticated()) {
-      // Names the ACTIVE broker rather than hardcoding Zerodha. StrikeEdge runs
+      // Names the ACTIVE broker rather than hardcoding Zerodha. GTS Box runs
       // either broker, and a Dhan-active deployment showing "Connect to Zerodha"
       // sends the operator to the wrong place — the exact confusion
       // tests/box/dhanActiveNoKite.test.mjs was written about.
@@ -1825,7 +1825,7 @@ export class BoxEngine {
        * POSTGRESQL, NOT MONGODB.
        *
        * This message used to read "set MONGODB_URI", which is now actively
-       * dangerous advice: in StrikeEdge PostgreSQL is the operational authority and
+       * dangerous advice: in GTS Box PostgreSQL is the operational authority and
        * MongoDB Atlas is an asynchronous reporting replica whose absence must never
        * block the scanner. `isBoxDbEnabled()` resolves to `isPgReady()`, so the only
        * thing that can trip this branch is PostgreSQL — and an operator told to fix
@@ -1834,7 +1834,7 @@ export class BoxEngine {
       return {
         ok: false,
         error:
-          "PostgreSQL is not ready. It is StrikeEdge's authoritative operational store, so the scanner refuses to discover new boxes rather than trade unrecorded. Check DATABASE_URL and GET /api/runtime/status (pg_ready).",
+          "PostgreSQL is not ready. It is GTS Box's authoritative operational store, so the scanner refuses to discover new boxes rather than trade unrecorded. Check DATABASE_URL and GET /api/runtime/status (pg_ready).",
       };
     }
     if (this.running) return { ok: true };

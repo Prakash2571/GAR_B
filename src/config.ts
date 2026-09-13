@@ -60,7 +60,7 @@ export function loadAppConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const appTimezone = (env.APP_TIMEZONE ?? "Asia/Kolkata").trim() || "Asia/Kolkata";
   if (appTimezone !== "Asia/Kolkata") {
     problems.push(
-      `APP_TIMEZONE must be "Asia/Kolkata" — every trading-day, token-scheduling and P&L-day decision in StrikeEdge is an IST decision (got "${appTimezone}")`,
+      `APP_TIMEZONE must be "Asia/Kolkata" — every trading-day, token-scheduling and P&L-day decision in GTS Box is an IST decision (got "${appTimezone}")`,
     );
   }
 

@@ -1,6 +1,6 @@
-# StrikeEdge configuration
+# GTS Box configuration
 
-Every variable StrikeEdge reads, grouped by concern. Defaults are the code
+Every variable GTS Box reads, grouped by concern. Defaults are the code
 fallbacks (from `src/config.ts`, `src/box/config.ts`, `src/pg/pool.ts`,
 `src/outbox/mongo.ts`, `src/brokers/*`). Configuration is validated at boot and
 **fails closed** with the full list of problems.
@@ -264,24 +264,24 @@ validates and clamps each one and fails closed. The full annotated list lives in
 
 ## CalSpread variables that were REMOVED
 
-StrikeEdge deliberately **does not read** the following CalSpread variables. They
+GTS Box deliberately **does not read** the following CalSpread variables. They
 belong to features that were left behind in the extraction, so shipping them in
 `.env.example` would be a lie about what the process does. If any appear in a
 copied `.env`, they are silently ignored.
 
 | Removed variable(s) | Why it is gone |
 | --- | --- |
-| `KITE_API_SECRET` | StrikeEdge performs no Zerodha OAuth; it fetches a ready token from CalSpread. No secret is exchanged. |
+| `KITE_API_SECRET` | GTS Box performs no Zerodha OAuth; it fetches a ready token from CalSpread. No secret is exchanged. |
 | `ADMIN_SECRET` | The full-admin login is replaced by the site passcode session (`SITE_ACCESS_SECRET`) plus the runtime arming controls. |
 | `ACCESS_SECRET` | The separate trade-access password is replaced by the single site passcode. |
 | `INTERNAL_TOKEN_SECRET` | The `/api/internal/kite-token` route that fed a separate market-data recorder is gone. |
-| `TOKEN_ROUTE_SECRET` | StrikeEdge does not host token routes; it is a **client** of CalSpread's, using `KITE_TOKEN_BROKER_PASSCODE` / `DHAN_TOKEN_BROKER_PASSCODE`. |
+| `TOKEN_ROUTE_SECRET` | GTS Box does not host token routes; it is a **client** of CalSpread's, using `KITE_TOKEN_BROKER_PASSCODE` / `DHAN_TOKEN_BROKER_PASSCODE`. |
 | `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` | Upstash Redis is removed entirely; the P&L and closed-trade caches are PostgreSQL-backed. |
 | `TRADE_LOG_URI` | The calendar-spread ledger is out of scope. |
 | `NSE_FNO_ARCHIVE_URI`, `NSE_FNO_CURRENT_URI`, `NSE_FNO_SPREAD_URI` | Historical F&O capture / spread computation are calendar-scanner features, not Box. |
 | `EXTRA_SESSION_DAYS` | Only the intraday capture (removed) consumed the special-session list. |
 | `BOX_MONGODB_URI` | Mongo is no longer the operational store; PostgreSQL (`DATABASE_URL`) is. Mongo is reporting-only via `MONGODB_URI`. |
-| `DHAN_REDIRECT_URL`, `DHAN_POSTBACK_URL` | Read only by the disabled Dhan OAuth consent flow (`src/brokers/dhan/auth.ts`), which StrikeEdge never invokes. Setting them does nothing. |
+| `DHAN_REDIRECT_URL`, `DHAN_POSTBACK_URL` | Read only by the disabled Dhan OAuth consent flow (`src/brokers/dhan/auth.ts`), which GTS Box never invokes. Setting them does nothing. |
 
 > **Correction (2026-09 audit).** `DHAN_API_KEY` and `DHAN_API_SECRET` are NOT
 > inert. `readDhanCredentials()` (`src/brokers/dhan/auth.ts`) reads

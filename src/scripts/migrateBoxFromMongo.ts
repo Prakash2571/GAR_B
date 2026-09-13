@@ -2,7 +2,7 @@
  * `npm run migrate:box-from-mongo` — the ONE-TIME legacy import.
  *
  * It reads the CalSpread Box collections from a legacy MongoDB (LEGACY_BOX_MONGODB_URI)
- * and writes them into StrikeEdge's authoritative PostgreSQL tables. It is the tool
+ * and writes them into GTS Box's authoritative PostgreSQL tables. It is the tool
  * an operator runs ONCE, during cutover, to carry the historical Box book across.
  *
  * SAFETY RULES (all enforced here, all documented in docs/LEGACY_IMPORT.md):
@@ -16,7 +16,7 @@
  *     text primary key VERBATIM as a string. Trade/attempt cross-references keep
  *     their exact old string values.
  *  4. REFUSES TO RUN AGAINST A LIVE PROCESS. If the TARGET PostgreSQL already shows
- *     signs a StrikeEdge process could be trading — an armed trading session, or an
+ *     signs a GTS Box process could be trading — an armed trading session, or an
  *     unresolved (nonterminal) order intent — the import aborts unless the operator
  *     passes `--force-with-live`, which the docs explicitly tell operators never to
  *     use. Importing under a live process could interleave writes with the running
@@ -151,7 +151,7 @@ function parseArgs(argv: string[]): ImportOptions {
  *    (`legacyIntentIds`) are excluded: they are historical rows being re-imported,
  *    not evidence of a live process. A nonterminal intent in the target that is
  *    ABSENT from the legacy source is unexplained and DOES block, because it can
- *    only have been produced by a live StrikeEdge process.
+ *    only have been produced by a live GTS Box process.
  */
 async function detectLiveMarkers(
   client: PoolClient,
@@ -593,13 +593,13 @@ export async function runImport(
   return { reports, openPositions, nonterminalIntents, liveMarkers };
 }
 
-/** Raised when the target shows a StrikeEdge process could be trading. */
+/** Raised when the target shows a GTS Box process could be trading. */
 export class LiveMarkersPresentError extends Error {
   readonly markers: readonly string[];
   constructor(markers: readonly string[]) {
     super(
-      "Refusing to import while a StrikeEdge process could be trading: " +
-        `${markers.join("; ")}. Stop all StrikeEdge processes and retry. ` +
+      "Refusing to import while a GTS Box process could be trading: " +
+        `${markers.join("; ")}. Stop all GTS Box processes and retry. ` +
         "(--force-with-live exists but MUST NOT be used against a live deployment; see docs/LEGACY_IMPORT.md.)",
     );
     this.name = "LiveMarkersPresentError";

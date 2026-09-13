@@ -1,6 +1,6 @@
 # Broker token acquisition, storage and the active-broker record
 
-StrikeEdge never performs its own broker OAuth. Both access tokens are fetched from
+GTS Box never performs its own broker OAuth. Both access tokens are fetched from
 CalSpread, validated hard, encrypted with AES-256-GCM and stored in PostgreSQL. Only
 one broker is ever *active*; the other may hold a valid standby token but opens no
 socket. This document is the contract for the modules under `src/tokens/*`,

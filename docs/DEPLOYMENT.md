@@ -1,10 +1,10 @@
-# StrikeEdge deployment
+# GTS Box deployment
 
 Production deployment: PostgreSQL, migrations, build/start, PM2, nginx (with the
 SSE settings), health check, backup/restore, rollback, the safe migration
-procedure, and — most importantly — the **CalSpread → StrikeEdge cutover**.
+procedure, and — most importantly — the **CalSpread → GTS Box cutover**.
 
-PostgreSQL is StrikeEdge's operational authority; treat it accordingly.
+PostgreSQL is GTS Box's operational authority; treat it accordingly.
 
 > **Going live in Mumbai (`ap-south-1`)?** Read
 > [`docs/MUMBAI_EC2_PROFILE.md`](MUMBAI_EC2_PROFILE.md) first. It holds the conservative
@@ -253,15 +253,15 @@ Never migrate under a live, armed process.
 
 ---
 
-## 11. THE CRITICAL CUTOVER — CalSpread → StrikeEdge
+## 11. THE CRITICAL CUTOVER — CalSpread → GTS Box
 
 > **CalSpread Box live execution for both Zerodha and Dhan must remain disabled
-> before and while StrikeEdge owns Box live execution. StrikeEdge PostgreSQL
+> before and while GTS Box owns Box live execution. GTS Box PostgreSQL
 > cannot fence orders submitted independently by the old CalSpread process.**
 
-CalSpread and StrikeEdge **must not both run active Box live scanners against the
+CalSpread and GTS Box **must not both run active Box live scanners against the
 same Zerodha or Dhan account.** Their reservation/order-intent stores are separate
-(CalSpread's Mongo, StrikeEdge's PostgreSQL); neither can see or fence the other's
+(CalSpread's Mongo, GTS Box's PostgreSQL); neither can see or fence the other's
 orders. Two live scanners on one account can double-enter, race the same
 underlying and leave residuals nobody planned. The passcode/token routes are
 shared and safe; **live execution is the thing that must be exclusive.**
@@ -277,21 +277,21 @@ Perform the cutover in this order:
    working Box order, no ambiguous Box order, no unresolved Box order intent, and
    no residual Box exposure at Zerodha AND at Dhan.
 7. **Make an explicit ownership decision for any existing Box position.** Either
-   close it under CalSpread first, or import it into StrikeEdge with
+   close it under CalSpread first, or import it into GTS Box with
    `npm run migrate:box-from-mongo` (dry-run first; it copies state verbatim,
    never marks anything flat) and reconcile each open position/nonterminal intent
    by hand. Decide per position — do not leave it ambiguous.
 8. **Stop CalSpread's dedicated Box market feed.**
 9. **Keep CalSpread running** only for its remaining, non-Box functions **and its
-   two token routes** (`/api/kite/token`, `/api/dhan/token`) — StrikeEdge depends
+   two token routes** (`/api/kite/token`, `/api/dhan/token`) — GTS Box depends
    on those for the morning token.
-10. **Start StrikeEdge in paper mode** (the shipped defaults: `paper_latency`,
+10. **Start GTS Box in paper mode** (the shipped defaults: `paper_latency`,
     all live gates false).
-11. **Verify token acquisition** — StrikeEdge's morning poll fetches the day's
+11. **Verify token acquisition** — GTS Box's morning poll fetches the day's
     token from CalSpread; `/api/runtime/status` shows a healthy token.
-12. **Verify the dedicated StrikeEdge Box feed** — one socket on the active
+12. **Verify the dedicated GTS Box feed** — one socket on the active
     broker, ticks flowing.
-13. **Verify PostgreSQL restart recovery** — restart StrikeEdge and confirm it
+13. **Verify PostgreSQL restart recovery** — restart GTS Box and confirm it
     reloads open state from PostgreSQL and reconciles cleanly.
 14. **Verify Mongo outbox replication** — `/api/export/status` shows the backlog
     draining to Atlas.
@@ -307,12 +307,12 @@ Perform the cutover in this order:
 
 - **CalSpread:** its own non-Box feeds as before, **no dedicated Box feed**, and
   it continues to serve the two token routes. **No CalSpread Box live execution.**
-- **StrikeEdge:** exactly **one** dedicated Box market-data socket on the
+- **GTS Box:** exactly **one** dedicated Box market-data socket on the
   **active** broker (never two brokers at once), plus the broker order/HTTP
   connections for the active broker only. One PM2 fork process, one PostgreSQL
   pool, one (optional) Mongo client for the reporting drain.
 
 At no point do both systems hold a live Box order path to the same account. If you
 must roll back to CalSpread, reverse the exclusivity the same way: disarm and
-disable StrikeEdge live execution and stop its Box feed **before** re-enabling
+disable GTS Box live execution and stop its Box feed **before** re-enabling
 CalSpread's.

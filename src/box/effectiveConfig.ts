@@ -315,7 +315,7 @@ function loadWith(env: NodeJS.ProcessEnv): BoxConfig {
 /** Render the report as a human-readable table (for logs or an operator). */
 export function renderEffectiveConfig(report: EffectiveConfigReport): string {
   const lines: string[] = [];
-  lines.push("StrikeEdge — effective Box configuration (resolved, with provenance)");
+  lines.push("GTS Box — effective Box configuration (resolved, with provenance)");
   lines.push("");
   lines.push("Precedence:");
   for (const p of report.precedence) lines.push(`  ${p}`);

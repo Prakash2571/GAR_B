@@ -127,4 +127,4 @@ effective-config pre-flight, and `docs/RUNBOOK.md` for arming order and rollback
 
 Real trading is OFF by default (`config.ts:952`), both order streams are OFF by default, and the
 live order manager starts with `entryEnabled: false` and `liveOrderEnabled: false`. CalSpread Box
-execution must be disabled before StrikeEdge is armed against a shared account.
+execution must be disabled before GTS Box is armed against a shared account.

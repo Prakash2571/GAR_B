@@ -4,7 +4,7 @@
  * In CalSpread this file was the Mongoose schema layer: it declared the box_trades /
  * box_trade_events / box_order_intents / box_execution_attempts / box_daily_pnl /
  * box_settings / box_trading_session / box_calibration_samples collections and bound
- * them to a Mongo connection. StrikeEdge's operational authority is PostgreSQL, so
+ * them to a Mongo connection. GTS Box's operational authority is PostgreSQL, so
  * there are no Mongoose models any more. What CALLERS depended on — the record TYPES
  * with an opaque string `_id`, the archive/day-state/settings/session/calibration
  * interfaces, `isBoxEventLedgerEnabled`, and the compile-time proof that the box

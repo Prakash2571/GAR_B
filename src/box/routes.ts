@@ -28,7 +28,7 @@ export interface BoxRouteDeps {
   requireOperator: RequestHandler;
   /**
    * Resolves the operator role from the request's validated session (attached by
-   * requireOperator). StrikeEdge authenticates via an HttpOnly session cookie, not
+   * requireOperator). GTS Box authenticates via an HttpOnly session cookie, not
    * a header/query token, so this reads the request — never a query-string token —
    * which is why an SSE stream cannot be authenticated by a token in the URL.
    */

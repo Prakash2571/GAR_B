@@ -11,7 +11,7 @@
  * the CalSpread shapes the ActiveBrokerManager already destructures.
  *
  * WHAT CHANGED UNDERNEATH
- * CalSpread stored these as plaintext Mongo documents. StrikeEdge stores the access
+ * CalSpread stored these as plaintext Mongo documents. GTS Box stores the access
  * token AES-256-GCM-encrypted in PostgreSQL (`broker_sessions`) and the active
  * broker in `active_broker` with a durable, monotonic generation from a sequence.
  * The plaintext token exists only transiently in memory here and in the client that
