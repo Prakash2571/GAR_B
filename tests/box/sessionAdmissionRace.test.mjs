@@ -59,6 +59,9 @@ import { entrySideFor } from "../../dist/box/math.js";
 import { BOX_LEG_ROLES } from "../../dist/box/types.js";
 import { cfg } from "./helpers.mjs";
 
+/** The refusal reason the underlying lock uses, imported rather than hard-coded as a string. */
+const UNDERLYING_ALREADY_ACTIVE = "underlying_already_active";
+
 const NOW = 1_700_000_000_000;
 const IDENTITY = {
   deployment: "test", instance: "host-w0", pid: 1, boot: "w0", processTag: "host-w0:p1:w0",
@@ -229,7 +232,7 @@ async function armedSession({ maxAttempts = 1, maxTrades = 1, delayMs = 0, failF
 
 /* ─────────────────── the real coordinator with the real session hooks ─────────────────── */
 
-function makeCoordinator({ gateway, session, config = {} } = {}) {
+function makeCoordinator({ gateway, session, config = {}, activeUnderlyings } = {}) {
   const local = new InProcessInstrumentReservations();
   const consumeCalls = { count: 0 };
   const coordinator = new CoordinatedBoxExecutionGateway({
@@ -251,6 +254,7 @@ function makeCoordinator({ gateway, session, config = {} } = {}) {
     setTimer: () => null,
     clearTimer: () => {},
     log: () => {},
+    ...(activeUnderlyings ? { activeUnderlyings } : {}),
     ...(session
       ? {
           sessionEntryGate: () => session.evaluateEntry(false),
@@ -658,4 +662,155 @@ test("C10 DISARM during the awaited attempt write lets no new order escape", asy
   assert.equal(after.reason, "session_limit_reached");
   gateway.finish(0);
   await p.catch(() => {});
+});
+
+
+/* ═════════════════════════════════════════════════════════════════════════════════════════
+ * SECTION E — WHICH REFUSALS SPEND AN ATTEMPT, AFTER THE PROLOGUE REORDER
+ *
+ * Moving the claim above the two awaits also moved two GATES relative to the point where the
+ * attempt budget is spent, and that is a behavioural change worth pinning rather than
+ * discovering later:
+ *
+ *   BEFORE:  cycle gate → CONSUME → Layer 1a (durable underlying) → Layer 1b (hold) → budget → claim
+ *   AFTER:   duplicate → cycle gate → Layer 1a → per-underlying budget → CLAIM → CONSUME → Layer 1b
+ *
+ * So a candidate refused because the underlying is ALREADY ACTIVE — an open Box, a partial, a
+ * recovery position, or an unresolved RESIDUAL leg — no longer burns an attempt. On a
+ * one-attempt supervised trial that distinction is the difference between "the trial is over"
+ * and "that candidate was not eligible". It also matches the stated rule that candidates
+ * suppressed BEFORE admission must not consume budget.
+ *
+ * The complement is deliberate and equally pinned: once the attempt has been consumed, a later
+ * refusal does NOT refund it (E4). An attempt that got as far as competing for the cross-process
+ * underlying lease was a real attempt.
+ *
+ * These also re-assert invariant E8 (residual quantities block incompatible new entry) through
+ * the reordered path. The residual FLATTENING behaviour itself is covered in
+ * tests/box/residualRecovery.test.mjs, and the underlying-lock layers in
+ * tests/box/underlyingLockCoordinator.test.mjs; this file covers only their interaction with the
+ * attempt budget, which is what changed.
+ * ═════════════════════════════════════════════════════════════════════════════════════════ */
+
+/** The durable-activity map Layer 1a consults, keyed by normalised underlying. */
+function activeUnderlyingMap(underlying, kinds, detail) {
+  return () =>
+    new Map([[underlying.toUpperCase(), { underlying: underlying.toUpperCase(), kinds, detail }]]);
+}
+
+test("E1 an UNDERLYING-ALREADY-ACTIVE refusal spends NO attempt and leaks no claim", async (t) => {
+  const gateway = controllableGateway();
+  t.after(() => gateway.finishAll());
+  const { manager } = await armedSession({ maxAttempts: 1, maxTrades: 5, delayMs: 2 });
+  const { coordinator, consumeCalls } = makeCoordinator({
+    gateway,
+    session: manager,
+    config: { oneActiveBoxPerUnderlying: true },
+    activeUnderlyings: activeUnderlyingMap("RELIANCE", ["open_box"], "an open RELIANCE Box"),
+  });
+
+  const r = await settled(enter(coordinator, boxFor({ underlying: "RELIANCE", k1: 2500, k2: 2550 })));
+  assert.equal(r.ok, false, "a second Box on an active underlying is refused");
+  assert.equal(consumeCalls.count, 0, "and the refusal must NOT spend the one available attempt");
+  assert.equal(manager.snapshot().entry_attempts, 0);
+  assert.equal(gateway.started.length, 0, "nothing reached execution");
+
+  const m = coordinator.metrics();
+  assert.equal(m.activeExecutions, 0, "no claim leaked");
+  assert.equal(m.activeInstrumentReservations, 0, "no reservation leaked");
+
+  // The budget is genuinely intact: a DIFFERENT, eligible underlying can still use it.
+  const ok = enter(coordinator, boxFor({ underlying: "INFY", k1: 1500, k2: 1550 }));
+  await letAdmissionSettle();
+  assert.equal(manager.snapshot().entry_attempts, 1, "the attempt was still available afterwards");
+  gateway.finishAll();
+  await ok;
+});
+
+test("E2 an unresolved RESIDUAL leg blocks a new Box on that underlying without spending an attempt", async (t) => {
+  const gateway = controllableGateway();
+  t.after(() => gateway.finishAll());
+  const { manager } = await armedSession({ maxAttempts: 1, maxTrades: 5, delayMs: 2 });
+  const { coordinator, consumeCalls } = makeCoordinator({
+    gateway,
+    session: manager,
+    config: { oneActiveBoxPerUnderlying: true },
+    activeUnderlyings: activeUnderlyingMap(
+      "RELIANCE",
+      ["residual_leg"],
+      "an unresolved residual RELIANCE leg",
+    ),
+  });
+
+  const r = await settled(enter(coordinator, boxFor({ underlying: "RELIANCE", k1: 2600, k2: 2650 })));
+  assert.equal(r.ok, false, "residual exposure blocks an incompatible new entry");
+  assert.match(
+    String(r.detail),
+    /residual/i,
+    "and the refusal names the residual rather than looking like a contract conflict",
+  );
+  assert.equal(consumeCalls.count, 0, "an ineligible candidate must not consume trial budget");
+  assert.equal(manager.snapshot().entry_attempts, 0);
+});
+
+test("E3 a CONSUME refusal releases the claim and leaves the underlying free for a later entry", async (t) => {
+  const gateway = controllableGateway();
+  t.after(() => gateway.finishAll());
+  // The attempt write fails, so the consume refuses AFTER the claim has been taken.
+  const { manager } = await armedSession({ maxAttempts: 5, failFrom: 2 });
+  const { coordinator } = makeCoordinator({
+    gateway,
+    session: manager,
+    config: { oneActiveBoxPerUnderlying: true },
+  });
+
+  const r = await settled(enter(coordinator, boxFor({ underlying: "RELIANCE", k1: 2500, k2: 2550 })));
+  assert.equal(r.ok, false);
+  assert.equal(gateway.started.length, 0, "ZERO order-placement paths were entered");
+
+  const m = coordinator.metrics();
+  assert.equal(m.activeExecutions, 0, "the claim taken before the consume was released");
+  assert.equal(m.activeInstrumentReservations, 0);
+
+  // THE POINT: the underlying must not be left held. A leaked exclusive hold here would block
+  // this underlying for the rest of the process's life, which a database blip must not cause.
+  const retry = await settled(enter(coordinator, boxFor({ underlying: "RELIANCE", k1: 2500, k2: 2550 })));
+  assert.notEqual(
+    retry.reason,
+    UNDERLYING_ALREADY_ACTIVE,
+    "a failed attempt must not leave the underlying permanently held",
+  );
+  assert.notEqual(retry.reason, "duplicate", "nor leave a phantom incumbent");
+});
+
+test("E4 once CONSUMED, a later refusal does NOT refund the attempt", async (t) => {
+  const gateway = controllableGateway();
+  t.after(() => gateway.finishAll());
+  const { manager } = await armedSession({ maxAttempts: 2, maxTrades: 5, delayMs: 2 });
+
+  // Two coordinators sharing one session, as two competing pipelines would: the second takes the
+  // same underlying's exclusive hold and is refused at Layer 1b — AFTER consuming.
+  const { coordinator, consumeCalls } = makeCoordinator({
+    gateway,
+    session: manager,
+    config: { oneActiveBoxPerUnderlying: true },
+  });
+
+  const first = enter(coordinator, boxFor({ underlying: "RELIANCE", k1: 2500, k2: 2550 }));
+  await letAdmissionSettle();
+  assert.equal(manager.snapshot().entry_attempts, 1, "the first attempt was consumed");
+
+  // A second, DIFFERENT-CONTRACT Box on the SAME underlying. Layer 1a sees nothing durable yet,
+  // so it reaches the consume and then loses the exclusive underlying hold.
+  const second = await settled(enter(coordinator, boxFor({ underlying: "RELIANCE", k1: 2600, k2: 2650 })));
+  assert.equal(second.ok, false, "the second pipeline on the same underlying is refused");
+  assert.equal(
+    manager.snapshot().entry_attempts,
+    2,
+    "the attempt it had already consumed is NOT handed back — it really did attempt",
+  );
+  assert.equal(consumeCalls.count, 2);
+
+  gateway.finishAll();
+  await first;
 });
