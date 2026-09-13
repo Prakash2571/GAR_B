@@ -46,7 +46,7 @@ export const MARKET_DATA_LANES: readonly MarketDataLane[] = ["futures", "box"] a
  * Stated once, here, so the answer cannot drift between the subscription layer, the
  * diagnostics and the engine.
  *
- *   futures — calendar-spread board, spot prices for CalSpread, near/current/mid
+ *   futures — calendar-spread board, spot prices for the predecessor codebase, near/current/mid
  *             futures, the calendar-spread scanner, futures analytics, and the
  *             hourly/EOD captures that depend on live ticks.
  *   box     — option contracts (CE/PE strikes) for the Box scanner: bid/ask/depth,

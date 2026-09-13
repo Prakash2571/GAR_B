@@ -11,7 +11,7 @@
  *
  * SHAPE
  *   <deployment>:<instance>:p<pid>:<boot>:<kind>-<seq>:<uuid>
- *   production-mumbai:calspread-1:p38192:m8x2a:entry-7:9f2c1e...
+ *   production-mumbai:gts-1:p38192:m8x2a:entry-7:9f2c1e...
  *
  * Every component earns its place:
  *   deployment  namespaces staging away from production in a shared cluster

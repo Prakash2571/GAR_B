@@ -5,7 +5,7 @@
  * WHY A FIXED +5:30 OFFSET, NOT `Intl`
  * India has never observed daylight saving, so the IST offset is a constant
  * +5:30. `src/boxSupport.ts` `istDayKey` computes the P&L day key with exactly
- * this arithmetic, and every durable day key CalSpread ever wrote was produced
+ * this arithmetic, and every durable day key the predecessor codebase ever wrote was produced
  * that way. If the token scheduler used `Intl.DateTimeFormat` with a named zone
  * instead, a subtle disagreement at the midnight boundary between two libraries
  * could make "today" mean two different things in two subsystems. It must mean

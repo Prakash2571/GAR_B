@@ -1,7 +1,7 @@
 /**
  * tokenProviderClient — the ONLY outbound HTTP that fetches a broker access token
- * from CalSpread. StrikeEdge never performs its own broker OAuth: it asks the
- * CalSpread token route for the token CalSpread already holds, validates it hard,
+ * from the predecessor codebase. This backend never performs its own broker OAuth: it asks the
+ * external CalSpread token route for the token that service already holds, validates it hard,
  * and hands it to the session store to encrypt.
  *
  * SECURITY POSTURE

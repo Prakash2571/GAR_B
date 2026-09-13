@@ -3,15 +3,15 @@
  * decrypted or read back.
  *
  * PORTING CONTRACT (INTERNAL_SEAMS.md, seam 5)
- * These functions keep CalSpread's signatures exactly — `loadDhanSession`,
+ * These functions keep the predecessor codebase's signatures exactly — `loadDhanSession`,
  * `saveDhanSession`, `clearDhanSession`, `loadActiveBroker`, `saveActiveBroker`,
  * plus Zerodha equivalents — so `src/brokers/registry.ts` is ported by changing a
  * single import line from `../db.js` to `../brokerState/brokerSessions.js`. The
  * shapes returned (`IKiteSession`, `IDhanSession`, `{ broker, generation }`) are
- * the CalSpread shapes the ActiveBrokerManager already destructures.
+ * the predecessor codebase's shapes the ActiveBrokerManager already destructures.
  *
  * WHAT CHANGED UNDERNEATH
- * CalSpread stored these as plaintext Mongo documents. StrikeEdge stores the access
+ * the predecessor codebase stored these as plaintext Mongo documents. This backend stores the access
  * token AES-256-GCM-encrypted in PostgreSQL (`broker_sessions`) and the active
  * broker in `active_broker` with a durable, monotonic generation from a sequence.
  * The plaintext token exists only transiently in memory here and in the client that
@@ -76,10 +76,10 @@ function boundedValue(raw: unknown): string {
 }
 
 /* -------------------------------------------------------------------------- */
-/*  CalSpread-compatible session shapes                                       */
+/*  predecessor-compatible session shapes                                       */
 /* -------------------------------------------------------------------------- */
 
-/** Zerodha session — the CalSpread `IKiteSession` shape (minus the Mongo `_id`). */
+/** Zerodha session — the predecessor codebase's `IKiteSession` shape (minus the Mongo `_id`). */
 export interface IKiteSession {
   access_token: string;
   user_id: string;
@@ -88,7 +88,7 @@ export interface IKiteSession {
   updated_at: Date;
 }
 
-/** Dhan session — the CalSpread `IDhanSession` shape (minus the Mongo `_id`). */
+/** Dhan session — the predecessor codebase's `IDhanSession` shape (minus the Mongo `_id`). */
 export interface IDhanSession {
   access_token: string;
   dhan_client_id: string;
@@ -256,7 +256,7 @@ async function invalidateSession(broker: "zerodha" | "dhan", reason: string): Pr
 }
 
 /* -------------------------------------------------------------------------- */
-/*  Zerodha (Kite) session — CalSpread signatures                             */
+/*  Zerodha (Kite) session — predecessor signatures                             */
 /* -------------------------------------------------------------------------- */
 
 /** Persist (upsert) the current Zerodha access token, encrypted. */
@@ -298,7 +298,7 @@ export async function clearKiteSession(reason = "cleared"): Promise<void> {
 }
 
 /* -------------------------------------------------------------------------- */
-/*  Dhan session — CalSpread signatures                                       */
+/*  Dhan session — predecessor signatures                                       */
 /* -------------------------------------------------------------------------- */
 
 /** Persist (upsert) the current Dhan session, encrypted. */
@@ -318,7 +318,7 @@ export async function saveDhanSession(data: {
     // The client name / UCC / PoA are NOT authenticated as AAD (they are display
     // fields Dhan may vary), but the identity that the token is bound to — the
     // client id — is. They are stored here folded into broker_identity as a small
-    // JSON blob so the CalSpread IDhanSession shape can be reconstructed on load.
+    // JSON blob so the predecessor codebase's IDhanSession shape can be reconstructed on load.
     brokerIdentity: JSON.stringify({
       name: data.dhan_client_name,
       ucc: data.dhan_client_ucc,

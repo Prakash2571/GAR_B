@@ -1,7 +1,7 @@
 {
-  "name": "strikedge_backend",
+  "name": "gts-algo-research-backend",
   "version": "1.0.0",
-  "description": "StrikeEdge \u2014 standalone Box-arbitrage backend (Zerodha + Dhan, PostgreSQL authoritative, MongoDB async replica)",
+  "description": "GTS Algo Research \u2014 Box arbitrage execution backend for Zerodha and Dhan (PostgreSQL authoritative, MongoDB async replica)",
   "main": "dist/index.js",
   "type": "module",
   "scripts": {
