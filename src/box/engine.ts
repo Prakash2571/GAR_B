@@ -23,6 +23,7 @@ import type {
   BoxMarginProvider,
   BoxMarketDataProvider,
 } from "./brokerContext.js";
+import { createPlannedMarginProvider } from "./plannedMarginEvidence.js";
 import type { Tick } from "../ticker.js";
 import {
   BOX_TUNING_KEYS,
@@ -1094,47 +1095,25 @@ export class BoxEngine {
           // zero utilisation is a real, trustworthy figure and stays 0; an ABSENT one stays null and
           // makes the funding gate refuse. `Number.isFinite(0)` is true, so presence is decided by
           // the adapter's null, never inferred from the value.
+          //
+          // WHERE THE REFUSAL COMES FROM, for each broker's declared semantics (fundsSemantics.ts):
+          // for a GROSS or UNVERIFIED broker the utilisation is needed to compute spendable funds at
+          // all, so a null yields no funds figure. For a NET broker it is not needed for the
+          // subtraction, but its absence means the already-net claim cannot be corroborated — so the
+          // encumbrance stays a required UNKNOWN component of the binding requirement and stage
+          // funding refuses. Either way an absent utilisation refuses rather than being assumed idle.
           utilisedRupees: typeof m.utilised === "number" && Number.isFinite(m.utilised) ? m.utilised : null,
           observedAt: Date.now(),
         };
       },
-      plannedMargin: async (requests) => {
-        const orders = requests.map((r) => ({
-          exchange: r.exchange,
-          tradingsymbol: r.tradingsymbol,
-          transaction_type: r.side,
-          variety: "regular",
-          product: "NRML",
-          order_type: "LIMIT",
-          quantity: r.quantity,
-          price: r.pricing.limit_price,
-          reference_price: r.pricing.limit_price,
-        }));
-        const basket = await this.deps.margins.basketMargin(orders).catch(() => null);
-        // "unavailable" is an HONEST no-figure, not a zero: surface it as missing so the gate
-        // fails closed rather than admitting on a fabricated ₹0 margin.
-        if (!basket || basket.source === "unavailable" || !Number.isFinite(basket.total)) {
-          return { marginRupees: null, observedAt: Date.now() };
-        }
-        // SECTION 8. `initial` and `final` are passed through SEPARATELY and are never collapsed
-        // here. Kite documents `initial` as "Total margins required to execute the orders" and
-        // `final` as "Total margins with the spread benefit"; the stage model needs both, because
-        // while legging the spread benefit does not exist yet. `total` is retained for the existing
-        // single-figure margin control, unchanged.
-        return {
-          marginRupees: basket.total,
-          observedAt: Date.now(),
-          initialMarginRupees: Number.isFinite(basket.initial) ? basket.initial : null,
-          finalMarginRupees: Number.isFinite(basket.final) ? basket.final : null,
-          // STILL NULL HERE, AND THAT IS NOW CORRECT RATHER THAN A GAP. The basket-margin endpoint
-          // genuinely does not report account encumbrance; it prices a hypothetical basket. The
-          // encumbrance now arrives from the FUNDS provider above, which is the endpoint that reports
-          // it — and which is also where the `available` figure comes from, so the two are read from
-          // one response and cannot disagree with each other. The gateway prefers the funds-derived
-          // value and falls back to this only if a future provider can supply it.
-          encumbranceRupees: null,
-        };
-      },
+      // THE PLANNED-MARGIN EVIDENCE PROVIDER, extracted to `plannedMarginEvidence.ts`.
+      //
+      // It used to be an inline closure here, which meant the rules deciding whether a broker's
+      // margin answer counts as EVIDENCE could not be tested without constructing the whole engine
+      // (and a database). Both defects it guards against — accepting an INCOMPLETE basket figure,
+      // and using `Number.isFinite` as a presence test so a fabricated `initial: 0` read as an
+      // established requirement — shipped under exactly that lack of reachable coverage.
+      plannedMargin: createPlannedMarginProvider({ margins: this.deps.margins }),
       // MONOTONIC clock for evidence aging and read deadlines, separate from the wall clock used
       // for audit stamps. An NTP correction must not be able to fabricate or erase staleness.
       monotonicNow: () => performance.now(),
@@ -3568,8 +3547,19 @@ export class BoxEngine {
           // long box is a hedged position, so a position-aware basket margin can
           // legitimately be low, whichever broker computed it. Only a thrown error (network / auth / rate
           // limit) is a miss worth retrying — a successful small number is real.
-          if (!Number.isFinite(res.total)) {
-            throw new Error(`basket margin returned a non-numeric total`);
+          // A null total is UNKNOWN, and an INCOMPLETE figure covers only part of the basket.
+          // Neither is a margin for this trade. Throwing routes both into the existing retry /
+          // backfill path, which leaves the column NULL — honestly blank — rather than
+          // persisting a partial sum that becomes indistinguishable from a real basket margin
+          // the moment it is written.
+          if (res.total === null || !Number.isFinite(res.total)) {
+            throw new Error(`basket margin returned no usable total (source=${res.source})`);
+          }
+          if (res.complete !== true) {
+            throw new Error(
+              `basket margin covered only ${res.legs_priced}/${res.legs_requested} legs and is ` +
+                `not a basket figure: ${res.incomplete_reason ?? "incomplete"}`,
+            );
           }
           const margin = Math.max(0, Math.round(res.total));
           // Say so when the figure is NOT a netted basket number. Only `res.total` is

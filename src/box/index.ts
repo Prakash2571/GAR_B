@@ -66,7 +66,23 @@ export interface BoxModuleDeps {
       quantity: number;
       price: number;
     }[],
-  ) => Promise<{ initial: number; final: number; total: number }>;
+  ) => Promise<{
+    initial: number;
+    final: number;
+    total: number;
+    /**
+     * PRESENCE flags, when the caller's client tracks them (`src/kite.ts` does).
+     *
+     * Optional so an older injector still compiles, but when supplied they are AUTHORITATIVE:
+     * Zerodha returns `0` for a block it did not send, and treating that 0 as an established
+     * requirement is defect B's Zerodha-shaped twin. Absent flags are treated conservatively as
+     * "value present" only because this legacy path is Zerodha-only and its caller does supply
+     * them; see the mapping in `mountBox`.
+     */
+    initial_available?: boolean;
+    final_available?: boolean;
+    total_basis?: "final" | "initial" | "unavailable";
+  }>;
   /**
    * The site-passcode gate. In the predecessor codebase this was `requireAdmin`, a header/query
    * admin-token middleware; in this backend it is `requireOperator`, which validates
@@ -178,10 +194,27 @@ export function registerBoxModule(app: Express, deps: BoxModuleDeps): BoxModule 
     isMarketOpen: deps.isMarketOpen,
     margins: deps.margins ?? {
       broker: "zerodha" as const,
-      basketMargin: async (orders) => ({
-        ...(await deps.getBasketMargin(orders)),
-        source: "kite_basket" as const,
-      }),
+      // The legacy Zerodha-only margin provider, used when no broker-aware provider is injected.
+      // Mapped field-by-field onto the nullable/completeness contract rather than spread, so a
+      // block Zerodha did not send stays UNKNOWN instead of arriving as a numeric ₹0.
+      basketMargin: async (orders) => {
+        const res = await deps.getBasketMargin(orders);
+        const initialUsable = res.initial_available ?? true;
+        const finalUsable = res.final_available ?? true;
+        const totalUsable = (res.total_basis ?? "final") !== "unavailable";
+        return {
+          initial: initialUsable ? res.initial : null,
+          final: finalUsable ? res.final : null,
+          total: totalUsable ? res.total : null,
+          source: "kite_basket" as const,
+          complete: totalUsable,
+          legs_requested: orders.length,
+          legs_priced: totalUsable ? orders.length : 0,
+          incomplete_reason: totalUsable
+            ? null
+            : "Zerodha's basket-margin response contained neither an `initial` nor a `final` total",
+        };
+      },
     },
     ...(deps.createLiveAdapter ? { createLiveAdapter: deps.createLiveAdapter } : {}),
     ...(deps.createDhanOrderFeed ? { createDhanOrderFeed: deps.createDhanOrderFeed } : {}),

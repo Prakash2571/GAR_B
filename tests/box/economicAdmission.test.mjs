@@ -215,7 +215,7 @@ test("funds cover REFUSES when funds are missing, never admits on unknown funds"
   assert.ok(r.reasons.includes("insufficient_available_funds"));
 });
 
-test("funds cover uses BROKER MARGIN when usable, else the WORST-CASE cost — never the net debit", () => {
+test("funds cover uses BROKER MARGIN when usable, and REFUSES when there is no margin figure", () => {
   // Funds 30,000. Broker margin 41,250 (fresh) > funds ⇒ refuse.
   const withMargin = evaluateEconomicAdmission({
     picture: picture({
@@ -228,12 +228,21 @@ test("funds cover uses BROKER MARGIN when usable, else the WORST-CASE cost — n
   assert.ok(withMargin.reasons.includes("insufficient_available_funds"));
   assert.match(withMargin.detail, /broker margin/);
 
-  // No usable margin: fall back to worst-case gross entry cost (20,000). Funds 30,000 cover it.
+  // CHANGED DELIBERATELY. This second half used to assert that with NO usable margin the check
+  // fell back to the worst-case GROSS ENTRY COST (₹20,000) and admitted, because ₹30,000 covers
+  // it. That is the defect: ₹20,000 of option premium says nothing about the margin the two SHORT
+  // legs of this box attract, which in the same fixture is ₹41,250 — more than the funds
+  // available. Substituting premium for margin therefore admitted an entry the account could not
+  // fund, using a comparison that reads like diligence.
+  //
+  // With no real requirement the answer is UNKNOWN, and admission refuses.
   const noMargin = evaluateEconomicAdmission({
     picture: picture({ availableFundsRupees: 30_000, availableFundsObservedAt: NOW }),
     grossCapRupees: 0, requireFundsCover: true, requireMarginEvidence: false,
   });
-  assert.equal(noMargin.allowed, true, "30k funds cover the 20k worst-case cost");
+  assert.equal(noMargin.allowed, false, "no margin evidence ⇒ no funding requirement ⇒ refuse");
+  assert.ok(noMargin.reasons.includes("metric_incomplete"));
+  assert.match(noMargin.detail, /Gross option premium is NOT used as a substitute/);
 });
 
 test("gross cap control stays consistent with the standalone gross-notional gate", () => {

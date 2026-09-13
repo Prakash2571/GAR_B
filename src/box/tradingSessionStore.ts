@@ -98,9 +98,55 @@ export class BoxTradingSessionManager {
    * answer that cannot lose a spent cycle.
    */
   private writeFailed = false;
+  /**
+   * SERIALIZATION TAIL. Every mutation runs to completion before the next one starts.
+   *
+   * THE DEFECT THIS CLOSES. `commit()` is a read-modify-write over `this.record` with an `await`
+   * in the middle, and nothing serialised the callers:
+   *
+   *     const previous = this.record;      // READ
+   *     this.record = next;                // MODIFY  (next was derived from a snapshot)
+   *     await this.deps.persistence.save(next);   // ← YIELD
+   *     if (rollbackOnFailure) this.record = previous;   // on failure
+   *
+   * Two overlapping mutations both derived `next` from the SAME snapshot, so the later `save()`
+   * wrote a row that had never seen the earlier increment — a classic lost update, and the counter
+   * it loses is the one bounding how many live entry attempts may be made. Worse, a FAILED write
+   * could roll `this.record` back to a `previous` captured before an interleaved writer ran,
+   * discarding that other writer's already-successful mutation.
+   *
+   * The concurrent callers are real and unrelated: the coordinator awaits `recordAttemptStarted()`
+   * on the entry path while the engine's periodic reconciliation calls `retryPendingWrite()`,
+   * `recordEstablished()`, `recordCompleted()` and the fire-and-forget `recordAborted()`.
+   *
+   * A promise-chain mutex is the right instrument here rather than a distributed lock: the
+   * deployment is explicitly ONE Node process (see `backendInstance.ts` and migration 009, whose
+   * boot-ordinal fencing treats two live instances as a forbidden topology), so in-process
+   * ordering is the whole ordering. Each mutation re-derives its next record from the CURRENT
+   * `this.record` INSIDE the critical section, which is what makes increments compose.
+   */
+  private mutations: Promise<unknown> = Promise.resolve();
 
   constructor(private readonly deps: TradingSessionManagerDeps) {
     this.record = idleSessionRecord(this.now());
+  }
+
+  /**
+   * Run `mutate` with exclusive access to the session record.
+   *
+   * `mutate` MUST read `this.record` itself (not a value captured by its caller), because the
+   * point of the queue is that the record may have advanced while it waited its turn.
+   *
+   * The tail is advanced with a catch-swallowing continuation so one rejected mutation cannot
+   * wedge the queue for every later one; the rejection is still propagated to ITS OWN caller.
+   */
+  private serialize<T>(mutate: () => Promise<T>): Promise<T> {
+    const run = this.mutations.then(mutate, mutate);
+    this.mutations = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
   }
 
   private now(): number {
@@ -180,8 +226,10 @@ export class BoxTradingSessionManager {
     if (outstanding.length === 0) return;
     const flat = await this.deps.persistence.flatTradeIds(outstanding);
     if (flat.length === 0) return;
-    const next = reconcileCompletions(this.record, flat, this.now());
-    await this.commit(next, "reconcile boot completions", true);
+    await this.serialize(async () => {
+      const next = reconcileCompletions(this.record, flat, this.now());
+      await this.commit(next, "reconcile boot completions", true);
+    });
     this.deps.log?.(
       `[Box] session reconciliation closed ${flat.length} cycle(s) that reached FLAT while the ` +
         "process was down.",
@@ -305,6 +353,18 @@ export class BoxTradingSessionManager {
     if (!this.loaded) {
       return { ok: false, reason: `durable session state is unreadable (${this.loadError ?? "unknown"})` };
     }
+    return this.serialize(() => this.armLocked(args));
+  }
+
+  /** The body of {@link arm}, run under the mutation lock. */
+  private async armLocked(args: {
+    readonly maxCompletedTrades?: number;
+    readonly maxEntryAttempts?: number;
+    readonly armedBy: string | null;
+    readonly openBoxes: number;
+    readonly residualLegs: number;
+    readonly recoveryActive: boolean;
+  }): Promise<{ ok: true; record: BoxSessionRecord } | { ok: false; reason: string }> {
     const permitted = canArm({
       record: this.record,
       openBoxes: args.openBoxes,
@@ -332,7 +392,10 @@ export class BoxTradingSessionManager {
   /** Disarm. Counters are preserved, so disarm-then-arm cannot skip the exposure guard. */
   async disarm(): Promise<boolean> {
     if (!this.loaded) return false;
-    return this.commit(disarmSession(this.record, this.now()), "disarm", true);
+    // Serialized so a disarm cannot interleave with an in-flight attempt write. Ordering is then
+    // unambiguous: an attempt that already won the lock is counted and admitted, and every attempt
+    // that queues BEHIND the disarm finds an unarmed session and is refused.
+    return this.serialize(() => this.commit(disarmSession(this.record, this.now()), "disarm", true));
   }
 
   /**
@@ -342,14 +405,17 @@ export class BoxTradingSessionManager {
    * partially-filled or economics-aborted entry never established a Box and must not burn a cycle.
    */
   async recordEstablished(tradeId: string): Promise<void> {
-    if (!this.deps.persistenceAvailable() || !this.loaded || !isArmed(this.record)) return;
-    const next = recordEstablishedBox(this.record, tradeId, this.now());
-    // Already counted IN MEMORY. Normally idempotent — but when a previous write failed, the
-    // in-memory record is ahead of the durable one and entry is closed until it catches up, so
-    // this call is the RETRY. Returning early here would have wedged entry closed permanently.
-    if (next === this.record && !this.writeFailed) return;
-    // NO ROLLBACK: the Box exists, so the cycle is spent whether or not Mongo agrees yet.
-    await this.commit(next, `establish ${tradeId}`, false);
+    if (!this.deps.persistenceAvailable()) return;
+    await this.serialize(async () => {
+      if (!this.loaded || !isArmed(this.record)) return;
+      const next = recordEstablishedBox(this.record, tradeId, this.now());
+      // Already counted IN MEMORY. Normally idempotent — but when a previous write failed, the
+      // in-memory record is ahead of the durable one and entry is closed until it catches up, so
+      // this call is the RETRY. Returning early here would have wedged entry closed permanently.
+      if (next === this.record && !this.writeFailed) return;
+      // NO ROLLBACK: the Box exists, so the cycle is spent whether or not Mongo agrees yet.
+      await this.commit(next, `establish ${tradeId}`, false);
+    });
   }
 
   /**
@@ -360,16 +426,24 @@ export class BoxTradingSessionManager {
    * pending.
    */
   async retryPendingWrite(): Promise<void> {
-    if (!this.writeFailed || !this.deps.persistenceAvailable()) return;
-    await this.commit(this.record, "retry pending consumption", false);
+    if (!this.deps.persistenceAvailable()) return;
+    // Serialized with everything else: this used to be able to run CONCURRENTLY with
+    // `recordAttemptStarted`, re-saving a snapshot that another mutation had already superseded.
+    await this.serialize(async () => {
+      if (!this.writeFailed) return;
+      await this.commit(this.record, "retry pending consumption", false);
+    });
   }
 
   /** Record that an established Box reached fully FLAT. COMPLETES a cycle. */
   async recordCompleted(tradeId: string): Promise<void> {
-    if (!this.deps.persistenceAvailable() || !this.loaded) return;
-    const next = recordCompletedBox(this.record, tradeId, this.now());
-    if (next === this.record) return;
-    await this.commit(next, `complete ${tradeId}`, true);
+    if (!this.deps.persistenceAvailable()) return;
+    await this.serialize(async () => {
+      if (!this.loaded) return;
+      const next = recordCompletedBox(this.record, tradeId, this.now());
+      if (next === this.record) return;
+      await this.commit(next, `complete ${tradeId}`, true);
+    });
   }
 
   /** Record an entry attempt that ended with no Box. Visibility only; consumes nothing. */
@@ -391,29 +465,65 @@ export class BoxTradingSessionManager {
       // `evaluateEntry` has already returned "no opinion" for the same reason.
       return { ok: true, detail: null };
     }
-    if (!this.loaded || !isArmed(this.record)) {
-      // Unreadable or unarmed sessions are already refused by evaluateEntry; reaching here means the
-      // caller did not consult it. Refuse rather than silently proceed unbounded.
-      return {
-        ok: false,
-        detail: "the trading session is not armed or its durable state is unreadable, so an entry attempt cannot be accounted for",
-      };
-    }
-    const next = recordEntryAttemptStarted(this.record, this.now());
-    if (!(await this.commit(next, "entry attempt started", true))) {
-      return {
-        ok: false,
-        detail:
-          "the entry attempt could not be durably recorded, so it was NOT started. Counting attempts " +
-          "is what bounds repeated failed attempts, and an unrecorded attempt would be unbounded.",
-      };
-    }
-    return { ok: true, detail: null };
+    // SERIALIZED, and the budget is re-checked INSIDE the critical section.
+    //
+    // Both halves matter. Deriving `next` from `this.record` here rather than from a value read
+    // before queueing is what makes two concurrent consumptions compose into +2 instead of +1.
+    // Re-evaluating the ceiling here is what stops two callers who each passed the synchronous
+    // `evaluateEntry` gate from both spending the LAST allowance: the second one now finds the
+    // budget already exhausted and is refused, which is the durable equivalent of the
+    // claim-before-yield fix in the coordinator's prologue.
+    return this.serialize(async () => {
+      if (!this.loaded || !isArmed(this.record)) {
+        // Unreadable or unarmed sessions are already refused by evaluateEntry; reaching here means
+        // the caller did not consult it, OR the session was disarmed while this call queued.
+        // Refuse rather than silently proceed unbounded.
+        return {
+          ok: false,
+          detail:
+            "the trading session is not armed or its durable state is unreadable, so an entry attempt cannot be accounted for",
+        };
+      }
+      // RE-CHECK THE WHOLE VERDICT, not just the attempt budget. The caller consulted
+      // `evaluateEntry` SYNCHRONOUSLY before this mutation was queued, so any budget that became
+      // exhausted while it waited its turn — the attempt ceiling OR the completed-cycle ceiling —
+      // must be honoured here rather than spending an attempt against a session that has since
+      // closed. Honouring only one reason left the other able to slip through.
+      //
+      // `recoveryActive` is deliberately false: this manager does not observe recovery state, and
+      // the caller's synchronous gate is the authority on it. That is a narrowing, and it is safe
+      // in the conservative direction only because recovery activation cannot make a refusal into
+      // an admission — it can only add a reason to refuse, which the caller already applied.
+      const verdict = evaluateSessionEntry({ record: this.record, recoveryActive: false });
+      if (!verdict.allowed) {
+        return {
+          ok: false,
+          detail:
+            verdict.detail ??
+            `the armed trading session refused the attempt (${verdict.reason ?? "session_limit_reached"})`,
+        };
+      }
+      const next = recordEntryAttemptStarted(this.record, this.now());
+      if (!(await this.commit(next, "entry attempt started", true))) {
+        return {
+          ok: false,
+          detail:
+            "the entry attempt could not be durably recorded, so it was NOT started. Counting attempts " +
+            "is what bounds repeated failed attempts, and an unrecorded attempt would be unbounded.",
+        };
+      }
+      return { ok: true, detail: null };
+    });
   }
 
   async recordAborted(): Promise<void> {
-    if (!this.deps.persistenceAvailable() || !this.loaded || !isArmed(this.record)) return;
-    await this.commit(recordAbortedAttempt(this.record, this.now()), "aborted attempt", true);
+    if (!this.deps.persistenceAvailable()) return;
+    // Called fire-and-forget (`void this.session.recordAborted()`), so without serialization this
+    // was the most likely writer to interleave with a consumption and lose it.
+    await this.serialize(async () => {
+      if (!this.loaded || !isArmed(this.record)) return;
+      await this.commit(recordAbortedAttempt(this.record, this.now()), "aborted attempt", true);
+    });
   }
 
   /** The status projection, including the load-failure block reason. */

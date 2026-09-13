@@ -150,10 +150,27 @@ test("FRESH funds that cover the requirement ADMIT the entry (evidence-driven, n
   const h = harness({
     config: { liveRequireFundsCover: true },
     funds: async () => ({ availableRupees: 10_000_000, observedAt: NOW }),
+    // A real broker margin figure is now REQUIRED for funds cover to have anything to compare
+    // against: the previous gross-option-premium substitute has been removed, because premium
+    // does not bound the margin a short option requires.
+    plannedMargin: async () => ({ marginRupees: 50_000, observedAt: NOW }),
   });
   const entry = await runEntry(h);
   assert.equal(entry.ok, true, "fresh funds covering the requirement admit the entry");
   assert.equal(h.submitted.length, 4, "all four legs were submitted once admission passed");
+});
+
+test("funds cover with NO margin figure refuses and submits nothing (no premium substitute)", async () => {
+  // The complement of the test above, and the safety half of it: ample funds plus funds-cover
+  // enabled must NOT admit while the funding requirement is unknown. Pre-fix this admitted by
+  // comparing ₹10,000,000 against the gross entry premium.
+  const h = harness({
+    config: { liveRequireFundsCover: true },
+    funds: async () => ({ availableRupees: 10_000_000, observedAt: NOW }),
+  });
+  const entry = await runEntry(h);
+  assert.equal(entry.ok, false, "an unknown requirement cannot be 'covered' by any amount of funds");
+  assert.equal(h.submitted.length, 0, "ZERO order-placement calls reached the manager");
 });
 
 test("INSUFFICIENT fresh funds block entry (funds compared to a real requirement, not the cap)", async () => {
