@@ -3,16 +3,16 @@
  *
  * WHY THIS FILE EXISTS
  * `BoxEngine.start()` refuses for two reasons, and both messages were inherited from
- * CalSpread where they were correct and in StrikeEdge were not:
+ * the predecessor codebase where they were correct and in this backend were not:
  *
- *   1. It said "Box persistence is not configured (set MONGODB_URI)". In StrikeEdge
+ *   1. It said "Box persistence is not configured (set MONGODB_URI)". In this backend
  *      PostgreSQL is the operational authority and MongoDB Atlas is an asynchronous
  *      reporting replica whose absence must NEVER block the scanner. `isBoxDbEnabled()`
  *      resolves to `isPgReady()`, so the only thing that can trip that branch is
  *      PostgreSQL. Telling an operator to fix Mongo while PostgreSQL is down sends them
  *      to the wrong database in the middle of a session.
  *
- *   2. It said "Connect to Zerodha before starting the box scanner". StrikeEdge runs
+ *   2. It said "Connect to Zerodha before starting the box scanner". GTS Algo Research runs
  *      either broker, so a Dhan-active deployment showed an instruction naming a broker
  *      it was not using.
  *

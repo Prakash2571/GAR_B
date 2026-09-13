@@ -9,7 +9,7 @@
  * and it wraps every outbound-network primitive Node offers so that ANY request
  * to a non-loopback host throws immediately. A test that reaches
  * images.dhan.co / api.kite.trade / auth.dhan.co / calspread.online (the live
- * broker endpoints the CalSpread suite used) turns the build RED instead of
+ * broker endpoints the predecessor suite used) turns the build RED instead of
  * quietly making 24 real HTTPS calls per run.
  *
  * WHY IT DOES NOT FIGHT THE TEST HELPERS

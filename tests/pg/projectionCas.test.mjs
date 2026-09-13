@@ -1,7 +1,7 @@
 /**
  * Residual-projection CAS against a real PostgreSQL.
  *
- * This file EXISTS to close a coverage gap left by the extraction. The old CalSpread suite
+ * This file EXISTS to close a coverage gap left by the extraction. The old the predecessor codebase suite
  * proved `applyBoxExecutionAttemptProjection` against a real MongoDB in
  * `executionAttemptProjection.test.mjs`:
  *
@@ -10,7 +10,7 @@
  *   • "real Mongo: a physically legacy row accepts one version-zero CAS"    ->  here:
  *      "a legacy row with a NULL projection_version accepts exactly one version-zero CAS"
  *
- * StrikeEdge made PostgreSQL the projection authority, so the guarantee is proven here against
+ * GTS Algo Research made PostgreSQL the projection authority, so the guarantee is proven here against
  * the SQL implementation (`SELECT ... FOR UPDATE`, an application-id idempotency ring, and a
  * version/identity guard) instead. See tests/README.md.
  */

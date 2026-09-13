@@ -34,7 +34,7 @@ import {
 } from "../../dist/brokers/dhan/charges.js";
 import { isDhanTokenExpired, parseExpiry, redactedSession } from "../../dist/brokers/dhan/auth.js";
 // NOTE: The Kite/Dhan historical-charts provider (src/brokers/history.ts) is deliberately
-// EXCLUDED from StrikeEdge — it is not part of the Box-arbitrage backend. The former
+// EXCLUDED from GTS Algo Research — it is not part of the Box-arbitrage backend. The former
 // `/* history */` block (dhanCandlesToRows / chunkDateRange) was removed with that module;
 // every other Dhan assertion below is in scope and retained. See tests/README.md.
 import { normalizeDhanError, isRetryableRead, DhanAuthError, DhanRateLimitError, DhanNetworkError, DhanError } from "../../dist/brokers/dhan/errors.js";
@@ -326,7 +326,7 @@ test("5xx and network failures are retryable for reads", () => {
 // oldest-first", "a candle with a bad timestamp is dropped", "missing columns become 0",
 // "long ranges chunk", "a range within the limit is a single chunk"). They exercised
 // dhanCandlesToRows / chunkDateRange from src/brokers/history.ts — the Kite historical-charts
-// provider that StrikeEdge deliberately does NOT ship. See tests/README.md for the rationale.
+// provider this backend deliberately does NOT ship. See tests/README.md for the rationale.
 
 
 /* ------------------- instrument-master quality filtering ------------------- */
