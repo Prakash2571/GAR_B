@@ -1,8 +1,8 @@
 /**
- * PostgreSQL persistence for box trades and the box event ledger — StrikeEdge's
+ * PostgreSQL persistence for box trades and the box event ledger — this backend's
  * operational authority.
  *
- * This is the rewrite of CalSpread's Mongoose repository. Its EXPORTED NAMES,
+ * This is the rewrite of the predecessor codebase's Mongoose repository. Its EXPORTED NAMES,
  * SIGNATURES AND OBSERVABLE SEMANTICS are frozen: the Box domain (engine,
  * orderManager, positionMonitor, executionGateway, …) reaches durable state only
  * through this module, and the ported unit tests are written against this surface.
@@ -108,7 +108,7 @@ function exactRecord(
 /**
  * Pure validation used by startup and offline tests. Any duplicate unresolved recovery
  * rows, or drift in the safety-critical index, is an operator-repair condition — never
- * something to guess through by selecting one row. Ported verbatim from CalSpread; the
+ * something to guess through by selecting one row. Ported verbatim from the predecessor codebase; the
  * index it validates is now the PostgreSQL partial unique index
  * `box_single_unresolved_crash_recovery`, presented in the same descriptor shape.
  */
@@ -137,7 +137,7 @@ export function boxRecoveryPersistenceValidationError(
 /**
  * Readiness gate for the crash-recovery uniqueness boundary. Ported verbatim: it is a
  * pure state machine over injected connection/establisher/clock doubles, so the
- * reconnect path is still exercised offline. See CalSpread for the full rationale.
+ * reconnect path is still exercised offline. See the predecessor codebase for the full rationale.
  */
 export class BoxRecoveryPersistenceGate {
   private verified = false;
@@ -329,7 +329,7 @@ export {
 
 /**
  * Verify the pool is up and migrations are applied. Called by engine boot in place of
- * CalSpread's `initBoxConnection`. It does NOT open the pool (boot owns that) — it
+ * the predecessor codebase's `initBoxConnection`. It does NOT open the pool (boot owns that) — it
  * proves the operational authority is usable before any position is read or written.
  */
 export async function ensureBoxPersistenceReady(): Promise<void> {
@@ -690,7 +690,7 @@ export async function insertBoxTrade(
 /**
  * Store a trade's margin AND the model that produced it.
  *
- * `source` is optional so the frozen CalSpread call signature still compiles, but callers
+ * `source` is optional so the frozen the predecessor codebase call signature still compiles, but callers
  * should always pass it: without provenance an inflated `dhan_per_leg_fallback` sum is
  * indistinguishable from a real netted basket figure once written, which is precisely the
  * confusion this column exists to prevent.
@@ -1452,7 +1452,7 @@ export async function updateBoxOrderIntent(
       return { intent: null, applied: false, previous_filled_quantity: null, current_filled_quantity: null };
     }
 
-    // Guards, exactly mirroring the CalSpread filter.
+    // Guards, exactly mirroring the predecessor codebase's filter.
     const stateOk = !patch.state || INTENT_STATE_PREDECESSORS[patch.state].includes(before.state);
     const expectedOk = !expectedStates || expectedStates.includes(before.state);
     const fillOk = patch.filled_quantity === undefined ||
@@ -2148,7 +2148,7 @@ export function boxPnlDayProofFromState(state: {
 }
 
 /* -- The following five run* functions are DB-agnostic: they take injected callbacks
- * and are ported VERBATIM from CalSpread. The ported unit tests exercise them directly. */
+ * and are ported VERBATIM from the predecessor codebase. The ported unit tests exercise them directly. */
 
 export async function runBoxPnlDayMutation<T>(args: {
   invalidate: () => Promise<void>;
@@ -2896,7 +2896,7 @@ export async function loadBoxSettings(): Promise<Map<string, number>> {
 }
 
 /**
- * Upsert admin thresholds in ONE transaction (like the CalSpread bulkWrite): a partial
+ * Upsert admin thresholds in ONE transaction (like the predecessor codebase's bulkWrite): a partial
  * failure must not leave "what was saved" and "what is running" diverging. Throws on
  * failure — this write is NOT best-effort.
  */

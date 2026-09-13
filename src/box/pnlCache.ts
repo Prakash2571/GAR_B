@@ -1,12 +1,12 @@
 /**
  * Day-P&L cache surface — REDIS REMOVED.
  *
- * In CalSpread this file mirrored the running day's box P&L into Upstash Redis on a
+ * In the predecessor codebase this file mirrored the running day's box P&L into Upstash Redis on a
  * slow cadence, so a mid-session restart could rebuild the day view in one round trip
  * before draining to Mongo overnight. Redis was ALWAYS best-effort here: durable
  * archive correctness lived in Mongo, never in the cache.
  *
- * StrikeEdge makes PostgreSQL the durable P&L tier (`box_daily_pnl` and the day-state
+ * This backend makes PostgreSQL the durable P&L tier (`box_daily_pnl` and the day-state
  * proof, see `repository.ts`). The Redis mirror was therefore PURELY A CACHE, so it is
  * removed rather than reimplemented: every method degrades to the same neutral value it
  * already returned when Redis was unreachable, and the archiver/engine already fall back
@@ -29,6 +29,16 @@ import {
  */
 export type RedisCommand = [command: string, ...args: (string | number)[]];
 
+/**
+ * The day-key prefix.
+ *
+ * COMPATIBILITY-SENSITIVE — NOT RENAMED WITH THE REBRAND. This is the durable key shape the
+ * day-P&L tier has always written, and keys already persisted by earlier deployments carry it.
+ * Changing the prefix would make every historical day key unreadable to the code that looks it
+ * up, silently orphaning archived P&L days rather than failing loudly. The prefix is an opaque
+ * internal identifier: it is never rendered, never returned by an API and never seen by an
+ * operator, so leaving it alone costs nothing and renaming it risks data nobody can get back.
+ */
 const dayKey = (day: string): string => `calspread:box:pnl:day:${day}`;
 
 export interface CachedDay {

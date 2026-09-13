@@ -90,6 +90,12 @@ export function hashBreadcrumb(value: string | undefined): string | null {
   // Domain-separated so an IP hash can never collide with a UA hash of the same
   // bytes. The salt is a fixed label, not a secret: this is forensic coarse-graining,
   // not authentication.
+  //
+  // THE LABEL IS COMPATIBILITY-SENSITIVE AND WAS NOT RENAMED WITH THE REBRAND. It is part of
+  // the hash input, so changing it changes every digest this function produces — breadcrumbs
+  // already stored in `access_sessions` would no longer correlate with newly computed ones,
+  // destroying the only value they have. The label is never rendered, never returned by an API
+  // and never seen by an operator, so renaming it would cost forensic continuity for nothing.
   return createHash("sha256").update("strikedge-access-breadcrumb\u0000").update(value).digest("hex");
 }
 

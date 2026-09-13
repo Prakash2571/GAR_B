@@ -1,7 +1,7 @@
 # Box persistence on PostgreSQL
 
-This note documents how CalSpread's Mongo Box repository was ported onto PostgreSQL as
-StrikeEdge's operational authority, table by table, operation by operation. MongoDB
+This note documents how the predecessor codebase's Mongo Box repository was ported onto PostgreSQL as
+this backend's operational authority, table by table, operation by operation. MongoDB
 Atlas becomes an async **reporting replica**, fed by the transactional outbox
 (`enqueueOutbox`), never on the execution hot path.
 
@@ -10,7 +10,7 @@ Atlas becomes an async **reporting replica**, fed by the transactional outbox
 The `GET /api/box/trades/history?scope=today` response field `source` — the tier that
 answered the read — changes its value set:
 
-| Before (CalSpread) | After (StrikeEdge) |
+| Before (the predecessor codebase) | After (GTS Algo Research) |
 | --- | --- |
 | `"memory" \| "redis" \| "mongo" \| "none"` | `"memory" \| "postgres" \| "none"` |
 

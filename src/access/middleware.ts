@@ -8,15 +8,15 @@
  *                       request so downstream handlers can read the role synchronously.
  *  - getOperatorRole  : (req) => "full" | "trade" | null, read from the session the
  *                       middleware attached. The two-role shape is preserved from
- *                       CalSpread's getAdminRole so src/box/routes.ts ports with a
+ *                       the predecessor codebase's getAdminRole so src/box/routes.ts ports with a
  *                       one-line import change; the passcode gate only ever mints "full".
  *  - corsMiddleware   : hand-rolled exact-origin CORS with credentials (never `*`).
  *  - apiError / errorHandler : the single JSON error shape and Express error handler.
  *  - startSessionSweeper : the bounded periodic expiry sweep.
  *
  * WHY getOperatorRole TAKES A REQUEST, NOT A TOKEN STRING
- * CalSpread authenticated with an `x-admin-token` HEADER and an in-memory Map, so
- * `getAdminRole(token)` was a synchronous string lookup. StrikeEdge authenticates
+ * the predecessor codebase authenticated with an `x-admin-token` HEADER and an in-memory Map, so
+ * `getAdminRole(token)` was a synchronous string lookup. This backend authenticates
  * with an HttpOnly SESSION COOKIE validated against PostgreSQL (async). The role is
  * therefore resolved once, in `requireOperator`, and cached on the request; the
  * synchronous accessor reads that cache. This is the one auth adaptation
@@ -204,7 +204,7 @@ export function createRequireOperator(deps: RequireOperatorDeps): RequestHandler
 
 /**
  * The synchronous role accessor `src/box/routes.ts` uses (renamed from
- * CalSpread's `getAdminRole`). Reads the role the middleware validated and
+ * the predecessor codebase's `getAdminRole`). Reads the role the middleware validated and
  * attached; returns null when there is no live session on the request. It NEVER
  * consults a header or query-string token, so a session token supplied in an SSE
  * query string cannot authenticate anything.

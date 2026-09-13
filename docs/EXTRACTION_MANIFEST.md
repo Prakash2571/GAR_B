@@ -1,6 +1,6 @@
-# StrikeEdge extraction manifest
+# GTS Algo Research extraction manifest
 
-This is the authoritative record of how StrikeEdge was extracted from CalSpread:
+This is the authoritative record of how GTS Algo Research was extracted from the predecessor codebase:
 what was copied, what was adapted, what was deliberately left behind, and every
 contract that changed. It is generated against the source trees and verified
 against the target code, not from memory.
@@ -9,10 +9,10 @@ against the target code, not from memory.
 
 | Repo | Role | SHA |
 | --- | --- | --- |
-| `Cal_Spread` | CalSpread frontend (source, READ ONLY) | `3ac5abe07a9e580a0ecc0c8c173aff7dff346184` |
-| `Cal_Spread_Backend` | CalSpread backend (source, READ ONLY) | `803ffe58a25d5ad5d42023d8c063d419b058da56` |
-| `Strikedge_B` | StrikeEdge backend (target) | `9a305888479ddd775b9c46e21624e1fc5e90850e` — the first `main` push |
-| `Strikedge_F` | StrikeEdge frontend (target) | `0230bcecb947e6f9328b9a5403c6f08a644c7e93` — the first `main` push |
+| `Cal_Spread` | the predecessor codebase frontend (source, READ ONLY) | `3ac5abe07a9e580a0ecc0c8c173aff7dff346184` |
+| `Cal_Spread_Backend` | the predecessor codebase backend (source, READ ONLY) | `803ffe58a25d5ad5d42023d8c063d419b058da56` |
+| `GTSAlgoResearch_B` | GTS Algo Research backend (target) | `9a305888479ddd775b9c46e21624e1fc5e90850e` — the first `main` push |
+| `GTSAlgoResearch_F` | GTS Algo Research frontend (target) | `0230bcecb947e6f9328b9a5403c6f08a644c7e93` — the first `main` push |
 
 Those two target SHAs are the commits at which the whole extraction was verified green:
 backend `npm run build` clean, 1,594 tests passing across seven suites with zero failures
@@ -28,7 +28,7 @@ present-but-different ⇒ **adapted**; absent in source ⇒ **new**.
 
 ### 2a. Copied verbatim (byte-for-byte identical to source)
 
-These carry the CalSpread behaviour unchanged. The Box strategy core — the
+These carry the predecessor codebase's behaviour unchanged. The Box strategy core — the
 mathematics, execution simulation, calibration, order lifecycle, reservations
 port, charge cards and broker adapters — is here, which is why the migration
 fixtures still pin the same numbers.
@@ -79,19 +79,19 @@ brokers/types.ts, brokers/zerodha/feed.ts, brokers/zerodha/liveAdapter.ts
 | `box/pnlCache.ts` | **Redis removed.** The Upstash day-P&L mirror is gone; every method degrades to the neutral value it already returned when Redis was down. Pure planning/partitioning helpers unchanged; exported surface preserved so no caller changed. |
 | `box/closedCache.ts` | **Redis removed.** The Upstash "closed today" mirror is gone; the cache reports itself disabled and reads fall through to PostgreSQL (`loadBoxTradesClosedSince`). Exported surface preserved. |
 | `box/engine.ts` | Small wiring changes to consume the PostgreSQL persistence/closed-today path instead of Mongo+Redis (~14 lines). Strategy logic unchanged. |
-| `box/index.ts` | `registerBoxModule` wiring adjusted for StrikeEdge's collaborators and the new persistence readiness (~19 lines). |
+| `box/index.ts` | `registerBoxModule` wiring adjusted for this backend's collaborators and the new persistence readiness (~19 lines). |
 | `box/routes.ts` | Trades-history `source` tier label changed to `"postgres"`; SSE stream (`/api/box/stream`) now guarded by the cookie-session `requireOperator` middleware instead of a query-string token; auth wiring for the new access model. |
 | `box/reservations/index.ts` | Factory now assembles the PostgreSQL-backed `PgReservationPort` instead of the Mongo store (~10 lines). |
 | `brokers/registry.ts` | 2-line adjustment (broker wiring); effectively verbatim. |
-| `brokers/dhan/auth.ts` | Present but the OAuth/login path is dead in StrikeEdge (tokens come from CalSpread); retained only so shared types compile. Not on any live path. |
+| `brokers/dhan/auth.ts` | Present but the OAuth/login path is dead in this backend (tokens come from the external CalSpread provider); retained only so shared types compile. Not on any live path. |
 | `kite.ts` | Trimmed to the Box-relevant client surface (charges, basket margin, order ops, instruments); calendar/history/analytics helpers dropped (~94 lines). |
-| `index.ts` | **Fully replaced** — see §3. The 5,500+ line CalSpread entrypoint became a small Box-only bootstrap; ~6,000 lines differ. |
+| `index.ts` | **Fully replaced** — see §3. The 5,500+ line the predecessor codebase entrypoint became a small Box-only bootstrap; ~6,000 lines differ. |
 
 ### 2c. New files (no source counterpart)
 
 ```
 config.ts                         (app config + deployment gates)
-boxSupport.ts                     (the collaborators CalSpread's index.ts injected — see §4)
+boxSupport.ts                     (the collaborators the predecessor codebase's index.ts injected — see §4)
 brokerRoutes.ts                   (broker status / switch-blockers / select)
 runtime/statusRoutes.ts           (GET /api/runtime/status, /api/export/status)
 
@@ -101,7 +101,7 @@ access/routes.ts, access/sessionStore.ts     (site-passcode session gate)
 brokerState/tokenCrypto.ts, brokerState/brokerSessions.ts   (AES-256-GCM token store)
 
 tokens/brokerTokenService.ts, tokens/tokenProviderClient.ts, tokens/istClock.ts
-                                  (morning token acquisition from CalSpread)
+                                  (morning token acquisition from the external CalSpread provider)
 
 pg/pool.ts, pg/migrate.ts         (PostgreSQL authority)
 box/reservations/pgStore.ts       (PostgreSQL reservation port)
@@ -123,23 +123,23 @@ except `index.ts`, which was replaced in place).
 
 | Source file | Why excluded |
 | --- | --- |
-| `index.ts` | **Replaced.** CalSpread's entrypoint bundled calendar spreads, analytics, OI capture, Yahoo dividends and admin/token routes into one file. StrikeEdge's `index.ts` is a Box-only bootstrap; the injected collaborators moved to `boxSupport.ts` (§4). |
+| `index.ts` | **Replaced.** the predecessor codebase's entrypoint bundled calendar spreads, analytics, OI capture, Yahoo dividends and admin/token routes into one file. this backend's `index.ts` is a Box-only bootstrap; the injected collaborators moved to `boxSupport.ts` (§4). |
 | `db.ts` | **Replaced by PostgreSQL.** Mongoose connection management is gone; `pg/pool.ts` is the operational authority. |
-| `redis.ts` | **Upstash removed.** The analytics/P&L Redis caches do not exist in StrikeEdge; durable state is PostgreSQL. |
+| `redis.ts` | **Upstash removed.** The analytics/P&L Redis caches do not exist in this backend; durable state is PostgreSQL. |
 | `eodCapture.ts` | End-of-day F&O capture is a calendar-scanner feature, out of scope. |
 | `hourlyCapture.ts` | Intraday OI/chain capture is a calendar-scanner feature, out of scope. |
 | `yahoo.ts` | Yahoo dividend feed is out of scope. |
 | `marketDataRoutes.ts` | The market-data recorder endpoints (calendar analytics) are out of scope. |
 | `adminToken.ts` | Full-admin token auth replaced by the site-passcode session (`access/*`). |
-| `tokenRouteAuth.ts` | StrikeEdge hosts no token routes; it is a **client** of CalSpread's, so the route-auth guard is unneeded. |
+| `tokenRouteAuth.ts` | GTS Algo Research hosts no token routes; it is a **client** of the external CalSpread routes, so the route-auth guard is unneeded. |
 | `brokers/history.ts` | Historical charts/candles are out of scope. |
-| `brokers/routes.ts` | The calendar broker routes (login/history/market-data) are replaced by StrikeEdge's Box-only `brokerRoutes.ts`. |
+| `brokers/routes.ts` | The calendar broker routes (login/history/market-data) are replaced by this backend's Box-only `brokerRoutes.ts`. |
 | `box/reservations/mongoStore.ts` | The Mongo durable reservation store is replaced by `box/reservations/pgStore.ts` (PostgreSQL). |
 
-## 4. Collaborators CalSpread's `index.ts` passed to `registerBoxModule`
+## 4. Collaborators the predecessor codebase's `index.ts` passed to `registerBoxModule`
 
-In CalSpread these were closures defined inside the monolithic `index.ts`. In
-StrikeEdge the pure ones live in **`src/boxSupport.ts`** (verbatim ports — the
+In the predecessor codebase these were closures defined inside the monolithic `index.ts`. In
+GTS Algo Research the pure ones live in **`src/boxSupport.ts`** (verbatim ports — the
 board derivation, IST arithmetic, market-hours window and charge folding are
 byte-for-byte, pinned by the migration fixtures), and the stateful ones are
 supplied by the broker registry / access layer.
@@ -186,10 +186,10 @@ The full table-by-table, operation-by-operation mapping is in
 
 ## 6. Redis-backed features replaced or removed
 
-CalSpread used Upstash Redis (`src/redis.ts`) for analytics caches and two Box
-caches. **StrikeEdge removes Redis entirely.**
+the predecessor codebase used Upstash Redis (`src/redis.ts`) for analytics caches and two Box
+caches. **GTS Algo Research removes Redis entirely.**
 
-| CalSpread Redis feature | StrikeEdge |
+| the predecessor codebase Redis feature | GTS Algo Research |
 | --- | --- |
 | Analytics OI/chain caches | **Removed** — the analytics feature is out of scope. |
 | `box/pnlCache.ts` — day-P&L mirror | **Redis removed.** Was always best-effort (durable correctness was in Mongo). The durable P&L tier is now PostgreSQL (`box_daily_pnl` + day-state proof). Every method degrades to its old neutral value; the pure planning helpers and the exported surface are unchanged so no caller changed. |
@@ -210,7 +210,7 @@ Verified against `src/box/routes.ts`, `src/access/routes.ts`,
   accepts a query-string token; it is guarded by the HttpOnly, same-origin
   cookie session via the `requireOperator` middleware (401 without a valid
   session).
-- **Admin auth → site passcode session.** CalSpread's `/api/admin/verify` /
+- **Admin auth → site passcode session.** the predecessor codebase's `/api/admin/verify` /
   admin-token model is replaced by the site-passcode session in `access/*`.
 
 ### New endpoints
@@ -233,7 +233,7 @@ over.
 
 ### Removed endpoints
 
-All of CalSpread's non-Box surface is gone. Verified present in the source
+All of the predecessor codebase's non-Box surface is gone. Verified present in the source
 `index.ts` and absent from the target:
 
 ```
@@ -252,31 +252,31 @@ All of CalSpread's non-Box surface is gone. Verified present in the source
 ```
 
 That is: every calendar, analytics, history, market-data, Dhan-login and admin
-route. StrikeEdge hosts **no token routes** — it is a client of CalSpread's.
+route. GTS Algo Research hosts **no token routes** — it is a client of the external CalSpread routes.
 
 ## 8. Known behaviour differences
 
-- **PostgreSQL is required to boot.** CalSpread degraded gracefully with no
-  Mongo (trades feature off); StrikeEdge refuses to start without `DATABASE_URL`
+- **PostgreSQL is required to boot.** the predecessor codebase degraded gracefully with no
+  Mongo (trades feature off); GTS Algo Research refuses to start without `DATABASE_URL`
   because PostgreSQL is the operational authority.
-- **Mongo is now optional and read-only.** With no `MONGODB_URI`, StrikeEdge runs
-  fully; only the reporting projection is skipped. In CalSpread, Mongo was the
+- **Mongo is now optional and read-only.** With no `MONGODB_URI`, GTS Algo Research runs
+  fully; only the reporting projection is skipped. In the predecessor codebase, Mongo was the
   store of record.
 - **No Redis warm-load.** A restart no longer warm-loads caches from Redis; the
   durable read comes straight from PostgreSQL, so the first read after boot is a
   DB query rather than a cache hit. Correctness is identical; latency profile
   differs.
-- **No broker OAuth.** StrikeEdge cannot log a user into Zerodha/Dhan; it depends
-  on CalSpread's token routes being reachable each morning. If CalSpread is down
-  at 09:00 IST, StrikeEdge has no token until it recovers.
+- **No broker OAuth.** GTS Algo Research cannot log a user into Zerodha/Dhan; it depends
+  on the external CalSpread token routes being reachable each morning. If that provider is down
+  at 09:00 IST, this backend has no token until it recovers.
 - **Single active broker.** Exactly one of Zerodha/Dhan is active; switching is
-  explicit and blocker-gated. CalSpread's broker handling differed.
+  explicit and blocker-gated. the predecessor codebase's broker handling differed.
 - **Auth model.** One site passcode + runtime arming replaces the two-tier
   admin/access secrets. The passcode grants UI access only and arms nothing.
 - **Multi-worker safety** now rests on the PostgreSQL durable reservation tier
   and globally-unique owner ids rather than a Mongo unique index.
 - **Two scanner-start refusal messages were corrected.** `BoxEngine.start()`
-  refuses for two reasons and both messages were inherited from CalSpread, where
+  refuses for two reasons and both messages were inherited from the predecessor codebase, where
   they were true, and were wrong here:
   - *"Box persistence is not configured (set MONGODB_URI)"* → now names
     PostgreSQL, `DATABASE_URL` and `GET /api/runtime/status`. `isBoxDbEnabled()`
@@ -294,7 +294,7 @@ route. StrikeEdge hosts **no token routes** — it is a client of CalSpread's.
 
 ## 8a. Frontend/backend contract drift, found and fixed
 
-The two repositories were built separately and their types for the NEW StrikeEdge
+The two repositories were built separately and their types for the NEW GTS Algo Research
 endpoints drifted badly. Verified by capturing real responses from a running
 backend and comparing them with the frontend's declarations:
 
@@ -302,7 +302,7 @@ backend and comparing them with the frontend's declarations:
 | --- | --- |
 | `GET /api/runtime/status` | 1 of 9 (`residual_exposure`) |
 | `GET /api/export/status` | 1 of 5 (`enabled`) |
-| `GET /api/broker/status` | structurally different — the frontend expected a single CalSpread-shaped broker; the backend returns `{active_broker, generation, brokers[]}` |
+| `GET /api/broker/status` | structurally different — the frontend expected a single predecessor-shaped broker; the backend returns `{active_broker, generation, brokers[]}` |
 
 `blockers` is `string[]`, not `{reason, detail}[]`. `POST /api/broker/select`
 returns `{ok, broker, blockers}`, not a status object. `last_margin_source`
@@ -315,10 +315,10 @@ tests while every readiness banner stayed dark and the broker panel rendered
 
 Fixed by making the frontend types exact (which turned the drift into compiler
 errors) and rewiring the banners and the broker panel. Pinned by
-`Strikedge_F/tests/apiContract.test.mjs`, which asserts against responses captured
+`GTSAlgoResearch_F/tests/apiContract.test.mjs`, which asserts against responses captured
 from a running backend and was verified to fail when the old shape is restored.
 Fixture provenance and the re-capture procedure are in
-`Strikedge_F/tests/fixtures/README.md`.
+`GTSAlgoResearch_F/tests/fixtures/README.md`.
 
 Two states the old shape could not express are now shown: a token-provider
 **configuration error** (fatal — retrying on a timer will never clear it, so it is
@@ -357,7 +357,7 @@ including that an omitted source never erases provenance a previous write record
 ### `DHAN_DATA_ENABLED` defaults true, deliberately
 
 Every other Dhan gate defaults false, so this looks asymmetric. It is intentional
-and is preserved byte-for-byte from CalSpread: `dhanDataEnabled()` treats an unset
+and is preserved byte-for-byte from the predecessor codebase: `dhanDataEnabled()` treats an unset
 value as **true** because it gates only quote/instrument access, which cannot place
 an order, whereas `dhanLiveTradingEnabled()` treats an unset value as **false**
 because it gates real orders. Verified by diffing both predicates against
@@ -367,13 +367,13 @@ unrequested behavioural divergence from the source, so it stands.
 ## 8b. Box math parity, verified by regeneration
 
 The 22 golden fixtures under `tests/migration-fixtures/` (113 cases: 42 in
-`box/`, 71 in `box-parity/`) are **byte-for-byte identical** to the CalSpread
+`box/`, 71 in `box-parity/`) are **byte-for-byte identical** to the predecessor codebase's
 baseline, generators included.
 
 That alone only proves the files were copied. The stronger check was also run:
 `tests/migration-fixtures/generate.mjs` and `generate-parity.mjs` were executed
-against **StrikeEdge's own compiled build**, which rewrites every fixture from the
-live implementation. The regenerated output is byte-identical to the CalSpread
+against **this backend's own compiled build**, which rewrites every fixture from the
+live implementation. The regenerated output is byte-identical to the predecessor codebase's
 baseline.
 
 So the persistence layer moved from Mongoose to `pg`, the reservation store was
@@ -394,7 +394,7 @@ Dhan.** Neither broker offers an all-or-nothing multi-leg primitive, so between
 the first accepted leg and the fourth there is a real, unavoidable window in
 which the position is partially on.
 
-StrikeEdge **bounds** that exposure — it does not eliminate it:
+GTS Algo Research **bounds** that exposure — it does not eliminate it:
 
 - **Hedge-first submission ordering** submits the legs that reduce risk before
   the legs that add it, so a partial fill leans safe rather than naked.
@@ -416,15 +416,15 @@ arming — and even then the four-leg risk above remains inherent to the strateg
 
 ## 10. Test hermeticity
 
-This is a behaviour difference from CalSpread in the test tree, recorded here
-next to §8. The ported CalSpread suite reached **live broker endpoints** while
+This is a behaviour difference from the predecessor codebase in the test tree, recorded here
+next to §8. The ported predecessor suite reached **live broker endpoints** while
 running: a full run made 24 outbound HTTPS requests — 23 to `images.dhan.co`
 (the live Dhan scrip master, roughly 201,075 rows at about 4.5s per parse, so
 about 90s of a 2m34s CI job) and 1 to `api.kite.trade`. Those requests
 originated from three files: `tests/box/singleBroker.test.mjs`,
 `tests/tokens/morningDefault.test.mjs` and `tests/switch/managerSwitch.test.mjs`.
 
-StrikeEdge's suite does not. A fetch-interceptor scan across all seven suite
+this backend's suite does not. A fetch-interceptor scan across all seven suite
 directories now reports **zero non-loopback requests**. The scrip master the
 tests parse is served from `tests/fixtures/dhan-scrip-master-detailed.sample.csv`,
 a **trimmed sample derived from the real upstream file** — not a live snapshot,

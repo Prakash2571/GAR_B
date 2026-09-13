@@ -1,4 +1,4 @@
-# StrikeEdge live box-arbitrage execution — fix summary
+# GTS Algo Research live box-arbitrage execution — fix summary
 
 Backend: `Prakash2571/Strikedge_B`, branch `fix/live-execution-hardening`.
 Frontend: `Prakash2571/Strikedge_F`, branch `fix/order-stream-status`.
@@ -260,8 +260,8 @@ disable `liveOrderEnabled` while exposure exists.
 Also documented: Elastic IP / NAT for broker static-IP whitelisting, Amazon Time Sync via chrony,
 never `synchronous_commit = off`, pool and timeout settings, monitoring including event-loop lag
 and CPU-credit exhaustion, restart/recovery, configuration precedence with the instruction to read
-effective values back from `/api/box/status .config`, and the requirement that **CalSpread Box
-execution be disabled before arming StrikeEdge live against a shared account** (shared rate
+effective values back from `/api/box/status .config`, and the requirement that **the predecessor codebase Box
+execution be disabled before arming GTS Algo Research live against a shared account** (shared rate
 budgets neither application can observe — operational coordination, not a code guarantee).
 
 **A loss breaker is not a guaranteed maximum loss.** It stops new entries; it cannot cap exposure

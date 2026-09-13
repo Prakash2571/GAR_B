@@ -93,7 +93,7 @@ export async function createPgHarness(label = "tokens") {
     poolMax: 6,
     statementTimeoutMs: 5_000,
     lockTimeoutMs: 2_000,
-    applicationName: "strikedge-token-tests",
+    applicationName: "gts-token-tests",
   });
   // Pin search_path on the shared pool.
   const raw = pool.getPool();

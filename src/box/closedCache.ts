@@ -1,13 +1,13 @@
 /**
  * Closed-today trade cache surface — REDIS REMOVED.
  *
- * In CalSpread this mirrored TODAY's closed box trades into Upstash Redis so the
+ * In the predecessor codebase this mirrored TODAY's closed box trades into Upstash Redis so the
  * Closed-trades tab could render the current session in one round trip instead of a
  * whole-book Mongo sort. It was ALWAYS a best-effort read-path accelerator: every
  * method was a no-op returning a neutral value when Redis was off or unreachable, and
  * the caller fell back to the definitionally-complete database.
  *
- * StrikeEdge's complete source for "closed today" is now PostgreSQL
+ * this backend's complete source for "closed today" is now PostgreSQL
  * (`loadBoxTradesClosedSince`, see `repository.ts` / `engine.getClosedToday`). The Redis
  * mirror was PURELY A CACHE, so it is removed rather than reimplemented: the cache
  * reports itself disabled and every read/write degrades to the neutral value, which is

@@ -2,7 +2,7 @@
  * BrokerTokenAcquisitionService — the daily, per-broker token acquisition loop.
  *
  * WHAT IT DOES
- * Each trading morning at BROKER_TOKEN_POLL_START (09:00 IST) it asks the CalSpread
+ * Each trading morning at BROKER_TOKEN_POLL_START (09:00 IST) it asks the external CalSpread
  * provider for a Zerodha token and a Dhan token, INDEPENDENTLY. Each broker has its
  * own state machine, its own timer and its own in-flight guard, so:
  *   - the two requests can run concurrently but never overwrite each other;

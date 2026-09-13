@@ -224,7 +224,7 @@ export async function startApp(dbUrl, opts = {}) {
     NODE_ENV: "test",
     FRONTEND_URL: "http://localhost:5173",
     CSRF_ALLOWED_ORIGIN: "http://localhost:5173",
-    SESSION_COOKIE_NAME: "strikedge_session",
+    SESSION_COOKIE_NAME: "gts_session",
     SITE_SESSION_TTL_HOURS: "24",
     SITE_ACCESS_SECRET: process.env.SITE_ACCESS_SECRET ?? "ci-fake-site-access-secret-not-a-real-passcode",
     DATABASE_URL: dbUrl,
@@ -248,7 +248,7 @@ export async function startApp(dbUrl, opts = {}) {
     poolMax: 5,
     statementTimeoutMs: 5000,
     lockTimeoutMs: 2000,
-    applicationName: "strikedge-contract-test",
+    applicationName: "gts-contract-test",
   });
 
   const app = express();

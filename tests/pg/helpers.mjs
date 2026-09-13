@@ -90,7 +90,7 @@ export async function setup(tag) {
     poolMax: 10,
     statementTimeoutMs: 5000,
     lockTimeoutMs: 4000,
-    applicationName: `strikedge-test-${tag}`,
+    applicationName: `gts-test-${tag}`,
   });
   return { schema, pool };
 }

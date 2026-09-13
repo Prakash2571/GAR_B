@@ -68,7 +68,7 @@ claim in this table can be checked rather than believed.
 | Fault | Asserted outcome | Where | Kind |
 |---|---|---|---|
 | **PostgreSQL unavailable** | Actions requiring authoritative persistence are refused: the scanner refuses to discover new boxes rather than trade unrecorded, and readiness reports it. | `tests/readiness/readiness.test.mjs`, `tests/box/crashRecovery.test.mjs` | UNIT |
-| **PostgreSQL unavailable at boot (ordering)** | No durable boot ordinal ⇒ readiness is **unorderable** ⇒ the server itself refuses entry (`instance_epoch_unknown`) and the UI disables entry. | `tests/box/readinessInstanceOrdering.test.mjs`, `Strikedge_F tests/readinessOrder.test.mjs` | UNIT |
+| **PostgreSQL unavailable at boot (ordering)** | No durable boot ordinal ⇒ readiness is **unorderable** ⇒ the server itself refuses entry (`instance_epoch_unknown`) and the UI disables entry. | `tests/box/readinessInstanceOrdering.test.mjs`, `GTSAlgoResearch_F tests/readinessOrder.test.mjs` | UNIT |
 | **Mongo replica unavailable** | Must **not** become an alternative source of truth, and must not block the scanner: Mongo is the asynchronous reporting replica. Distinguished from "no Box database configured". | `tests/projector/*.test.mjs`, `tests/box/tradingSession*.test.mjs` | PG + UNIT |
 | **Session state unreadable** | Entry refused with `session_state_unreadable` — an unread session is **not** an unarmed one, so a transient outage cannot hand back a spent one-shot budget. | `tests/box/sessionAttemptBudget.test.mjs`, `tests/box/tradingSessionStore.test.mjs` | UNIT |
 | **Consumption write fails** | Entry stays closed until the write lands, because a restart would otherwise resurrect the budget. | `tests/box/sessionAttemptBudget.test.mjs` | UNIT |

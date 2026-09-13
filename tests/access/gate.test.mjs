@@ -23,8 +23,8 @@ import assert from "node:assert/strict";
 import { cookieHeader, createDbSchema, parseSetCookies, startApp, verify } from "./helpers.mjs";
 
 const SECRET = "correct-horse-battery-staple";
-const COOKIE = "strikedge_session";
-const CSRF_COOKIE = "strikedge_session_csrf";
+const COOKIE = "gts_session";
+const CSRF_COOKIE = "gts_session_csrf";
 const ORIGIN = "http://localhost:5173";
 
 let db;

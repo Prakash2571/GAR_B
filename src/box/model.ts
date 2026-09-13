@@ -1,10 +1,10 @@
 /**
  * Box persistence TYPES — pure, dependency-free.
  *
- * In CalSpread this file was the Mongoose schema layer: it declared the box_trades /
+ * In the predecessor codebase this file was the Mongoose schema layer: it declared the box_trades /
  * box_trade_events / box_order_intents / box_execution_attempts / box_daily_pnl /
  * box_settings / box_trading_session / box_calibration_samples collections and bound
- * them to a Mongo connection. StrikeEdge's operational authority is PostgreSQL, so
+ * them to a Mongo connection. this backend's operational authority is PostgreSQL, so
  * there are no Mongoose models any more. What CALLERS depended on — the record TYPES
  * with an opaque string `_id`, the archive/day-state/settings/session/calibration
  * interfaces, `isBoxEventLedgerEnabled`, and the compile-time proof that the box
@@ -78,7 +78,7 @@ export interface BoxExecutionAttemptRecord extends IBoxExecutionAttempt {
 /**
  * True once the box event ledger has a durable store to write to.
  *
- * In CalSpread this asked Mongoose whether the box connection's `readyState` was 1.
+ * In the predecessor codebase this asked Mongoose whether the box connection's `readyState` was 1.
  * The event ledger is now a PostgreSQL table (box_trade_events) projected onward
  * through the outbox, so "ledger enabled" is "PostgreSQL is configured and ready".
  */

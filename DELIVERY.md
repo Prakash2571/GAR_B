@@ -126,5 +126,5 @@ Do **not** deploy or enable live trading from this branch without explicit sign-
 effective-config pre-flight, and `docs/RUNBOOK.md` for arming order and rollback.
 
 Real trading is OFF by default (`config.ts:952`), both order streams are OFF by default, and the
-live order manager starts with `entryEnabled: false` and `liveOrderEnabled: false`. CalSpread Box
-execution must be disabled before StrikeEdge is armed against a shared account.
+live order manager starts with `entryEnabled: false` and `liveOrderEnabled: false`. the predecessor codebase Box
+execution must be disabled before GTS Algo Research is armed against a shared account.

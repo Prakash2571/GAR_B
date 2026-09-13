@@ -140,11 +140,11 @@ async function authFetch<T>(
 /**
  * STEP 1 — DISABLED IN STRIKEEDGE.
  *
- * StrikeEdge never performs its own Dhan consent flow. The Dhan access token is
- * fetched from the CalSpread provider (`src/tokens/tokenProviderClient.ts`),
+ * This backend never performs its own Dhan consent flow. The Dhan access token is
+ * fetched from the external CalSpread provider (`src/tokens/tokenProviderClient.ts`),
  * validated, encrypted and stored locally. This function is retained only so the
  * ported `ActiveBrokerManager` compiles against the same surface; calling it is a
- * configuration error, because it would begin a browser OAuth StrikeEdge must not
+ * configuration error, because it would begin a browser OAuth GTS Algo Research must not
  * own.
  */
 export async function generateDhanConsent(
@@ -152,7 +152,7 @@ export async function generateDhanConsent(
   _timeoutMs = 10_000,
 ): Promise<{ consentAppId: string; loginUrl: string }> {
   throw new DhanError(
-    "Dhan consent login is disabled in StrikeEdge: the access token is provisioned by the CalSpread token provider, not by a Dhan consent flow.",
+    "Dhan consent login is disabled in this backend: the access token is provisioned by the external CalSpread token provider, not by a Dhan consent flow.",
     400,
     "CONSENT_DISABLED",
     null,
@@ -163,7 +163,7 @@ export async function generateDhanConsent(
  * STEP 3 — DISABLED IN STRIKEEDGE.
  *
  * See {@link generateDhanConsent}. There is no redirect `tokenId` to consume
- * because StrikeEdge never initiates the browser login. Retained for the ported
+ * because this backend never initiates the browser login. Retained for the ported
  * manager's type surface only.
  */
 export async function consumeDhanConsent(
@@ -172,7 +172,7 @@ export async function consumeDhanConsent(
   _timeoutMs = 10_000,
 ): Promise<DhanConsentSession> {
   throw new DhanError(
-    "Dhan consent login is disabled in StrikeEdge: the access token is provisioned by the CalSpread token provider, not by a Dhan consent flow.",
+    "Dhan consent login is disabled in this backend: the access token is provisioned by the external CalSpread token provider, not by a Dhan consent flow.",
     400,
     "CONSENT_DISABLED",
     null,

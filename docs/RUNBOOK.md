@@ -1,14 +1,14 @@
-# StrikeEdge runbook
+# GTS Algo Research runbook
 
-Day-in-the-life operations for StrikeEdge. Read `docs/DEPLOYMENT.md` for install
+Day-in-the-life operations for GTS Algo Research. Read `docs/DEPLOYMENT.md` for install
 and the cutover; this document is what you keep open during a trading day.
 
 ## The trading day at a glance
 
-1. **~09:00 IST — token acquisition.** StrikeEdge's morning poll
+1. **~09:00 IST — token acquisition.** this backend's morning poll
    (`BROKER_TOKEN_POLL_START`, default `09:00`, retrying every
    `BROKER_TOKEN_POLL_INTERVAL_MS`) fetches the day's access token for the active
-   broker from CalSpread's token route. Until a healthy token arrives, no trading
+   broker from the external CalSpread token route. Until a healthy token arrives, no trading
    is possible.
 2. **09:15 IST — market opens.** With a token and a healthy feed, the scanner (if
    started) publishes opportunities. In paper mode it simulates; live requires all
@@ -67,7 +67,7 @@ exactly one of these five values (`src/tokens/brokerTokenService.ts`,
   proceed (subject to the gates + arming).
 - **`waiting`** — before the poll start (`BROKER_TOKEN_POLL_START`, default
   `09:00`); no attempt has run yet today.
-- **`polling`** — actively retrying. This covers a CalSpread **409 "no live
+- **`polling`** — actively retrying. This covers a predecessor-era **409 "no live
   session yet"**, a network/5xx error, and a **503** backoff. The distinguishing
   detail is in the **`last_error`** string (e.g. it mentions `(409)`), NOT in
   `token_state`.
@@ -86,30 +86,30 @@ exactly one of these five values (`src/tokens/brokerTokenService.ts`,
 
 ### Zerodha `token_state: polling` with a `last_error` mentioning 409
 
-CalSpread has no live Zerodha session yet. **Action:** have the CalSpread operator
-complete the Zerodha login for the day. StrikeEdge keeps polling
+the predecessor codebase has no live Zerodha session yet. **Action:** have the predecessor codebase's operator
+complete the Zerodha login for the day. GTS Algo Research keeps polling
 (`BROKER_TOKEN_POLL_INTERVAL_MS`) and picks the token up automatically once
-CalSpread has it. Do **not** try to force a token in; there is nothing to force.
+the external CalSpread provider has it. Do **not** try to force a token in; there is nothing to force.
 
 ### Zerodha `token_state: configuration_error` (401/403)
 
 The passcode is wrong or was rotated, and polling has stopped. **Action:** verify
-`KITE_TOKEN_BROKER_PASSCODE` matches what CalSpread expects; fix `.env` and
+`KITE_TOKEN_BROKER_PASSCODE` matches what the external CalSpread provider expects; fix `.env` and
 restart. A `configuration_error` is a credential problem, not a market problem.
 
 ### `token_state: invalid` — stale login_date
 
 The token belongs to a previous IST day (or failed another identity check).
-**Action:** this means CalSpread served yesterday's session. It should refresh on
-CalSpread's side; StrikeEdge rejects the stale token (`invalid`) rather than
-trading on it. Confirm the CalSpread operator has done today's login. Never
+**Action:** this means the predecessor codebase served yesterday's session. It should refresh on
+the provider's side; GTS Algo Research rejects the stale token (`invalid`) rather than
+trading on it. Confirm the predecessor codebase's operator has done today's login. Never
 override the day check.
 
 ### Dhan expiry unknown
 
 If Dhan's `token_expires_at` is unknown/unparseable, treat the token as **not
-trustworthy for live** — StrikeEdge will not go live on an ambiguous expiry.
-**Action:** re-fetch (next poll), and if it stays unknown, have CalSpread re-issue
+trustworthy for live** — GTS Algo Research will not go live on an ambiguous expiry.
+**Action:** re-fetch (next poll), and if it stays unknown, have the external CalSpread provider re-issue
 the Dhan session. Stay in paper on the Dhan side until expiry is known.
 
 ## Switching brokers safely
@@ -160,7 +160,7 @@ is deliberately asymmetric:
   protect an open position on a DB hiccup.
 
 **Action:** treat it as an incident. Check `GET /api/runtime/status` (PostgreSQL
-state + last error) and `/api/health`. Restore PostgreSQL. On recovery, StrikeEdge
+state + last error) and `/api/health`. Restore PostgreSQL. On recovery, GTS Algo Research
 reconciles from the durable state. Do **not** restart repeatedly hoping it clears;
 fix the database.
 
@@ -189,9 +189,9 @@ When you need to get out now:
 
 ## What NOT to do
 
-- **Do NOT run CalSpread Box live execution while StrikeEdge owns it.** Two live
+- **Do NOT run the predecessor codebase Box live execution while GTS Algo Research owns it.** Two live
   scanners on one broker account can double-enter and race; neither store can
-  fence the other. Keep CalSpread's `BOX_LIVE_TRADING_ENABLED=false` and
+  fence the other. Keep the predecessor codebase's `BOX_LIVE_TRADING_ENABLED=false` and
   `DHAN_LIVE_TRADING_ENABLED=false`.
 - **Do NOT set `exec_mode: "cluster"` in PM2.** The in-process reservation tier is
   authoritative for one process; multiple workers are safe only via the durable

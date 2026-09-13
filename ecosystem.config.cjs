@@ -1,4 +1,4 @@
-// PM2 process definition for StrikeEdge.
+// PM2 process definition for the GTS Algo Research backend.
 //
 // FORK MODE, ONE INSTANCE — deliberately NOT cluster mode.
 //
@@ -19,7 +19,7 @@
 module.exports = {
   apps: [
     {
-      name: "strikedge",
+      name: "gts-backend",
       script: "dist/index.js",
       // node dist/index.js — the compiled server. Run `npm run build` first.
       interpreter: "node",
@@ -33,7 +33,7 @@ module.exports = {
 
       // GRACEFUL SHUTDOWN BUDGET.
       // On stop/reload PM2 sends SIGTERM, waits kill_timeout, then SIGKILL.
-      // StrikeEdge's shutdown sequence (stop scanner → drain outbox → close Mongo
+      // The shutdown sequence (stop scanner → drain outbox → close Mongo
       // → close PostgreSQL last) is bounded by SHUTDOWN_TIMEOUT_MS (default
       // 20000). kill_timeout MUST sit comfortably ABOVE that so the sequence can
       // finish before SIGKILL — otherwise PM2 kills the process mid-drain.
@@ -51,8 +51,8 @@ module.exports = {
       stop_exit_codes: [0],
 
       // Logs. Point these at wherever your host keeps service logs.
-      out_file: "/var/log/strikedge/out.log",
-      error_file: "/var/log/strikedge/error.log",
+      out_file: "/var/log/gts/out.log",
+      error_file: "/var/log/gts/error.log",
       merge_logs: true,
       time: true,
 

@@ -52,8 +52,8 @@ async function startApp(readiness = new ReadinessController()) {
       const state = readiness.getState();
       const message =
         state === "shutting_down"
-          ? "StrikeEdge is shutting down; mutating requests are refused."
-          : "StrikeEdge is not ready; mutating requests are refused until startup completes.";
+          ? "GTS Algo Research is shutting down; mutating requests are refused."
+          : "GTS Algo Research is not ready; mutating requests are refused until startup completes.";
       res.status(503).json({ error: message });
       return;
     }
@@ -65,7 +65,7 @@ async function startApp(readiness = new ReadinessController()) {
     const state = readiness.getState();
     const ready = readiness.isReady();
     res.status(ready ? 200 : 503).json({
-      service: "strikedge",
+      service: "gts-algo-research",
       state,
       ready,
       shutting_down: state === "shutting_down",
@@ -209,7 +209,7 @@ test("health is 503 with ready:false during startup", async () => {
     assert.equal(res.status, 503);
     assert.equal(body.ready, false);
     assert.equal(body.state, "starting");
-    assert.equal(body.service, "strikedge");
+    assert.equal(body.service, "gts-algo-research");
   } finally {
     await app.close();
   }

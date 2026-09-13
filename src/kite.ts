@@ -3,8 +3,8 @@
  * Minimal Kite Connect v3 client implemented with native `fetch` so it needs no
  * external dependencies.
  *
- * StrikeEdge does NOT perform Zerodha OAuth: the api key and access token are
- * provisioned by the CalSpread token provider and installed via
+ * This backend does NOT perform Zerodha OAuth: the api key and access token are
+ * provisioned by the external CalSpread token provider and installed via
  * `KiteClient.installProvidedToken`. The request-token exchange and the login-URL
  * builder have been removed accordingly.
  *
@@ -33,7 +33,7 @@ const KITE_HTTP_TIMEOUT_MS = (() => {
 
 export interface KiteConfig {
   apiKey: string;
-  /** Unused in StrikeEdge (no OAuth checksum); kept optional for config compatibility. */
+  /** Unused in this backend (no OAuth checksum); kept optional for config compatibility. */
   apiSecret?: string;
 }
 
@@ -400,7 +400,7 @@ export class KiteClient {
   constructor(config: KiteConfig) {
     // NO OAUTH IN STRIKEEDGE. The api key and access token are installed by the
     // broker token acquisition service (`installProvidedToken`), which fetches them
-    // from the CalSpread provider. `api_secret` is therefore unused — there is no
+    // from the external CalSpread provider. `api_secret` is therefore unused — there is no
     // request-token checksum to compute — and an empty api key at construction is
     // fine because the installer supplies it before the first authenticated call.
     this.apiKey = config.apiKey ?? "";
@@ -408,7 +408,7 @@ export class KiteClient {
 
   /**
    * Install the api key + access token provisioned by the token acquisition
-   * service. This REPLACES the Zerodha OAuth login flow: StrikeEdge never exchanges
+   * service. This REPLACES the Zerodha OAuth login flow: This backend never exchanges
    * a request token itself.
    */
   installProvidedToken(apiKey: string, accessToken: string): void {
@@ -476,14 +476,14 @@ export class KiteClient {
   /**
    * Step 2/3 — DISABLED IN STRIKEEDGE.
    *
-   * The Zerodha request-token exchange is removed: StrikeEdge never performs its
-   * own broker OAuth. The access token is provisioned by the CalSpread token
+   * The Zerodha request-token exchange is removed: This backend never performs its
+   * own broker OAuth. The access token is provisioned by the external CalSpread token
    * provider and installed via {@link installProvidedToken}. Retained as a throwing
    * stub so any lingering caller fails loudly rather than silently doing nothing.
    */
   async generateSession(_requestToken: string): Promise<SessionData> {
     throw new KiteError(
-      "Zerodha OAuth login is disabled in StrikeEdge: the access token is provisioned by the CalSpread token provider, not by a request-token exchange.",
+      "Zerodha OAuth login is disabled in this backend: the access token is provisioned by the external CalSpread token provider, not by a request-token exchange.",
       400,
     );
   }
@@ -515,8 +515,8 @@ export class KiteClient {
   private authHeader(): Record<string, string> {
     if (!this.accessToken) {
       throw new KiteError(
-        "Zerodha access token is not installed yet. StrikeEdge has no interactive login flow; " +
-          "the token is provisioned by the CalSpread token acquisition service and installed via " +
+        "Zerodha access token is not installed yet. This backend has no interactive login flow; " +
+          "the token is provisioned by the external CalSpread token acquisition service and installed via " +
           "installProvidedToken(). Wait for token acquisition to complete (see GET /api/runtime/status).",
         401,
       );

@@ -2,8 +2,8 @@
  * A Dhan token acquired AFTER boot must reach the RUNNING manager.
  *
  * THE BUG THIS PINS
- * StrikeEdge performs no broker OAuth: `BrokerTokenAcquisitionService` fetches the Dhan
- * token from CalSpread at 09:00 IST, persists it encrypted to `broker_sessions`, and
+ * This backend performs no broker OAuth: `BrokerTokenAcquisitionService` fetches the Dhan
+ * token from the predecessor codebase at 09:00 IST, persists it encrypted to `broker_sessions`, and
  * then calls `callbacks.installDhanToken()`.
  *
  * `ActiveBrokerManager` read `broker_sessions` in exactly one place — inlined inside
