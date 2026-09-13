@@ -484,13 +484,23 @@ export class BoxTradingSessionManager {
             "the trading session is not armed or its durable state is unreadable, so an entry attempt cannot be accounted for",
         };
       }
+      // RE-CHECK THE WHOLE VERDICT, not just the attempt budget. The caller consulted
+      // `evaluateEntry` SYNCHRONOUSLY before this mutation was queued, so any budget that became
+      // exhausted while it waited its turn — the attempt ceiling OR the completed-cycle ceiling —
+      // must be honoured here rather than spending an attempt against a session that has since
+      // closed. Honouring only one reason left the other able to slip through.
+      //
+      // `recoveryActive` is deliberately false: this manager does not observe recovery state, and
+      // the caller's synchronous gate is the authority on it. That is a narrowing, and it is safe
+      // in the conservative direction only because recovery activation cannot make a refusal into
+      // an admission — it can only add a reason to refuse, which the caller already applied.
       const verdict = evaluateSessionEntry({ record: this.record, recoveryActive: false });
-      if (!verdict.allowed && verdict.reason === "session_attempt_budget_exhausted") {
+      if (!verdict.allowed) {
         return {
           ok: false,
           detail:
             verdict.detail ??
-            "the session's entry-attempt budget is exhausted, so no further attempt may be started",
+            `the armed trading session refused the attempt (${verdict.reason ?? "session_limit_reached"})`,
         };
       }
       const next = recordEntryAttemptStarted(this.record, this.now());

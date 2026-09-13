@@ -97,18 +97,41 @@ export function createPlannedMarginProvider(args: {
     // "unavailable" is an HONEST no-figure, not a zero. An INCOMPLETE figure may still be
     // DISPLAYED with its label (see `BoxEngine.captureMargin`), but it must not authorise new
     // exposure, so here it is surfaced to the gate as missing.
+    // FAIL CLOSED. Five independent ways this can fail to be evidence, and all five must produce
+    // the SAME "no figure" outcome so the gate cannot be admitted on a partial or fabricated one:
+    //   1. the read threw                           → basket is null
+    //   2. the adapter reported no figure            → source "unavailable"
+    //   3. the figure covers only part of the basket → complete !== true   (DEFECT A)
+    //   4. there is no usable total                  → total null / non-finite
+    //   5. the total is NON-POSITIVE                 → not a credible requirement
+    //
+    // (5) is the broker-agnostic backstop, and it belongs here rather than only in each adapter.
+    // A four-leg box always contains SHORT options, so a requirement of ₹0 is never real — it is
+    // what a fabricated stand-in or a misread payload looks like. `Number.isFinite(0)` is true and
+    // `available_funds < 0` is false, so without this test a ₹0 total would be reported as
+    // broker-confirmed evidence AND would satisfy funds-cover against any balance. The stage model
+    // rejects non-positive figures one layer above, but the two weaker controls
+    // (BOX_LIVE_REQUIRE_FUNDS_COVER / BOX_LIVE_REQUIRE_MARGIN_EVIDENCE) are configurable on their
+    // own, so the boundary has to hold this itself.
     if (
       !basket ||
       basket.source === "unavailable" ||
       basket.complete !== true ||
       basket.total === null ||
-      !Number.isFinite(basket.total)
+      !Number.isFinite(basket.total) ||
+      !(basket.total > 0)
     ) {
       if (basket && basket.complete !== true && basket.incomplete_reason !== null) {
         log(
           "[Box] planned-margin evidence is INCOMPLETE and will not authorise entry: " +
             `${basket.incomplete_reason} (source=${basket.source}, ` +
             `legs ${basket.legs_priced}/${basket.legs_requested})`,
+        );
+      } else if (basket && basket.complete === true && basket.total !== null && !(basket.total > 0)) {
+        log(
+          `[Box] planned-margin evidence REFUSED: ${basket.source} reported a complete basket with ` +
+            `a non-positive total (₹${basket.total}). A four-leg box contains short options, so ` +
+            "this is not a credible requirement and will not authorise entry.",
         );
       }
       return { marginRupees: null, observedAt: now() };

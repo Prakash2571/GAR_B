@@ -1095,6 +1095,13 @@ export class BoxEngine {
           // zero utilisation is a real, trustworthy figure and stays 0; an ABSENT one stays null and
           // makes the funding gate refuse. `Number.isFinite(0)` is true, so presence is decided by
           // the adapter's null, never inferred from the value.
+          //
+          // WHERE THE REFUSAL COMES FROM, for each broker's declared semantics (fundsSemantics.ts):
+          // for a GROSS or UNVERIFIED broker the utilisation is needed to compute spendable funds at
+          // all, so a null yields no funds figure. For a NET broker it is not needed for the
+          // subtraction, but its absence means the already-net claim cannot be corroborated — so the
+          // encumbrance stays a required UNKNOWN component of the binding requirement and stage
+          // funding refuses. Either way an absent utilisation refuses rather than being assumed idle.
           utilisedRupees: typeof m.utilised === "number" && Number.isFinite(m.utilised) ? m.utilised : null,
           observedAt: Date.now(),
         };

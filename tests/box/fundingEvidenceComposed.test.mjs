@@ -465,3 +465,98 @@ test("an unrecognised broker yields no funds figure rather than borrowing anothe
   assert.equal(usable.value_rupees, null);
   assert.equal(report.allowed, false);
 });
+
+
+/* ═════════════════════════════════════════════════════════════════════════════════════════
+ * SECTION R — REVIEW FINDING ON THE ENCUMBRANCE FIX
+ *
+ * Removing the double count also removed a refusal, and only on the arm that matters most.
+ *
+ * Under the old additive model an UNKNOWN encumbrance made `binding_requirement` unknown and
+ * stage funding refused `funding_stage_unknown`. The first version of the netting fix returned
+ * `encumbranceNettedFromAvailable: true` for a `net_of_encumbrance` broker WITHOUT consulting
+ * `utilisedRupees`, so a missing encumbrance neither poisoned the requirement nor reduced the
+ * funds figure — admission proceeded on `available` alone.
+ *
+ * That is only safe if `available.live_balance` really is net of encumbrance, and
+ * `fundsSemantics.ts` records its own identification of that field as resting on vendor SUPPORT
+ * documentation rather than a field-level API statement, "NOT VERIFIED against a live account".
+ * The double count was the compensating conservatism for that unverified fact — and Zerodha, the
+ * only broker on this arm, is precisely the broker the supervised trial profile permits to run
+ * (Dhan is deliberately blocked). So the refusal had to come back without the double count
+ * returning with it.
+ * ═════════════════════════════════════════════════════════════════════════════════════════ */
+
+test("R1 REPRODUCTION: a NET broker with an UNREPORTED encumbrance must still refuse", () => {
+  const { usable, picture, report } = admitWithFunds({
+    broker: "zerodha",
+    availableRupees: 10_000_000, // abundant
+    utilisedRupees: null, // the broker did not report it
+    initial: 96_505,
+    final: 34_787,
+  });
+  // The funds figure is still produced — `available` does not depend on the utilisation here...
+  assert.equal(usable.value_rupees, 10_000_000);
+  // ...but the already-net claim cannot be corroborated, so it is NOT treated as netted.
+  assert.equal(
+    usable.encumbranceNettedFromAvailable,
+    false,
+    "an absent utilisation must not be reported as 'already netted'",
+  );
+  assert.equal(usable.encumbranceMissing, true);
+  // Which leaves the encumbrance a required UNKNOWN component of the requirement.
+  assert.equal(picture.funding.binding_requirement.usable, false);
+  assert.equal(picture.funding.binding_requirement.value_rupees, null);
+  assert.equal(report.allowed, false, "abundant funds must not excuse an uncorroborated claim");
+  assert.ok(
+    report.reasons.includes("funding_stage_unknown"),
+    `expected funding_stage_unknown, got ${JSON.stringify(report.reasons)}`,
+  );
+});
+
+test("R2 a NET broker with a REPORTED encumbrance is netted once and admits", () => {
+  // The other half: when the utilisation IS reported the double count must stay gone.
+  const { usable, picture, report } = admitWithFunds({
+    broker: "zerodha",
+    availableRupees: 200_000,
+    utilisedRupees: 50_000,
+    initial: 96_505,
+    final: 34_787,
+  });
+  assert.equal(usable.value_rupees, 200_000, "not subtracted — the broker already netted it");
+  assert.equal(usable.encumbranceNettedFromAvailable, true);
+  assert.equal(
+    picture.funding.binding_requirement.value_rupees,
+    96_505,
+    "and not re-added to the requirement either",
+  );
+  assert.equal(report.allowed, true, `should admit; detail: ${report.detail ?? "(none)"}`);
+});
+
+test("R3 a reported ZERO encumbrance is a real figure, not a missing one", () => {
+  const { usable, picture, report } = admitWithFunds({
+    broker: "zerodha",
+    availableRupees: 200_000,
+    utilisedRupees: 0,
+    initial: 96_505,
+    final: 34_787,
+  });
+  assert.equal(usable.encumbranceMissing, false, "a trustworthy 0 is not an absence");
+  assert.equal(usable.encumbranceNettedFromAvailable, true);
+  assert.equal(picture.funding.binding_requirement.value_rupees, 96_505);
+  assert.equal(report.allowed, true);
+});
+
+test("R4 a GROSS/unverified broker still fails closed on the FUNDS side", () => {
+  // Unchanged by the netting fix, re-asserted here so the two arms are pinned together.
+  const { usable, report } = admitWithFunds({
+    broker: "dhan",
+    availableRupees: 200_000,
+    utilisedRupees: null,
+    initial: 96_505,
+    final: 34_787,
+  });
+  assert.equal(usable.value_rupees, null, "spendable funds cannot be computed without it");
+  assert.equal(usable.encumbranceNettedFromAvailable, false);
+  assert.equal(report.allowed, false);
+});

@@ -1650,6 +1650,29 @@ export class ActiveBrokerManager {
       priced++;
     }
 
+    // A NON-POSITIVE SUM IS NOT A REQUIREMENT. Every leg answering ₹0 satisfies the completeness
+    // count while establishing nothing: a four-leg box always contains SHORT options, so a total
+    // of ₹0 is what a fabricated or misread payload looks like, not a margin-free basket.
+    // `normalizeDhanMultiMargin` already refuses a non-positive total on the netted path; without
+    // the same test here the fallback could report `{ total: 0, complete: true }`, which downstream
+    // reads as broker-confirmed evidence of a ₹0 requirement.
+    if (priced === orders.length && !(total > 0)) {
+      console.warn(
+        `[Dhan] basket margin UNAVAILABLE: all ${orders.length} legs answered, but the summed ` +
+          `standalone margin is ₹${total}. A four-leg box contains short options, so a ` +
+          "non-positive requirement is not credible and is treated as unreadable.",
+      );
+      this.lastMarginSource = "unavailable";
+      return unusableBasketMargin({
+        source: "unavailable",
+        legsRequested: orders.length,
+        legsPriced: priced,
+        reason:
+          `all ${orders.length} legs answered but the summed standalone margin was ₹${total}; ` +
+          "a non-positive requirement for a basket containing short options is not credible",
+      });
+    }
+
     if (priced !== orders.length) {
       // INCOMPLETE. Report no figure rather than an understated one. This covers "nothing
       // priced at all" and every partial case in between, which the old `priced === 0` guard

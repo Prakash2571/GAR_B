@@ -210,18 +210,36 @@ export function usableFundsRupees(args: {
   }
 
   switch (semantics.availableIsNetOfEncumbrance) {
-    case "net_of_encumbrance":
+    case "net_of_encumbrance": {
       // Do NOT subtract. `utilised` is corroborating detail, not a second deduction.
+      //
+      // BUT ONLY CLAIM IT WAS NETTED WHEN WE CAN SEE IT. The identification of Zerodha's
+      // `available.live_balance` as already-net rests on vendor SUPPORT documentation, not on a
+      // field-level API statement, and this module records that as NOT VERIFIED against a live
+      // account. While that is true, a reported `utilised` figure is the only corroboration
+      // available, and its ABSENCE must not quietly become a claim.
+      //
+      // So: when the encumbrance is known, it is genuinely netted already and the requirement must
+      // not re-add it (that was the double count). When it is MISSING, this returns `false`, which
+      // leaves the encumbrance as a required-but-unknown component of the binding requirement and
+      // therefore REFUSES — exactly the fail-closed behaviour the additive model used to provide
+      // by accident. Removing the double count must not also remove that refusal.
+      const encumbranceKnown = utilised !== null && Number.isFinite(utilised);
       return {
         value_rupees: available,
         basis:
           `${args.broker}: ${semantics.availableField} is documented as already net of ` +
-          `encumbrances, so ${semantics.utilisedField} is NOT subtracted again`,
+          `encumbrances, so ${semantics.utilisedField} is NOT subtracted again` +
+          (encumbranceKnown
+            ? ` (${semantics.utilisedField} ₹${utilised} corroborates it)`
+            : `; but ${semantics.utilisedField} was NOT reported, so the already-net claim cannot ` +
+              `be corroborated and the encumbrance stays a required UNKNOWN component of the ` +
+              `funding requirement`),
         semanticsUnverified: false,
-        encumbranceMissing: false,
-        // The BROKER already netted it. Spendable, therefore the requirement must not add it.
-        encumbranceNettedFromAvailable: true,
+        encumbranceMissing: !encumbranceKnown,
+        encumbranceNettedFromAvailable: encumbranceKnown,
       };
+    }
 
     case "gross_of_encumbrance": {
       if (utilised === null || !Number.isFinite(utilised)) {

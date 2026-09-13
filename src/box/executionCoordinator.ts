@@ -861,7 +861,20 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
     // A failure to record REFUSES the entry rather than proceeding: nothing has been sent yet, so the
     // safe answer is to not send, and an uncounted attempt would be an unbounded one.
     if (this.deps.sessionConsumeAttempt) {
-      const consumed = await this.deps.sessionConsumeAttempt();
+      let consumed: { ok: boolean; detail: string | null };
+      try {
+        consumed = await this.deps.sessionConsumeAttempt();
+      } catch (error) {
+        // A THROWING consume hook must not keep the claim. This is the FIRST await past the
+        // claim, and a leak here is permanent and silent: nothing reaps `this.active` except a
+        // broker switch, so the opportunity would be refused as a duplicate OF ITSELF for the
+        // life of the process — and because the per-underlying budget counts `this.active`,
+        // with BOX_MAX_CONCURRENT_PER_UNDERLYING=1 (the trial-profile value) every OTHER
+        // opportunity on that underlying would be refused too. The hold acquisition below has
+        // the same guard for the same reason.
+        this.abandonAndReleaseHold(executionId);
+        throw error;
+      }
       if (!consumed.ok) {
         this.stats.sessionLimitRefusals++;
         this.log({

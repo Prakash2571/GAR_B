@@ -814,3 +814,119 @@ test("E4 once CONSUMED, a later refusal does NOT refund the attempt", async (t) 
   gateway.finishAll();
   await first;
 });
+
+
+/* ═════════════════════════════════════════════════════════════════════════════════════════
+ * SECTION R — REVIEW FINDINGS ON THE FIX ITSELF
+ *
+ * A behavioural review of the claim-before-yield reorder found one exit path past `claim()`
+ * that did not release it: a THROWING `sessionConsumeAttempt`. Its `!ok` return released, but a
+ * rejection propagated straight out of `coordinateEntry`, and nothing reaps `this.active` except
+ * a broker switch. The leak is permanent and silent, and its blast radius is wider than the
+ * affected opportunity, because the per-underlying budget counts `this.active`: with
+ * BOX_MAX_CONCURRENT_PER_UNDERLYING=1 — the supervised trial profile's value — every OTHER
+ * opportunity on that underlying is refused too.
+ *
+ * Reachability is low (`commit()` swallows persistence failures and returns false, so the
+ * remaining sources are the availability predicate, the clock and the injected logger), but the
+ * trigger is transient while the damage is permanent, which is the wrong way round.
+ * ═════════════════════════════════════════════════════════════════════════════════════════ */
+
+test("R1 REPRODUCTION: a THROWING consume hook must not leak the claim or wedge the underlying", async (t) => {
+  const gateway = controllableGateway();
+  t.after(() => gateway.finishAll());
+  const local = new InProcessInstrumentReservations();
+  let throwOnce = true;
+  const coordinator = new CoordinatedBoxExecutionGateway({
+    inner: gateway,
+    reservations: local,
+    local,
+    waitable: local,
+    cfg: cfg({
+      conflictWaitMaxMs: 250,
+      instrumentLockTtlMs: 5000,
+      // The trial-profile value. It is what turns one leaked claim into an underlying-wide outage.
+      maxConcurrentPerUnderlying: 1,
+      reservationClockSkewGraceMs: 0,
+      oneActiveBoxPerUnderlying: false,
+    }),
+    quotes: { view: () => new Map() },
+    broker: () => "zerodha",
+    generation: () => 1,
+    identity: IDENTITY,
+    now: () => NOW,
+    sleep: () => new Promise((r) => setImmediate(r)),
+    setTimer: () => null,
+    clearTimer: () => {},
+    log: () => {},
+    sessionEntryGate: () => ({ allowed: true, reason: null, detail: null }),
+    sessionConsumeAttempt: async () => {
+      if (throwOnce) {
+        throwOnce = false;
+        throw new Error("session persistence exploded");
+      }
+      return { ok: true, detail: null };
+    },
+  });
+
+  const a = boxFor({ underlying: "RELIANCE", k1: 2500, k2: 2550 });
+  await assert.rejects(
+    () => enter(coordinator, a),
+    /session persistence exploded/,
+    "the throw is propagated to the caller, not swallowed",
+  );
+
+  assert.equal(
+    coordinator.metrics().activeExecutions,
+    0,
+    "the claim taken before the throwing await MUST be released",
+  );
+  assert.equal(coordinator.metrics().activeInstrumentReservations, 0, "no reservation leaked");
+
+  // A DIFFERENT opportunity on the same underlying must not be starved by a phantom occupant of
+  // the per-underlying budget. Checked FIRST, while nothing else is in flight — a legitimately
+  // admitted entry would occupy the single slot itself and make this assertion meaningless.
+  const other = enter(coordinator, boxFor({ underlying: "RELIANCE", k1: 2600, k2: 2650 }));
+  await letAdmissionSettle();
+  assert.equal(
+    gateway.started.length,
+    1,
+    "a leaked claim would have consumed the only per-underlying slot and refused this entry",
+  );
+  gateway.finishAll();
+  const otherResult = await settled(other);
+  assert.ok(
+    !/per-underlying execution budget reached/.test(String(otherResult.detail ?? "")),
+    `a leaked claim starves the whole underlying: ${otherResult.detail}`,
+  );
+  assert.equal(coordinator.metrics().activeExecutions, 0, "and it settled cleanly");
+
+  // The SAME opportunity that threw must also be retryable — not refused as a duplicate of itself.
+  const retry = enter(coordinator, a);
+  await letAdmissionSettle();
+  gateway.finishAll();
+  const retryResult = await settled(retry);
+  assert.notEqual(
+    retryResult.reason,
+    "duplicate",
+    `a leaked claim makes the opportunity a duplicate of itself: ${retryResult.detail}`,
+  );
+});
+
+test("R2 an exhausted COMPLETED-CYCLE budget landing during the queued write also refuses", async () => {
+  // The in-lock re-check used to honour only `session_attempt_budget_exhausted`, so a
+  // completed-cycle exhaustion arriving while the mutation queued still spent an attempt and
+  // returned ok. Both ceilings are now honoured inside the lock.
+  const { manager } = await armedSession({ maxAttempts: 10, maxTrades: 1, delayMs: 5 });
+  // Consume the single completed-trade cycle by establishing a Box.
+  await manager.recordEstablished("trade-1");
+  assert.equal(manager.evaluateEntry(false).allowed, false, "the cycle budget is now exhausted");
+
+  const consumed = await manager.recordAttemptStarted();
+  assert.equal(consumed.ok, false, "an attempt must not be spent against a closed session");
+  assert.equal(
+    manager.snapshot().entry_attempts,
+    0,
+    "and the attempt counter must not have advanced",
+  );
+});

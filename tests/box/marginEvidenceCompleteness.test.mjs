@@ -456,3 +456,44 @@ test("B9 funds cover must NOT silently fall back to gross option premium", () =>
     `expected metric_incomplete, got ${JSON.stringify(report.reasons)}`,
   );
 });
+
+
+/* ═════════════════════════════════════════════════════════════════════════════════════════
+ * SECTION R — REVIEW FINDINGS ON THE FIX ITSELF
+ *
+ * The completeness fix established that a ₹0 requirement for a four-leg basket containing SHORT
+ * options is what a fabricated or misread payload looks like — and enforced it in the stage model
+ * (`usableFigure`), in `normalizeDhanMultiMargin`, and in the decision to make `total` nullable
+ * "rather than 0". A review found the per-leg fallback it rewrote did NOT apply the same rule:
+ * four legs each answering `{ totalMargin: 0 }` satisfied the completeness COUNT and were returned
+ * as `{ total: 0, complete: true }` — the field the rest of the system now treats as the
+ * completeness authority. Funds-cover then compared available funds against a ₹0 requirement and
+ * admitted.
+ *
+ * Stage funding rejected it one layer above, so the supervised trial profile was protected; the
+ * weaker two controls, which are configurable on their own, were not.
+ * ═════════════════════════════════════════════════════════════════════════════════════════ */
+
+test("R1 REPRODUCTION: four legs each answering ZERO is not complete evidence", async () => {
+  const { res } = await dhanFallback({ perLeg: () => ({ totalMargin: 0, spanMargin: 0 }) });
+  assert.equal(
+    usableForAdmission(res),
+    false,
+    "a summed requirement of ₹0 for a basket containing short options is not credible",
+  );
+  assert.equal(res.complete, false);
+  assert.equal(res.total, null, "reported as unknown, not as a margin-free basket");
+  assert.equal(res.source, "unavailable");
+  assert.match(String(res.incomplete_reason), /non-positive|₹0/i);
+});
+
+test("R2 a partially-zero basket that still sums positive remains usable", async () => {
+  // The guard is on the TOTAL, not on each leg: a genuine zero on one leg is still a real answer
+  // (A6 above), and must not be turned into a refusal when the basket total is credible.
+  const { res } = await dhanFallback({
+    perLeg: (id) => (id === "45003" ? { totalMargin: 0 } : { totalMargin: 50_000 }),
+  });
+  assert.equal(res.complete, true);
+  assert.equal(res.total, 150_000);
+  assert.ok(usableForAdmission(res));
+});
