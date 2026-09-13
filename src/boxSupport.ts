@@ -1,16 +1,16 @@
 /**
- * The dependencies CalSpread's `src/index.ts` used to hand the Box module.
+ * The dependencies the predecessor codebase's `src/index.ts` used to hand the Box module.
  *
  * `registerBoxModule` takes eight collaborators it does not own — the IST day key,
  * the market-hours predicate, the token→identifier resolver, the F&O board, the
  * instrument dump, the Zerodha charge estimator and the basket-margin call. In
- * CalSpread those lived inside a 5,584-line `index.ts` alongcalendar spreads,
+ * the predecessor codebase those lived inside a 5,584-line `index.ts` alongcalendar spreads,
  * futures analytics, option-OI capture and Yahoo dividends. Extracting them into
- * this file is what makes StrikeEdge's own `index.ts` small enough to read.
+ * this file is what makes this backend's own `index.ts` small enough to read.
  *
  * EVERY FUNCTION HERE IS A VERBATIM PORT. The board derivation, the IST arithmetic,
  * the market-hours window, the per-leg charge folding and the aggregation rounding
- * are byte-for-byte the CalSpread behaviour, because the Box entry gate is priced
+ * are byte-for-byte the predecessor codebase's behaviour, because the Box entry gate is priced
  * off them and `tests/box/migration-fixtures` pins the results. Nothing in this
  * file may be "improved" without a fixture change to prove the new numbers.
  *
@@ -37,7 +37,7 @@ import type { ILegCharges, ITradeCharges } from "./types/charges.js";
  * Calendar day in IST (UTC+5:30) as YYYY-MM-DD — defaults to right now.
  *
  * Fixed offset rather than `Intl` on purpose: India has no daylight saving and
- * never has, and the durable P&L day keys already written by CalSpread were
+ * never has, and the durable P&L day keys already written by the predecessor codebase were
  * produced by exactly this arithmetic. `src/tokens/istClock.ts` uses the same
  * offset for the token scheduler, so a day boundary means one thing everywhere.
  */
@@ -69,12 +69,12 @@ export function makeIdResolver(all: Instrument[]): (token: number) => string | n
 }
 
 /**
- * One board row. Exactly CalSpread's `BoardItem`.
+ * One board row. Exactly the predecessor codebase's `BoardItem`.
  *
  * `BoxBoardItem` (in `src/box/instruments.ts`) declares only the four fields the
  * Box universe actually reads, and it is deliberately left that way — the Box code
  * must not grow a dependency on the calendar board's shape. The extra `futures`
- * array is still produced because it is what CalSpread's board carried, and a
+ * array is still produced because it is what the predecessor codebase's board carried, and a
  * structural subtype is assignable to `BoxBoardItem` wherever the Box module wants
  * one. Declaring it here rather than widening `BoxBoardItem` keeps that seam intact.
  */
@@ -233,6 +233,12 @@ export function makePriceChargeGroups(kite: KiteClient) {
           // Synthetic ids: these are simulated fills, so there is no broker order to
           // reference. They also let responses be mapped back to legs by value
           // instead of relying on the response preserving request order.
+          //
+          // THE PREFIX WAS NOT RENAMED WITH THE REBRAND. It is a correlation token inside one
+          // charge-pricing round trip, matched byte-for-byte against the broker's response a
+          // few lines below. It is on the charge-pricing path, which this rebrand does not
+          // touch, and it is never persisted, rendered or exposed — so there is nothing to
+          // gain by changing it and a leg-mapping bug to be gained by getting it wrong.
           order_id: `strikedge-${gi}-${li}`,
           exchange: leg.exchange,
           tradingsymbol: leg.tradingsymbol,

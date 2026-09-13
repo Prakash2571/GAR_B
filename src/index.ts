@@ -1,7 +1,7 @@
 /**
- * StrikeEdge backend entrypoint.
+ * GTS Algo Research backend entrypoint.
  *
- * This file replaces CalSpread's 5,584-line `src/index.ts`. Everything that was not
+ * This file replaces the predecessor codebase's 5,584-line `src/index.ts`. Everything that was not
  * the Box strategy — calendar spreads, futures analytics, option-OI capture, the
  * hourly/EOD schedulers, Yahoo dividends, the F&O board pages, the browser-wide
  * market-data SSE, the Zerodha OAuth login and the admin-token layer — is gone.
@@ -104,7 +104,7 @@ try {
   config = loadAppConfig();
 } catch (err) {
   if (err instanceof ConfigError) {
-    console.error("[FATAL] StrikeEdge refuses to start with invalid configuration.");
+    console.error("[FATAL] GTS Algo Research refuses to start with invalid configuration.");
     for (const p of err.problems) console.error(`  - ${p}`);
     process.exit(1);
   }
@@ -143,7 +143,7 @@ const dhanLiveTradingEnabled = boolOr(process.env.DHAN_LIVE_TRADING_ENABLED, fal
 if (boxExecutionMode === "live" && !boxLiveTradingEnabled) {
   console.error(
     "[FATAL] BOX_EXECUTION_MODE=live requires BOX_LIVE_TRADING_ENABLED=true. " +
-      "Live execution is double-gated at the deployment level and StrikeEdge fails closed " +
+      "Live execution is double-gated at the deployment level and GTS Algo Research fails closed " +
       "rather than degrading silently to paper.",
   );
   process.exit(1);
@@ -185,7 +185,7 @@ const brokerManager = new ActiveBrokerManager({
   zerodhaCredentials: () => ({ apiKey: kite.getApiKey(), accessToken: kite.getAccessToken() }),
   // BOX-LANE ticks go straight to the Box quote store, NOT through the hub: the hub
   // owns broadcast caches, and thousands of option strikes do not belong on a
-  // browser fan-out path. StrikeEdge has no browser market-data SSE at all, but the
+  // browser fan-out path. This backend has no browser market-data SSE at all, but the
   // separation is kept because it is what bounds the Box lane's own token budget.
   onBoxLaneTicks: (ticks) => {
     brokerManager.noteTick();
@@ -260,8 +260,8 @@ app.use((req: Request, res: Response, next) => {
     const state = readiness.getState();
     const message =
       state === "shutting_down"
-        ? "StrikeEdge is shutting down; mutating requests are refused."
-        : "StrikeEdge is not ready; mutating requests are refused until startup completes.";
+        ? "GTS Algo Research is shutting down; mutating requests are refused."
+        : "GTS Algo Research is not ready; mutating requests are refused until startup completes.";
     res.status(503).json({ error: message });
     return;
   }
@@ -288,7 +288,7 @@ app.get("/api/health", (_req: Request, res: Response) => {
   const state = readiness.getState();
   const ready = readiness.isReady();
   res.status(ready ? 200 : 503).json({
-    service: "strikedge",
+    service: "gts-algo-research",
     state,
     ready,
     shutting_down: state === "shutting_down",
@@ -430,7 +430,7 @@ let projector: Projector | null = null;
  *
  * Built explicitly, side by side, precisely because they must NOT be derived from one
  * another: the operator may legitimately set the same value for both passcodes (the
- * CalSpread deployment protects both routes with one `TOKEN_ROUTE_SECRET`), but the
+ * the external CalSpread deployment protects both routes with one `TOKEN_ROUTE_SECRET`), but the
  * application must never assume they are identical nor copy one into the other. A
  * future rotation of one secret then works without silently breaking the other.
  *
@@ -769,7 +769,7 @@ app.use(errorHandler());
  * "up but not ready yet". Readiness only flips to `ready` at the end of `boot()`.
  */
 const httpServer = app.listen(config.port, () => {
-  console.log(`StrikeEdge backend listening on http://localhost:${config.port} (readiness: starting)`);
+  console.log(`GTS Algo Research backend listening on http://localhost:${config.port} (readiness: starting)`);
   console.log(
     `[Gates] BOX_EXECUTION_MODE=${boxExecutionMode} BOX_LIVE_TRADING_ENABLED=${boxLiveTradingEnabled} ` +
       `ZERODHA_LIVE_TRADING_ENABLED=${zerodhaLiveTradingEnabled} DHAN_LIVE_TRADING_ENABLED=${dhanLiveTradingEnabled} ` +
@@ -799,7 +799,7 @@ const httpServer = app.listen(config.port, () => {
       // initialised resources — WITHOUT flattening or inventing any fill — and exit
       // non-zero so PM2 restarts us into a clean attempt.
       const message = err instanceof Error ? err.message : String(err);
-      console.error("[FATAL] StrikeEdge boot failed:", message);
+      console.error("[FATAL] GTS Algo Research boot failed:", message);
       readiness.markFailed(err);
       void failBootAndExit();
     });

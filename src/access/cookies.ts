@@ -2,7 +2,7 @@
  * Hand-rolled cookie parsing and serialisation.
  *
  * WHY NO `cookie` / `cookie-parser` DEPENDENCY
- * StrikeEdge deliberately keeps its dependency surface tiny (see package.json:
+ * This backend deliberately keeps its dependency surface tiny (see package.json:
  * express, pg, mongodb, dotenv and nothing else). The session gate needs exactly
  * two things — read one named cookie off an incoming request, and emit two
  * `Set-Cookie` headers with the right security attributes — so both are written

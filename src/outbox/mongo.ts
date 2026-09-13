@@ -79,6 +79,13 @@ function boolOr(raw: string | undefined, fallback: boolean): boolean {
 /**
  * Parse the database name out of a mongodb URI. Defaults to `strikedge` when the
  * URI carries no path (which is common for Atlas SRV strings).
+ *
+ * THE FALLBACK DATABASE NAME IS COMPATIBILITY-SENSITIVE AND WAS NOT RENAMED WITH THE REBRAND.
+ * It names a real MongoDB database that existing deployments already hold the reporting
+ * replica in. Changing it would silently start writing projections into a NEW, empty database
+ * while the populated one went stale — a data-loss-shaped failure that reports itself as
+ * "everything is fine". Set MONGO_EXPORT_DB (or put the database in the URI path) to choose a
+ * name explicitly; renaming a live database is a migration, not a rebrand.
  */
 export function dbNameFromUri(uri: string, fallback = "strikedge"): string {
   try {

@@ -1,7 +1,7 @@
 /**
  * APPLICATION configuration — deliberately NOT the Box strategy configuration.
  *
- * `src/box/config.ts` is ported unchanged from CalSpread and owns every `BOX_*`
+ * `src/box/config.ts` is ported unchanged from the predecessor codebase and owns every `BOX_*`
  * knob, its validation and its fail-closed behaviour. This file owns the things
  * that are true of the PROCESS: which port it listens on, which origin may talk to
  * it, how long shutdown may take, and the two independent live-trading deployment
@@ -60,7 +60,7 @@ export function loadAppConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const appTimezone = (env.APP_TIMEZONE ?? "Asia/Kolkata").trim() || "Asia/Kolkata";
   if (appTimezone !== "Asia/Kolkata") {
     problems.push(
-      `APP_TIMEZONE must be "Asia/Kolkata" — every trading-day, token-scheduling and P&L-day decision in StrikeEdge is an IST decision (got "${appTimezone}")`,
+      `APP_TIMEZONE must be "Asia/Kolkata" — every trading-day, token-scheduling and P&L-day decision in this backend is an IST decision (got "${appTimezone}")`,
     );
   }
 
@@ -78,7 +78,14 @@ export function loadAppConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     problems.push(`CSRF_ALLOWED_ORIGIN must be an absolute http(s) origin (got "${csrfAllowedOrigin}")`);
   }
 
-  const sessionCookieName = (env.SESSION_COOKIE_NAME ?? "strikedge_session").trim() || "strikedge_session";
+  // DEFAULT COOKIE NAME. Renamed with the rebrand, and only the DEFAULT: any deployment that
+  // sets SESSION_COOKIE_NAME explicitly (the documented production configuration does) is
+  // unaffected. A deployment relying on the default logs its operators out ONCE, because the
+  // browser presents the old cookie name and the server no longer looks for it — the session
+  // rows themselves are untouched and simply expire. That is an acceptable one-time cost;
+  // silently breaking authentication would not be, which is why this value is single-sourced
+  // with contract/protocol.json (`session_cookie_default`) and pinned by a contract test.
+  const sessionCookieName = (env.SESSION_COOKIE_NAME ?? "gts_session").trim() || "gts_session";
   if (!/^[A-Za-z0-9_-]+$/.test(sessionCookieName)) {
     problems.push("SESSION_COOKIE_NAME may only contain letters, digits, underscore and hyphen");
   }

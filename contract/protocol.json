@@ -1,6 +1,6 @@
 {
   "$comment": "Machine-readable protocol constants that are NOT JSON-Schema shapes but are part of the versioned wire contract. The BACKEND owns this file; the frontend MUST vendor and READ these values rather than hardcoding its own copies. csrf_header is the request header the SPA echoes the CSRF token in (see src/access/csrf.ts CSRF_HEADER). session_cookie_default is the default SESSION_COOKIE_NAME from src/config.ts. csrf_cookie_suffix is appended to the session cookie name to form the readable CSRF cookie (see src/access/cookies.ts csrfCookieName). Covered by contract/digest.mjs so a change here changes schemas_sha256.",
   "csrf_header": "x-csrf-token",
-  "session_cookie_default": "strikedge_session",
+  "session_cookie_default": "gts_session",
   "csrf_cookie_suffix": "_csrf"
 }

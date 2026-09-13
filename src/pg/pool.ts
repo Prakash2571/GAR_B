@@ -1,10 +1,10 @@
 /**
- * The PostgreSQL connection pool — StrikeEdge's single operational authority.
+ * The PostgreSQL connection pool — this backend's single operational authority.
  *
  * WHY THIS FILE IS SMALL AND EXPLICIT
- * CalSpread's Box module reached Mongo through Mongoose models, which meant a
+ * the predecessor codebase's Box module reached Mongo through Mongoose models, which meant a
  * compare-and-set was expressed as a `findOneAndUpdate` filter and the durable
- * pre-write value had to be inferred from the returned document. StrikeEdge
+ * pre-write value had to be inferred from the returned document. GTS Algo Research
  * replaces that with real SQL transactions and `UPDATE ... RETURNING`, so the
  * pre-write and post-write values are both authoritative and both come back from
  * the same statement. An ORM would obscure exactly the behaviour that matters, so
@@ -42,7 +42,7 @@ export function pgConfigFromEnv(env: NodeJS.ProcessEnv = process.env): PgConfig 
     poolMax: positiveInt(env.PG_POOL_MAX, 10),
     statementTimeoutMs: positiveInt(env.PG_STATEMENT_TIMEOUT_MS, 5_000),
     lockTimeoutMs: positiveInt(env.PG_LOCK_TIMEOUT_MS, 2_000),
-    applicationName: (env.PG_APPLICATION_NAME ?? "strikedge").trim() || "strikedge",
+    applicationName: (env.PG_APPLICATION_NAME ?? "gts").trim() || "gts",
   };
 }
 
@@ -53,7 +53,7 @@ function positiveInt(raw: string | undefined, fallback: number): number {
 
 /**
  * `pg` returns `numeric` as a string to avoid silent float truncation. Every
- * money column in StrikeEdge is `numeric`, and the Box code expects JS numbers
+ * money column in this backend is `numeric`, and the Box code expects JS numbers
  * with the rounding the strategy already applied, so the parse is registered
  * once here rather than at each call site.
  *
@@ -129,7 +129,7 @@ export async function initPg(cfg: PgConfig = pgConfigFromEnv()): Promise<void> {
     readyState = "failed";
     lastError = "DATABASE_URL is not set";
     throw new PgUnavailableError(
-      "DATABASE_URL is not set. PostgreSQL is StrikeEdge's operational authority; it is not optional.",
+      "DATABASE_URL is not set. PostgreSQL is this backend's operational authority; it is not optional.",
     );
   }
   configured = cfg;
