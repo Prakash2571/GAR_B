@@ -719,19 +719,32 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
       }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────────────────
     // EVERYTHING FROM HERE TO `claim()` RUNS SYNCHRONOUSLY, AND MUST.
     //
-    // The duplicate guard and the per-underlying budget are check-then-act on process
-    // state. When the reservation store was synchronous, this whole prologue ran to
-    // completion in one turn of the event loop, so two candidates arriving on the same
-    // tick could not both pass. Making the store asynchronous introduced an `await`
-    // between the check and the registration — a textbook TOCTOU, and it really did let
-    // two identical opportunities through, and two boxes past a budget of one.
+    // THE RULE: no `await` may appear between the guards below and `this.claim(...)`.
     //
-    // The fix is to CLAIM the slot before yielding. No `await` may be added between the
-    // guards below and `this.claim(...)`.
-    // ─────────────────────────────────────────────────────────────────────────
+    // The duplicate guard and the per-underlying budget are check-then-act on process state.
+    // When the reservation store was synchronous this whole prologue ran to completion in one
+    // turn of the event loop, so two candidates arriving on the same tick could not both pass.
+    // Every later `await` inserted here has re-opened the same TOCTOU.
+    //
+    // IT REGRESSED, AND THIS IS WHAT IT COST. The session ATTEMPT-BUDGET consume
+    // (`await sessionConsumeAttempt()`, a real PostgreSQL upsert) and the Layer 1b underlying
+    // hold were both added ABOVE the claim. Two identical candidates on one tick therefore both
+    // read `activeOpportunities` as empty, both yielded, and both SPENT an attempt before either
+    // was visible to the other: `duplicateSuppressed` stayed 0 and `entry_attempts` went to 2 for
+    // a single opportunity — on a one-attempt supervised trial, the entire safety budget consumed
+    // by a duplicate. The second `claim()` also overwrote the first execution's
+    // `activeOpportunities` entry, after which execution #1's `abandon()` no longer removed its
+    // own key (that delete is guarded on the key still mapping to itself), leaving a phantom
+    // incumbent that suppressed the opportunity for the rest of the process's life.
+    //
+    // Both awaits now live AFTER the claim. Ordering note: the attempt is still consumed durably
+    // BEFORE any reservation is taken and long before any broker POST, so nothing is risked on an
+    // uncounted attempt — the claim is process-local bookkeeping, not exposure. In exchange, every
+    // refusal past the claim must release it; `abandonAndReleaseHold` is the one call that does.
+    // ─────────────────────────────────────────────────────────────────────────────────────
 
     // DUPLICATE GUARD — a different problem from instrument reservation. This one
     // catches the SAME strategy fired twice; the reservation catches DIFFERENT
@@ -779,37 +792,6 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
       };
     }
 
-    // ── SESSION ATTEMPT BUDGET: CONSUMED HERE, BEFORE ANYTHING IS RISKED ───────────────
-    //
-    // The gate above asked "may I attempt?". This SPENDS the attempt. It sits before the reservation
-    // and long before any broker POST, so an attempt that is admitted and then fails — rejected,
-    // partially filled and unwound, or recovered — has still consumed its budget. Counting at
-    // completion instead is what let a trial configured for one trade submit orders indefinitely,
-    // provided no attempt ever completed a Box.
-    //
-    // A failure to record REFUSES the entry rather than proceeding: nothing has been sent yet, so the
-    // safe answer is to not send, and an uncounted attempt would be an unbounded one.
-    if (this.deps.sessionConsumeAttempt) {
-      const consumed = await this.deps.sessionConsumeAttempt();
-      if (!consumed.ok) {
-        this.stats.sessionLimitRefusals++;
-        this.log({
-          execution: executionId,
-          broker,
-          underlying: candidate.underlying,
-          status: "suppressed_session_limit",
-          reason: "session_attempt_unaccountable",
-        });
-        return {
-          ok: false,
-          reason: "session_limit_reached",
-          detail:
-            consumed.detail ??
-            "the entry attempt could not be durably counted against the session attempt budget, so it was not started",
-        };
-      }
-    }
-
     // ── UNDERLYING LOCK, LAYER 1a: DURABLE POSITION OWNERSHIP ──────────────────────────
     //
     // Checked here, synchronously, BEFORE any reservation is taken, and derived from durable
@@ -841,6 +823,67 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
       }
     }
 
+    const refs = this.refsForEntry(candidate);
+    const keys = keysOf(refs);
+
+    // Optional per-underlying budget. It NEVER replaces exact-leg exclusion — it is a
+    // risk cap on top of it, and 0 disables it.
+    const perUnderlying = this.deps.cfg.maxConcurrentPerUnderlying;
+    if (perUnderlying > 0) {
+      let sameUnderlying = 0;
+      for (const entry of this.active.values()) if (entry.underlying === candidate.underlying) sameUnderlying++;
+      if (sameUnderlying >= perUnderlying) {
+        return {
+          ok: false,
+          reason: "duplicate",
+          detail: `per-underlying execution budget reached (${sameUnderlying}/${perUnderlying})`,
+        };
+      }
+    }
+
+    // THE CLAIM. Still synchronous, still the same event-loop turn as the guards above,
+    // so a sibling candidate on this tick now sees this execution and is suppressed.
+    this.claim(executionId, opportunityId, candidate.underlying, keys, context);
+
+    // ═══════════════════════════════════════════════════════════════════════════════════
+    // PAST THE CLAIM. Awaiting is now safe, and everything below MUST release the claim on
+    // every refusal, exception and timeout — `abandonAndReleaseHold` does both halves.
+    // ═══════════════════════════════════════════════════════════════════════════════════
+
+    // ── SESSION ATTEMPT BUDGET: CONSUMED HERE, BEFORE ANYTHING IS RISKED ───────────────
+    //
+    // The gate above asked "may I attempt?". This SPENDS the attempt. It sits before the reservation
+    // and long before any broker POST, so an attempt that is admitted and then fails — rejected,
+    // partially filled and unwound, or recovered — has still consumed its budget. Counting at
+    // completion instead is what let a trial configured for one trade submit orders indefinitely,
+    // provided no attempt ever completed a Box.
+    //
+    // A failure to record REFUSES the entry rather than proceeding: nothing has been sent yet, so the
+    // safe answer is to not send, and an uncounted attempt would be an unbounded one.
+    if (this.deps.sessionConsumeAttempt) {
+      const consumed = await this.deps.sessionConsumeAttempt();
+      if (!consumed.ok) {
+        this.stats.sessionLimitRefusals++;
+        this.log({
+          execution: executionId,
+          broker,
+          underlying: candidate.underlying,
+          status: "suppressed_session_limit",
+          reason: "session_attempt_unaccountable",
+        });
+        // RELEASE THE CLAIM. It is held before this await now, so every refusal past this
+        // point must give it back or the opportunity would be permanently self-suppressed.
+        this.abandonAndReleaseHold(executionId);
+        return {
+          ok: false,
+          reason: "session_limit_reached",
+          detail:
+            consumed.detail ??
+            "the entry attempt could not be durably counted against the session attempt budget, so it was not started",
+        };
+      }
+    }
+
     // ── UNDERLYING LOCK, LAYER 1b: ENTRY PIPELINE OWNERSHIP ────────────────────────────
     //
     // Acquired here: after the durable-state check, BEFORE the contract lease, and holding ONLY
@@ -849,12 +892,20 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
     //
     // ENTRY ONLY. `refsForExit` never takes it, so an exit can never be blocked by it.
     if (this.deps.cfg.oneActiveBoxPerUnderlying) {
-      const held = await this.holdUnderlying(
-        candidate.underlying,
-        CoordinatedBoxExecutionGateway.pipelineHolder(executionId),
-        // EXCLUSIVE: a second entry pipeline may not join an underlying that is already held.
-        true,
-      );
+      let held: boolean;
+      try {
+        held = await this.holdUnderlying(
+          candidate.underlying,
+          CoordinatedBoxExecutionGateway.pipelineHolder(executionId),
+          // EXCLUSIVE: a second entry pipeline may not join an underlying that is already held.
+          true,
+        );
+      } catch (error) {
+        // A throwing hold store must not leave the claim behind, or this opportunity would be
+        // suppressed as a duplicate of itself for the rest of the process's life.
+        this.abandonAndReleaseHold(executionId);
+        throw error;
+      }
       if (!held) {
         this.abandonAndReleaseHold(executionId);
         this.stats.underlyingAlreadyActive++;
@@ -877,27 +928,6 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
       }
     }
 
-    const refs = this.refsForEntry(candidate);
-    const keys = keysOf(refs);
-
-    // Optional per-underlying budget. It NEVER replaces exact-leg exclusion — it is a
-    // risk cap on top of it, and 0 disables it.
-    const perUnderlying = this.deps.cfg.maxConcurrentPerUnderlying;
-    if (perUnderlying > 0) {
-      let sameUnderlying = 0;
-      for (const entry of this.active.values()) if (entry.underlying === candidate.underlying) sameUnderlying++;
-      if (sameUnderlying >= perUnderlying) {
-        return {
-          ok: false,
-          reason: "duplicate",
-          detail: `per-underlying execution budget reached (${sameUnderlying}/${perUnderlying})`,
-        };
-      }
-    }
-
-    // THE CLAIM. Still synchronous, still the same event-loop turn as the guards above,
-    // so a sibling candidate on this tick now sees this execution and is suppressed.
-    this.claim(executionId, opportunityId, candidate.underlying, keys, context);
 
     const waitStarted = this.now();
     let attempt: AcquireResult;
