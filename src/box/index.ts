@@ -69,7 +69,7 @@ export interface BoxModuleDeps {
   ) => Promise<{ initial: number; final: number; total: number }>;
   /**
    * The site-passcode gate. In CalSpread this was `requireAdmin`, a header/query
-   * admin-token middleware; in StrikeEdge it is `requireOperator`, which validates
+   * admin-token middleware; in GTS Box it is `requireOperator`, which validates
    * an HttpOnly session cookie against PostgreSQL. The `RequestHandler` shape is
    * identical, which is why the Box routes needed only an import change.
    */

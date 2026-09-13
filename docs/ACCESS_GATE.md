@@ -1,4 +1,4 @@
-# The StrikeEdge access gate
+# The GTS Box access gate
 
 A single **site passcode** gates the whole application. This document is the
 contract for how that gate works, what it protects, and — just as importantly —

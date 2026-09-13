@@ -16,7 +16,7 @@
  *
  * WHY getOperatorRole TAKES A REQUEST, NOT A TOKEN STRING
  * CalSpread authenticated with an `x-admin-token` HEADER and an in-memory Map, so
- * `getAdminRole(token)` was a synchronous string lookup. StrikeEdge authenticates
+ * `getAdminRole(token)` was a synchronous string lookup. GTS Box authenticates
  * with an HttpOnly SESSION COOKIE validated against PostgreSQL (async). The role is
  * therefore resolved once, in `requireOperator`, and cached on the request; the
  * synchronous accessor reads that cache. This is the one auth adaptation

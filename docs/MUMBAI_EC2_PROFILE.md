@@ -1,6 +1,6 @@
 # Conservative Mumbai EC2 profile (`ap-south-1`)
 
-The deliberately over-cautious starting posture for StrikeEdge live box arbitrage on a
+The deliberately over-cautious starting posture for GTS Box live box arbitrage on a
 Mumbai EC2 host. It is designed so the FIRST live session risks as little as possible
 while producing the broker observations you actually need — not so it trades often.
 
@@ -316,7 +316,7 @@ reconciliation; the stream is an additional fast observation path, never the aut
 
 ## 12. CalSpread must be disabled first
 
-**Requirement:** CalSpread Box execution MUST be disabled before activating StrikeEdge
+**Requirement:** CalSpread Box execution MUST be disabled before activating GTS Box
 live execution against a shared broker account. Both place orders through the same broker
 credentials. If both run:
 
@@ -326,7 +326,7 @@ credentials. If both run:
   they hold the only active box.
 - Reconciliation may adopt or cancel orders it did not create.
 
-StrikeEdge cannot detect requests made by another application on the same account. This
+GTS Box cannot detect requests made by another application on the same account. This
 is **operational coordination**, not a code guarantee.
 
 **How an operator verifies it before cutover:**
@@ -336,7 +336,7 @@ is **operational coordination**, not a code guarantee.
 2. Confirm CalSpread holds no open box or working order on the shared account — check the
    broker console order book and the CalSpread status page; the account order book must
    show no CalSpread-tagged working orders.
-3. Only then arm StrikeEdge. See the cutover procedure in `docs/DEPLOYMENT.md`.
+3. Only then arm GTS Box. See the cutover procedure in `docs/DEPLOYMENT.md`.
 
 ---
 

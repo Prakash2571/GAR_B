@@ -6,7 +6,7 @@
  * instrument dump, the Zerodha charge estimator and the basket-margin call. In
  * CalSpread those lived inside a 5,584-line `index.ts` alongcalendar spreads,
  * futures analytics, option-OI capture and Yahoo dividends. Extracting them into
- * this file is what makes StrikeEdge's own `index.ts` small enough to read.
+ * this file is what makes GTS Box's own `index.ts` small enough to read.
  *
  * EVERY FUNCTION HERE IS A VERBATIM PORT. The board derivation, the IST arithmetic,
  * the market-hours window, the per-leg charge folding and the aggregation rounding

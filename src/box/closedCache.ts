@@ -7,7 +7,7 @@
  * method was a no-op returning a neutral value when Redis was off or unreachable, and
  * the caller fell back to the definitionally-complete database.
  *
- * StrikeEdge's complete source for "closed today" is now PostgreSQL
+ * GTS Box's complete source for "closed today" is now PostgreSQL
  * (`loadBoxTradesClosedSince`, see `repository.ts` / `engine.getClosedToday`). The Redis
  * mirror was PURELY A CACHE, so it is removed rather than reimplemented: the cache
  * reports itself disabled and every read/write degrades to the neutral value, which is

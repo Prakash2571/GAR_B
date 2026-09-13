@@ -1,6 +1,6 @@
 # SUMMARY-transport.md
 
-Three confirmed defects in the StrikeEdge broker HTTP transport (Zerodha "Kite" + Dhan), fixed on
+Three confirmed defects in the GTS Box broker HTTP transport (Zerodha "Kite" + Dhan), fixed on
 branch `work/transport`. No real orders placed, no live trading enabled, no deploy, no credential
 change; every test mocks all network I/O (injected `fetch` / fake client) and the hermetic-network
 guard remains intact.

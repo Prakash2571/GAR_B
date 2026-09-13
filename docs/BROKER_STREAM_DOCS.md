@@ -22,7 +22,7 @@ query parameter at handshake; there is no separate in-band login frame.
 - Up to **3000 instruments** subscribed per connection.
 - **A single API key may hold at most 3 WebSocket connections.**
 
-> Consequence for StrikeEdge: order updates need **no additional socket**. Zerodha multiplexes
+> Consequence for GTS Box: order updates need **no additional socket**. Zerodha multiplexes
 > order postbacks onto the same connection as the binary ticks. We already open one connection
 > for the futures lane and one for the box lane; the third stays free. Adding a dedicated
 > order socket for Zerodha would consume the last slot and protect against nothing, because a
@@ -120,7 +120,7 @@ read as "no fills happened".
 ```
 
 `MsgCode` is documented as `42` for order updates. `UserType` is `SELF` for individual
-accounts (`PARTNER` + `Secret` exists for partner platforms; StrikeEdge is `SELF`).
+accounts (`PARTNER` + `Secret` exists for partner platforms; GTS Box is `SELF`).
 
 **Auth acknowledgement.** `NOT DOCUMENTED` — the docs specify no success frame. A rejected
 authorisation is observable only as a close/error. Consequently the consumer must not treat

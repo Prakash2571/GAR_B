@@ -52,8 +52,8 @@ async function startApp(readiness = new ReadinessController()) {
       const state = readiness.getState();
       const message =
         state === "shutting_down"
-          ? "StrikeEdge is shutting down; mutating requests are refused."
-          : "StrikeEdge is not ready; mutating requests are refused until startup completes.";
+          ? "GTS Box is shutting down; mutating requests are refused."
+          : "GTS Box is not ready; mutating requests are refused until startup completes.";
       res.status(503).json({ error: message });
       return;
     }

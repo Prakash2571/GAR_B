@@ -1,6 +1,6 @@
 # Dead-surface audit — "a claim that nothing verifies"
 
-Auditor pass over the pushed StrikeEdge backend (`Strikedge_B`) hunting the defect class
+Auditor pass over the pushed GTS Box backend (`Strikedge_B`) hunting the defect class
 that produced the two known bugs (the frontend contract drift where every field was
 optional, and the Dhan token persisted-but-never-loaded): a surface — a symbol, a status
 field, a projected field, an error message — that the 1,613-test green suite never checks,
@@ -45,8 +45,8 @@ No suite regressed. The +7 is the new `tests/pg/outboxPayloadContract.test.mjs`.
 - **Where it came from.** CalSpread's Dhan browser-consent OAuth flow. There it was called
   once, by `generateDhanConsent` (`.../dhan/auth.ts:171` in the read-only source), which
   returned `{ consentAppId, loginUrl: dhanLoginUrl(consentAppId) }`.
-- **Why it is dead now.** StrikeEdge neutralised the consent flow: `generateDhanConsent` is a
-  throwing stub ("Dhan consent login is disabled in StrikeEdge…"). With its only caller
+- **Why it is dead now.** GTS Box neutralised the consent flow: `generateDhanConsent` is a
+  throwing stub ("Dhan consent login is disabled in GTS Box…"). With its only caller
   neutralised, `dhanLoginUrl` had **zero references** anywhere in `src/**` or `tests/**`
   (verified by whole-tree token search). This is exactly the category "functions kept alive
   only by a neutralised OAuth stub."
@@ -95,7 +95,7 @@ helpers, or narrow module surfaces. Recorded as candidates rather than removed:
 | `isCheckViolation`, `isRetryableTxError` | `pg/pool.ts` | PostgreSQL error-classification helpers; natural pool surface. |
 | `createDisabledTimingRecorder` | `box/executionTiming.ts` | Disabled-recorder factory paired with the enabled one. |
 | `zerodhaOnlyLiveAdapterFactory` | `brokers/zerodha/liveAdapter.ts` | Broker adapter factory surface. |
-| `historicalQueueDepth` | `kite.ts` | Kite historical-charts diagnostic; StrikeEdge does not ship history. |
+| `historicalQueueDepth` | `kite.ts` | Kite historical-charts diagnostic; GTS Box does not ship history. |
 | `buildChargeLegsFromEvaluations`, `sameChargeLegs` | `box/charges.ts` | Charge-leg helpers. |
 | `keysEqual` | `brokerState/tokenCrypto.ts` | Constant-time key compare. |
 | `isIstWeekend` | `tokens/istClock.ts`, `isExpiryToday` `box/instruments.ts`, `isFeedUsable` `brokers/feedHealth.ts`, `laneLabel` `brokers/marketDataLane.ts`, `isPaperExecutionMode` `box/types.ts` | Small pure predicates. |
@@ -198,7 +198,7 @@ nothing verified. It is **pinned** by the last test in `outboxPayloadContract.te
 proves a daily-P&L archive write produces **zero** `box_daily_pnl` outbox rows.
 
 **Not "fixed" by adding a projection**, deliberately: whether daily P&L *should* reach the
-Mongo reporting replica in StrikeEdge (where PostgreSQL is authoritative and holds the durable
+Mongo reporting replica in GTS Box (where PostgreSQL is authoritative and holds the durable
 `box_daily_pnl` archive + day-proof) is a product decision for the module owners, not an
 auditor's unilateral behaviour change. The config comment (`config.ts`) additionally describes
 a CalSpread-era Redis-mirror-then-nightly-Mongo-drain flow that no longer exists (Redis
@@ -214,7 +214,7 @@ decision, not a mechanical fix — flagged here for an explicit follow-up.
 
 - **The bug.** `authHeader()` threw, on any unauthenticated Kite API call:
   `"Not authenticated. Complete the Zerodha login flow first (/login)."`
-- **Why it cannot work.** StrikeEdge removed the Zerodha OAuth login entirely
+- **Why it cannot work.** GTS Box removed the Zerodha OAuth login entirely
   (`index.ts:7`: "the Zerodha OAuth login … is gone"); there is **no `/login` route**
   (verified: zero matches for a `/login` handler in `src/**`). The token is provisioned by
   the CalSpread token acquisition service and installed via `installProvidedToken`. The
@@ -223,10 +223,10 @@ decision, not a mechanical fix — flagged here for an explicit follow-up.
   right beside it was correctly updated at extraction; `authHeader` was missed.
 - **Provenance.** Confirmed the string is copied unchanged from CalSpread
   (`Cal_Spread_Backend/src/kite.ts:469`), where `/login` was a real route
-  (`KITE_LOGIN_ROOT = https://kite.zerodha.com/connect/login`). No StrikeEdge test pins the
+  (`KITE_LOGIN_ROOT = https://kite.zerodha.com/connect/login`). No GTS Box test pins the
   string.
 - **Fix.** Rewrote the message to state the real cause and the real remedy: the token is
-  installed by the token acquisition service, StrikeEdge has no interactive login flow, and
+  installed by the token acquisition service, GTS Box has no interactive login flow, and
   the operator should watch `GET /api/runtime/status`. HTTP status unchanged (401).
 
 ### JUDGED CLEAN — no second-error-while-handling-first, other subsystem strings are honest

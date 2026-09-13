@@ -1,6 +1,6 @@
 # Offline Composed-Path Execution Benchmark (item 9)
 
-This document describes the offline latency benchmark for the StrikeEdge live box-arbitrage
+This document describes the offline latency benchmark for the GTS Box live box-arbitrage
 execution path, why the previous benchmark was misleading, what the replacement measures, and —
 most importantly — what it **can** and **cannot** tell you.
 

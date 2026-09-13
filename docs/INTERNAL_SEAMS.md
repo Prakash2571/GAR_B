@@ -1,4 +1,4 @@
-# StrikeEdge internal seams
+# GTS Box internal seams
 
 This file is the contract between the subsystems of `Strikedge_B`. It exists because the
 extraction replaced CalSpread's two implicit seams (a 5,584-line `index.ts` and a Mongoose

@@ -1,6 +1,6 @@
 # CI workflows
 
-`ci.yml` is the StrikeEdge backend pipeline. It runs on every push to `main` and every pull
+`ci.yml` is the GTS Box backend pipeline. It runs on every push to `main` and every pull
 request, with a read-only token and no repository secrets.
 
 ## What it guarantees

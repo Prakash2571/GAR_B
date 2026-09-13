@@ -1,6 +1,17 @@
-# StrikeEdge extraction manifest
+# GTS Box extraction manifest
 
-This is the authoritative record of how StrikeEdge was extracted from CalSpread:
+> **A HISTORICAL RECORD, NOT A DESCRIPTION OF THE PRODUCT.**
+> The product is now **GTS Box**, a box-arbitrage research desk. This document deliberately
+> keeps the name it was written under — **StrikeEdge** — everywhere it refers to a decision
+> actually made at that time, because rewriting the name into the history would make the record
+> claim things that did not happen under it. Read every "StrikeEdge" below as "this service, at
+> extraction time". The rename to GTS Box came later and is not part of what is recorded here.
+>
+> The `CALSPREAD_*` environment variables and the `calspread.online` token-broker URLs referenced
+> here are **not** stale branding: they are a live external dependency (GTS Box fetches the day's
+> broker token from that provider) and must not be renamed. See `docs/CONFIGURATION.md`.
+
+This is the authoritative record of how this service was extracted from CalSpread:
 what was copied, what was adapted, what was deliberately left behind, and every
 contract that changed. It is generated against the source trees and verified
 against the target code, not from memory.

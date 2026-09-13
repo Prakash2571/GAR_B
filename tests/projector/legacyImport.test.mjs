@@ -287,7 +287,7 @@ test("legacy import: refuses to run against a live-marked target (armed session)
   await assert.rejects(
     () => runImport(h.pool, h.legacyDb, { apply: true, forceWithLive: false }),
     LiveMarkersPresentError,
-    "must refuse while a StrikeEdge process could be trading",
+    "must refuse while a GTS Box process could be trading",
   );
 
   // Nothing was written because it aborted before the import transaction.

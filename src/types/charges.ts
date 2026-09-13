@@ -5,7 +5,7 @@
  * declares its own structural copies in `src/box/types.ts` and a compile-time
  * assertion in `src/box/model.ts` proves the two stay interchangeable. In
  * CalSpread these interfaces happened to sit next to the Mongoose models; in
- * StrikeEdge there are no Mongoose models, so the types get their own module.
+ * GTS Box there are no Mongoose models, so the types get their own module.
  *
  * NOTHING here is persistence. `ITradeCharges.at` is a `Date` exactly as before,
  * so a charge payload produced by the shared Zerodha estimator round-trips
