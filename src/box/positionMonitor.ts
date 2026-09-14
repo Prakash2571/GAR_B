@@ -498,6 +498,27 @@ export class BoxPositionMonitor {
       return;
     }
 
+    // ATTEMPT-CADENCE THROTTLE FOR A STILL-WHOLE BOX.
+    //
+    // The PARTIALLY_EXITED branch above is throttled, but a box whose admitted legs all came back
+    // with ZERO fill never becomes PARTIALLY_EXITED: it stays here, `OPEN`. That was harmless while
+    // the liquidity gate demanded EVERY leg be executable, because a book bad enough to close nothing
+    // usually failed the gate too. Now that live exits proceed when only SOME legs are executable, a
+    // single healthy book would re-fire the whole attempt on every monitor cycle — a fresh
+    // `stableAttemptId`, hence a fresh durable intent and a fresh POST per admitted leg, indefinitely.
+    //
+    // The same throttle is therefore applied here. It bounds retry CADENCE only: nothing about which
+    // legs are eligible changes.
+    //
+    // The EXPIRY-SAFETY WINDOW is exempt, and the exemption keys on the WINDOW rather than on the
+    // reason name. Inside the window a box that has also converged is named EDGE_CONVERGED, so
+    // testing the reason would have thrown away the exemption in exactly the case where the position
+    // both can and must be closed. A position that has to be flat before expiry cannot be made to wait.
+    if (!expirySafety && this.deps.cfg.executionMode === "live") {
+      const throttle = Math.max(250, this.deps.cfg.legTimeoutMs);
+      if (now - (pos.last_exit_attempt_at ?? 0) < throttle) return;
+    }
+
     // For a convergence/profit exit the net P&L must still be genuinely positive.
     // Expiry safety overrides profitability but still refuses invented prices.
     if (reason !== "EXPIRY_SAFETY") {
@@ -1337,9 +1358,31 @@ export class BoxPositionMonitor {
    * the executor actually does.
    */
   private exitExecutionOk(pos: BoxOpenPosition, metrics: BoxExitMetrics): boolean {
-    if (this.deps.cfg.executionMode === "paper_legging" || this.deps.cfg.executionMode === "live") {
+    if (this.deps.cfg.executionMode === "live") {
       const est = this.deps.executionSim.estimateExecutableExit(pos);
       if (est.length === 0) return false;
+      // LIVE ISOLATES PER LEG, so this gate must too.
+      //
+      // `every` here was the second half of the all-or-nothing exit defect: one outstanding role
+      // with no book (or a stale/thin one) made the whole predicate false, so `runExit` returned at
+      // the EXIT_SKIPPED_LIQUIDITY branch and `simulateLeggingExit` was never called at all. The
+      // per-leg isolation inside the gateway was therefore unreachable in production, and a
+      // risk-reducing close on a leg with perfectly good depth was suppressed by an unrelated leg.
+      //
+      // `some` asks the question this gate is actually for: is there ANY work worth attempting? It
+      // does NOT decide what gets sent. The gateway still prechecks every leg individually and the
+      // order manager still re-validates at CHECKPOINT 3 (dequeue) and CHECKPOINT 5 (pre-POST), so
+      // relaxing this cannot transmit anything against an unusable book — it can only stop the
+      // monitor from refusing to look. Legs that remain unexecutable are reported as withheld and
+      // the exit is never reported as fully closed.
+      return est.some((e) => e.fresh && e.executable >= e.remaining);
+    }
+    if (this.deps.cfg.executionMode === "paper_legging") {
+      const est = this.deps.executionSim.estimateExecutableExit(pos);
+      if (est.length === 0) return false;
+      // paper_legging keeps the whole-position gate: its simulator resolves a wave as one unit and
+      // has no per-leg withholding, so admitting a partially executable position there would model
+      // an execution the paper executor cannot actually perform. One implementation per model.
       return est.every((e) => e.fresh && e.executable >= e.remaining);
     }
     return exitLiquidityOk(metrics.legs);

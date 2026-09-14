@@ -21,6 +21,7 @@ import {
   type BoxCapitalReport,
   type EconomicAdmissionReport,
 } from "./boxCapital.js";
+import { buildFundingReadiness, type FundingReadiness } from "./fundingReadiness.js";
 import {
   ageEvidence,
   identityMismatch,
@@ -132,6 +133,24 @@ interface ExitWaveOutcome {
  * generation. A newer book may proceed only when it still executes the immutable
  * quantity within the immutable bounded LIMIT; generation changes always refuse.
  */
+/**
+ * Make a withheld-leg reason safe to embed in the exit `detail` string.
+ *
+ * WHY THIS IS NOT COSMETIC. `positionMonitor.applyLeggingExitResult` decides whether a failed exit
+ * sends the position to RECOVERY by matching `/uncertain|reconcil/i` against `result.detail`. A
+ * withheld leg is the OPPOSITE of uncertain — nothing was transmitted, so zero filled is proven —
+ * and it must not be classified as an unprovable outcome. Since a per-leg reason can now carry
+ * arbitrary broker/pricing error text into that string, the two words the classifier keys on are
+ * neutralised here rather than left to chance.
+ *
+ * The reason stays fully readable for the operator; only the classifier's trigger tokens are broken.
+ */
+function withheldReason(reason: string): string {
+  return reason
+    .replace(/uncertain/gi, "not-established")
+    .replace(/reconcil/gi, "re-check");
+}
+
 export function checkedFeedBlockReason(args: {
   request: BrokerOrderRequest;
   stamp: CheckedFeedStamp | undefined;
@@ -895,22 +914,64 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     let attempted = 0;
     const withheld: string[] = [];
 
-    /** Submit one wave, recording orders and whether any outcome is unprovable. */
+    /**
+     * Submit one wave, recording orders and whether any outcome is unprovable.
+     *
+     * PER-LEG ISOLATION. Request construction, pricing and the current-feed precheck all happen
+     * INSIDE the loop, so one unusable book removes exactly one leg. Previously all requests were
+     * built and then prechecked as a batch, and `precheck` threw on the first failure — so a single
+     * leg with a missing, stale or thin book prevented every OTHER leg in the wave from reaching the
+     * manager, including risk-reducing short closes on legs with perfectly good depth.
+     *
+     * A blocked leg is recorded as `{ filled: 0, certain: true }`: nothing was transmitted, so zero
+     * filled is PROVEN, exactly as for a `BrokerPreSubmitRefusedError` below. That is what keeps it
+     * safe — a proven-zero short close releases NO hedge, because the short is fully intact. It is
+     * also recorded in `withheld` with its exact reason, so the exit can never be reported clean.
+     *
+     * Nothing is submitted against a fabricated, stale or insufficient book: an admitted leg carries
+     * the stamp `precheckOne` produced, and the manager re-validates it at CHECKPOINT 3 (dequeue) and
+     * CHECKPOINT 5 (immediately pre-POST) before any broker mutation.
+     */
     const runWave = async (
       legs: readonly { role: BoxLegRole; quantity: number }[],
     ): Promise<Map<BoxLegRole, ExitWaveOutcome>> => {
       const byRole = new Map<BoxLegRole, ExitWaveOutcome>();
       if (legs.length === 0) return byRole;
-      const requests = legs.map((leg) => build(leg.role, leg.quantity));
-      attempted += requests.length;
       // Freshness is re-established per wave: wave 1 is transmitted after wave 0's broker round
       // trip, so reusing wave 0's stamps would authorise a SELL against a book that has since aged.
-      const checkedFeed = this.precheck(requests);
+      const checkedAt = this.now();
+      const feedGeneration = this.deps.feedGeneration?.() ?? 0;
+      const admitted: BrokerOrderRequest[] = [];
+      const checkedFeed = new Map<string, CheckedFeedStamp>();
+
+      for (const leg of legs) {
+        attempted++;
+        let request: BrokerOrderRequest;
+        try {
+          // Construction and pricing are per-leg: a leg whose reference price cannot be derived
+          // must not take the rest of the wave down with it.
+          request = build(leg.role, leg.quantity);
+        } catch (error) {
+          byRole.set(leg.role, { filled: 0, certain: true });
+          withheld.push(`${leg.role} not submitted: ${withheldReason(errorMessage(error))}`);
+          continue;
+        }
+        const verdict = this.precheckOne(request, checkedAt, feedGeneration);
+        if (verdict.reason !== null) {
+          byRole.set(leg.role, { filled: 0, certain: true });
+          withheld.push(`${leg.role} not submitted: ${withheldReason(verdict.reason)}`);
+          continue;
+        }
+        checkedFeed.set(request.client_order_id, verdict.stamp);
+        admitted.push(request);
+      }
+
+      if (admitted.length === 0) return byRole;
       const settled = await Promise.allSettled(
-        requests.map((request) => manager.submit(request, checkedFeed.get(request.client_order_id))),
+        admitted.map((request) => manager.submit(request, checkedFeed.get(request.client_order_id))),
       );
       settled.forEach((item, index) => {
-        const role = requests[index]!.role;
+        const role = admitted[index]!.role;
         if (item.status === "fulfilled") {
           orders.push(item.value);
           // `uncertain` keeps its ORIGINAL meaning — an unprovable broker terminal quantity — so a
@@ -948,6 +1009,10 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     try {
       wave0 = await runWave(plan.wave0.map((slot) => ({ role: slot.role, quantity: slot.outstanding })));
     } catch (error) {
+      // DEFENCE IN DEPTH ONLY. An unusable book, an unpriceable leg and a per-leg submission failure
+      // are all handled inside `runWave` now and are recorded as withheld legs, so none of them
+      // reaches here. This remains for a genuinely unexpected fault, where abandoning the attempt
+      // without having transmitted anything is the safe outcome.
       const record = liveRecord(args.detectedAt, this.now(), [], false, this.deps.cfg, plan.wave0.length, args.position.id);
       return { ok: false, record, reason: "insufficient_quantity", detail: errorMessage(error) };
     }
@@ -978,10 +1043,13 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
 
     if (releases.length > 0) {
       try {
+        // Hedge releases are isolated per leg by the SAME mechanism as wave 0, so one release with
+        // no executable book no longer suppresses an unrelated release that is already proven free.
+        // A release refused for want of a book is NOT an exposure failure: that hedge simply stays
+        // on, which is the safe side. Recorded, never escalated to a naked sell.
         await runWave(releases);
       } catch (error) {
-        // A hedge release refused for want of an executable book is NOT an exposure failure: the
-        // hedge simply stays on, which is the safe side. Recorded, never escalated to a naked sell.
+        // Defence in depth, as for wave 0.
         withheld.push(`hedge release blocked: ${errorMessage(error)}`);
       }
     }
@@ -1700,6 +1768,36 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
   }
 
   /**
+   * FUNDING READINESS — always answerable, including when every evidence gate is off.
+   *
+   * `economicDiagnostics()` is deliberately null until a control has run, and stays null forever
+   * when all three gates are disabled. That null is honest but ambiguous to read: "nothing was
+   * checked" and "checked and fine" are different facts and must not share a representation. This
+   * accessor names which of the five funding states the deployment is actually in, reports the
+   * EFFECTIVE gate settings (including the stage-funding ⇒ funds-cover implication), and states the
+   * standing limitations — so a deployment review can see that funding is unverified rather than
+   * inferring it from an absent object.
+   *
+   * It reads only already-resolved config and the last decision: no broker call, no side effect.
+   */
+  fundingReadiness(brokerLimitations: readonly string[] = []): FundingReadiness {
+    return buildFundingReadiness({
+      live: this.mode === "live",
+      requireFundsCover: this.deps.cfg.liveRequireFundsCover === true,
+      requireMarginEvidence: this.deps.cfg.liveRequireMarginEvidence === true,
+      requireStageFunding: this.deps.cfg.liveRequireStageFunding === true,
+      recoveryReserveRupees: this.deps.cfg.liveRecoveryReserveRupees,
+      freshness: {
+        funds_max_age_ms: this.deps.cfg.liveFundsFreshnessMaxAgeMs,
+        margin_max_age_ms: this.deps.cfg.liveMarginFreshnessMaxAgeMs,
+        read_timeout_ms: this.deps.cfg.liveEvidenceReadTimeoutMs,
+      },
+      report: this.lastEconomicReport,
+      brokerLimitations,
+    });
+  }
+
+  /**
    * Observe the four legs' CURRENT books as coherence evidence.
    *
    * The socket generation is captured per leg (a cold/unwarm token is treated as belonging to no
@@ -1746,40 +1844,71 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     );
   }
 
-  private precheck(requests: BrokerOrderRequest[]): Map<string, CheckedFeedStamp> {
-    const checked = new Map<string, CheckedFeedStamp>();
-    const checkedAt = this.now();
-    const feedGeneration = this.deps.feedGeneration?.() ?? 0;
-    for (const request of requests) {
-      if (this.mode === "live" && this.deps.isTokenWarm && !this.deps.isTokenWarm(request.token)) {
-        throw new Error(`${request.tradingsymbol} has not received a WebSocket tick in the current feed generation.`);
-      }
-      const quote = this.deps.quotes.get(request.token);
-      if (!quote) throw new Error(`${request.tradingsymbol} has no live depth.`);
-      const age = checkedAt - quote.at;
-      if (this.deps.isTokenWarm && (!Number.isFinite(age) || age < 0 || age > this.deps.cfg.quoteMaxAgeMs)) {
-        throw new Error(`${request.tradingsymbol} has no current executable depth.`);
-      }
-      const walk = walkDepth({
-        side: request.side,
-        levels: request.side === "BUY" ? quote.asks : quote.bids,
-        remainingQty: request.quantity,
-        limitPrice: request.pricing.limit_price,
-        queueModel: this.deps.cfg.queueModel,
-        haircutPct: this.deps.cfg.queueLiquidityHaircutPct,
-        at: quote.at,
-        quoteVersion: quote.version,
-      });
-      if (walk.executable_within_limit < request.quantity) {
-        throw new Error(`${request.tradingsymbol} has ${walk.executable_within_limit} safe quantity within bounded limit; needs ${request.quantity}.`);
-      }
-      checked.set(request.client_order_id, {
+  /**
+   * Current-feed authority for ONE request.
+   *
+   * The four refusal conditions are unchanged and are still applied in the same order; the only
+   * difference from the historical `precheck` loop is that a refusal is RETURNED rather than thrown,
+   * so a caller may decide whether the failure is fatal to a whole batch or only to this leg.
+   * Nothing here admits a request it previously rejected.
+   */
+  private precheckOne(
+    request: BrokerOrderRequest,
+    checkedAt: number,
+    feedGeneration: number,
+  ): { stamp: CheckedFeedStamp; reason: null } | { stamp: null; reason: string } {
+    if (this.mode === "live" && this.deps.isTokenWarm && !this.deps.isTokenWarm(request.token)) {
+      return { stamp: null, reason: `${request.tradingsymbol} has not received a WebSocket tick in the current feed generation.` };
+    }
+    const quote = this.deps.quotes.get(request.token);
+    if (!quote) return { stamp: null, reason: `${request.tradingsymbol} has no live depth.` };
+    const age = checkedAt - quote.at;
+    if (this.deps.isTokenWarm && (!Number.isFinite(age) || age < 0 || age > this.deps.cfg.quoteMaxAgeMs)) {
+      return { stamp: null, reason: `${request.tradingsymbol} has no current executable depth.` };
+    }
+    const walk = walkDepth({
+      side: request.side,
+      levels: request.side === "BUY" ? quote.asks : quote.bids,
+      remainingQty: request.quantity,
+      limitPrice: request.pricing.limit_price,
+      queueModel: this.deps.cfg.queueModel,
+      haircutPct: this.deps.cfg.queueLiquidityHaircutPct,
+      at: quote.at,
+      quoteVersion: quote.version,
+    });
+    if (walk.executable_within_limit < request.quantity) {
+      return {
+        stamp: null,
+        reason: `${request.tradingsymbol} has ${walk.executable_within_limit} safe quantity within bounded limit; needs ${request.quantity}.`,
+      };
+    }
+    return {
+      stamp: {
         token: request.token,
         feed_generation: feedGeneration,
         quote_version: quote.version,
         quote_at: quote.at,
         checked_at: checkedAt,
-      });
+      },
+      reason: null,
+    };
+  }
+
+  /**
+   * ALL-OR-NOTHING precheck, for batches where a partial batch is not a valid outcome.
+   *
+   * ENTRY uses this deliberately: a box that cannot place all four legs is not a box, so the first
+   * unusable leg must abort the attempt before anything is transmitted. Behaviour is identical to
+   * the original implementation, including the message text of each refusal.
+   */
+  private precheck(requests: BrokerOrderRequest[]): Map<string, CheckedFeedStamp> {
+    const checked = new Map<string, CheckedFeedStamp>();
+    const checkedAt = this.now();
+    const feedGeneration = this.deps.feedGeneration?.() ?? 0;
+    for (const request of requests) {
+      const verdict = this.precheckOne(request, checkedAt, feedGeneration);
+      if (verdict.reason !== null) throw new Error(verdict.reason);
+      checked.set(request.client_order_id, verdict.stamp);
     }
     return checked;
   }

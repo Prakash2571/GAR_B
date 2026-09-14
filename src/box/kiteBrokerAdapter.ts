@@ -33,6 +33,7 @@ import {
   readNonNegativeInteger,
   readPositivePrice,
 } from "./brokerExecutionEvidence.js";
+import { cloneBrokerOrder, mergeBrokerOrderSnapshot, type BrokerOrderMergeOptions } from "./brokerOrderMerge.js";
 import type { ExternalOrderUpdate } from "./brokerAdapter.js";
 import type { ExecutionTimingRecorder } from "./executionTiming.js";
 import type { ExecutionMode, IBoxOrderIntent, OrderSide } from "./types.js";
@@ -484,25 +485,44 @@ export class KiteBrokerAdapter implements BrokerAdapter {
           // The order DOES exist. Carry on with its real state, exactly as Dhan does.
           return await this.resolveAdopted(req, adopted);
         }
-        order.state = "RECONCILIATION_REQUIRED";
-        order.updated_at = this.clock.now();
+        // Quarantine the LATEST accepted state, not the pre-POST object: a postback that landed
+        // while the POST was in flight replaced the map entry, so mutating `order` here would mutate
+        // an orphan and the thrown error would carry `filled 0` over a real fill.
+        const quarantined = this.quarantine(req.client_order_id, order);
         throw new BrokerAmbiguousSubmitError(
           req.client_order_id,
           `${errorMessage(error)} (${describeAmbiguity(error)}; tag lookup did not uniquely identify an order, so reconciliation is required and NO retry was attempted)`,
           error,
-          clone(order),
+          clone(quarantined),
         );
       }
-      order.state = "REJECTED";
-      order.reject_family = classifyKiteReject(error);
-      order.reject_reason = errorMessage(error);
-      order.updated_at = this.clock.now();
-      throw new BrokerOrderRejectedError(clone(order), error);
+      // A DEFINITIVE rejection, merged rather than written blind — the same treatment Dhan's
+      // definitive-4xx path gets. If a fill was observed on the stream while the POST was in flight,
+      // a bare REJECTED would erase real exposure; the merge routes that contradiction to
+      // RECONCILIATION_REQUIRED instead of silently choosing one side.
+      const rejected = this.commit(req.client_order_id, {
+        ...cloneBrokerOrder(this.orders.get(req.client_order_id) ?? order),
+        state: "REJECTED",
+        reject_family: classifyKiteReject(error),
+        reject_reason: errorMessage(error),
+        updated_at: this.clock.now(),
+      });
+      throw new BrokerOrderRejectedError(clone(rejected), error);
     }
 
-    order.broker_order_id = placed.order_id;
-    order.state = "ACKNOWLEDGED";
-    order.updated_at = this.clock.now();
+    // THE ACK-OVERWRITES-FILL WINDOW. `order` was created before the POST. A postback for this
+    // client order id can legitimately land while the POST response is in flight, in which case the
+    // map already holds a merged snapshot and mutating `order` would mutate an orphan. The ACK is
+    // therefore committed THROUGH the map, and the resolution loop starts from the merged result.
+    //
+    // ACKNOWLEDGED is a WORKING state, so the merge cannot use it to rewind a stream-confirmed
+    // terminal state, and it cannot lower a stream-confirmed cumulative quantity.
+    const acknowledged = this.commit(req.client_order_id, {
+      ...cloneBrokerOrder(order),
+      broker_order_id: placed.order_id,
+      state: "ACKNOWLEDGED",
+      updated_at: this.clock.now(),
+    });
     // BROKER ORDER ID + ACK. Two marks because they are two different facts: the id proves an
     // order EXISTS, and the ACK proves the broker ACCEPTED it. Neither proves any quantity
     // executed — see orderLifecycle.stageProvesExecution.
@@ -510,15 +530,14 @@ export class KiteBrokerAdapter implements BrokerAdapter {
     this.mark(req.client_order_id, "acknowledged");
     this.clientByBroker.set(placed.order_id, req.client_order_id);
     try {
-      return await this.waitForResolution(order);
+      return await this.waitForResolution(acknowledged);
     } catch (error) {
-      order.state = "RECONCILIATION_REQUIRED";
-      order.updated_at = this.clock.now();
+      const quarantined = this.quarantine(req.client_order_id, acknowledged);
       throw new BrokerAmbiguousSubmitError(
         req.client_order_id,
         `Kite order ${placed.order_id} became uncertain while awaiting broker state; reconciliation is required.`,
         error,
-        clone(order),
+        clone(quarantined),
       );
     }
   }
@@ -529,28 +548,30 @@ export class KiteBrokerAdapter implements BrokerAdapter {
     if (!order) return undefined;
     if (isBrokerOrderTerminal(order.state)) return clone(order);
     if (!order.broker_order_id) {
-      order.state = "RECONCILIATION_REQUIRED";
-      return clone(order);
+      return clone(this.quarantine(clientOrderId, order));
     }
-    order.state = "CANCEL_REQUESTED";
-    order.updated_at = this.clock.now();
+    const brokerOrderId = order.broker_order_id;
+    // Written THROUGH the map rather than mutated in place: if a stream observation replaces the map
+    // entry during the DELETE below, an in-place mutation would apply to a detached object and the
+    // confirmation loop would then write that orphan lineage back over the merged fill.
+    this.commit(clientOrderId, { ...cloneBrokerOrder(order), state: "CANCEL_REQUESTED", updated_at: this.clock.now() });
     // CANCEL REQUESTED. This opens cancel_request_to_terminal_ms — the measured span that sizes
     // paper's cancel-vs-fill race window. It is deliberately marked BEFORE the DELETE is sent,
     // because the race starts the moment we commit to cancelling.
     this.mark(clientOrderId, "cancel_requested");
     await withDeadline(
-      this.call(() => this.transport.cancelOrder(order.broker_order_id as string), "order_cancel"),
+      this.call(() => this.transport.cancelOrder(brokerOrderId), "order_cancel"),
       this.config.cancelTimeoutMs,
       "Kite cancellation timed out; reconciliation is required.",
     ).catch((error) => {
       this.penalizeIfRateLimited(error);
-      order.state = "RECONCILIATION_REQUIRED";
+      this.quarantine(clientOrderId, order);
       throw error;
     });
     // The broker accepted the cancel REQUEST. It is not yet a cancellation: the order may still
     // be filling right now, which is why confirmTerminalAfterCancel re-reads until terminal.
     this.mark(clientOrderId, "cancel_acknowledged");
-    return clone(await this.confirmTerminalAfterCancel(order));
+    return clone(await this.confirmTerminalAfterCancel(clientOrderId));
   }
 
   async modifyOrder(clientOrderId: string, request: BrokerModifyRequest): Promise<BrokerOrder> {
@@ -601,12 +622,18 @@ export class KiteBrokerAdapter implements BrokerAdapter {
   async listOrders(): Promise<BrokerOrder[]> {
     this.ensureEnabled();
     const raw = await this.call(() => this.transport.listOrders());
+    // ── NO AWAIT BEYOND THIS POINT ───────────────────────────────────────────────────────────
+    // The map reads below were already post-await, so the cumulative floor was current; but the
+    // PAYLOAD predates any stream event that landed during the round trip, so an unconditional write
+    // still regressed state, average price, pending quantity and evidence. Merging fixes that.
     return raw.map((item) => {
       const clientId = this.clientByBroker.get(item.order_id) ?? `KITE_ORPHAN:${item.order_id}`;
       const known = this.orders.get(clientId);
       const normalized = normalizeKiteOrder(item, known, this.clock.now());
-      if (known) this.orders.set(clientId, normalized);
-      return clone(normalized);
+      if (!known) return clone(normalized);
+      return clone(this.commit(clientId, normalized, {
+        observedCumulativeQty: readNonNegativeInteger(item.filled_quantity).value,
+      }));
     });
   }
 
@@ -656,9 +683,11 @@ export class KiteBrokerAdapter implements BrokerAdapter {
       limit_price: intent.limit_price,
       fills: snapshot.fills.map((fill) => ({ ...fill })),
     };
-    this.orders.set(intent.client_order_id, adopted);
-    this.clientByBroker.set(brokerOrderId, intent.client_order_id);
-    return clone(adopted);
+    // ADOPTION MERGES. An unconditional write discarded a session entry that a stream observation
+    // had already advanced — restart adoption and a live stream can overlap. Merging keeps the
+    // higher cumulative quantity and cannot reopen a confirmed terminal order, while every
+    // durable immutable field above is still asserted before we get here.
+    return clone(this.commit(intent.client_order_id, adopted));
   }
 
   async listPositions(): Promise<BrokerPosition[]> {
@@ -757,15 +786,20 @@ export class KiteBrokerAdapter implements BrokerAdapter {
       return null;
     }
 
-    const adopted = normalizeKiteOrder(candidate, pending, this.clock.now());
-    this.orders.set(req.client_order_id, adopted);
-    this.clientByBroker.set(candidate.order_id, req.client_order_id);
+    // `pending` is the PRE-AWAIT submission snapshot. The latest accepted state is re-read here,
+    // after the listOrders round trip, so a stream observation delivered during it is the merge base
+    // rather than something the adoption write silently discards.
+    const current = this.orders.get(req.client_order_id) ?? pending;
+    const adopted = this.commit(
+      req.client_order_id,
+      normalizeKiteOrder(candidate, current, this.clock.now()),
+      { observedCumulativeQty: readNonNegativeInteger(candidate.filled_quantity).value },
+    );
     // The order exists at the broker, so these facts are now established — even though our POST
     // appeared to fail. Recording them keeps the latency sample honest rather than losing the
     // whole operation from calibration.
     this.mark(req.client_order_id, "broker_order_id");
     this.mark(req.client_order_id, "acknowledged");
-    this.markFill(req.client_order_id, adopted.filled_quantity);
     console.warn(
       `[Kite] adopted existing broker order ${candidate.order_id} for ${req.client_order_id} after an ambiguous submission; no retry was attempted.`,
     );
@@ -862,52 +896,53 @@ export class KiteBrokerAdapter implements BrokerAdapter {
       quantity: observedQuantity,
       price: observedPrice,
     });
-    const regressed = observedQuantity.present && (observedQuantity.value ?? 0) < known.filled_quantity;
+    const observedFilled = observedQuantity.present ? (observedQuantity.value ?? 0) : null;
+    const regressed = observedFilled !== null && observedFilled < known.filled_quantity;
+    const at = update.observedAtWall ?? this.clock.now();
+
     // A QUANTITY REGRESSION MUST NOT DISCARD THE WHOLE OBSERVATION.
     //
-    // This used to `return clone(known)` immediately, dropping the update entirely. But quantity is
-    // not the only thing an order update carries: Kite can report `CANCELLED` alongside a
-    // `filled_quantity` that reflects a pre-fill snapshot, and a REST poll can overtake a stream
-    // event and arrive with an older figure on a newer label. Discarding the whole observation threw
-    // away the CANCELLATION of the remainder along with the stale number — so the order stayed
-    // "working" in the session snapshot and its waiters were never woken.
+    // Quantity is not the only thing an order update carries: Kite can report `CANCELLED` alongside
+    // a `filled_quantity` that reflects a pre-fill snapshot. Dropping the whole observation would
+    // throw away the CANCELLATION of the remainder along with the stale number, leaving the order
+    // "working" in the session snapshot with its waiters never woken.
     //
-    // The quantity is therefore PINNED to what we already hold (monotonic, never rewound) and the
-    // status label is resolved against that accepted quantity. The stale number touches nothing.
-    const acceptedFilled = regressed ? known.filled_quantity : verdict.filledQuantity;
+    // The candidate below is therefore RAW-FAITHFUL — it reports exactly what this observation said —
+    // and `mergeBrokerOrderSnapshot` applies the monotonic quantity floor, the price rule, the
+    // terminal guard and the fill-record rule. Stream and REST now share one implementation of that
+    // authority, which is what stops the two paths from disagreeing.
+    const candidate = clone(known);
+    candidate.filled_quantity = observedFilled ?? verdict.filledQuantity;
+    candidate.pending_quantity = Math.max(0, known.quantity - candidate.filled_quantity);
+    candidate.average_price = verdict.averagePrice;
+    candidate.execution_evidence = verdict.quality;
+    if (update.brokerOrderId) candidate.broker_order_id = update.brokerOrderId;
+    candidate.state = verdict.sufficient
+      ? kiteState(label, candidate.filled_quantity, known.quantity)
+      : known.state;
+    if (!verdict.sufficient) candidate.reject_reason = verdict.detail;
+    candidate.fills = candidate.filled_quantity > 0
+      ? [{
+        fill_id: `kite:stream:${candidate.broker_order_id ?? update.clientOrderId}:${candidate.filled_quantity}:${verdict.averagePrice ?? "unpriced"}`,
+        quantity: candidate.filled_quantity,
+        price: verdict.averagePrice,
+        at,
+      }]
+      : [];
+    candidate.updated_at = at;
 
-    const merged = clone(known);
-    merged.filled_quantity = acceptedFilled;
-    merged.pending_quantity = Math.max(0, known.quantity - acceptedFilled);
-    // A stale observation's average price describes a SMALLER fill than we already hold, so it is not
-    // better evidence and is not adopted.
-    if (verdict.averagePrice !== null && !regressed) merged.average_price = verdict.averagePrice;
-    if (!regressed) merged.execution_evidence = verdict.quality;
-    if (update.brokerOrderId) merged.broker_order_id = update.brokerOrderId;
-    merged.state = verdict.sufficient ? kiteState(label, acceptedFilled, known.quantity) : known.state;
-    if (!verdict.sufficient && !regressed) merged.reject_reason = verdict.detail;
-    if (isBrokerOrderTerminal(known.state) && !isBrokerOrderTerminal(merged.state)) {
-      merged.state = known.state;
-    }
-    if (acceptedFilled > 0 && merged.fills.length === 0) {
-      merged.fills = [{
-        fill_id: `kite:stream:${merged.broker_order_id ?? update.clientOrderId}:${acceptedFilled}:${merged.average_price ?? "unpriced"}`,
-        quantity: acceptedFilled,
-        price: merged.average_price,
-        at: update.observedAtWall ?? this.clock.now(),
-      }];
-    }
-    // When the quantity went backwards AND the label resolves to the state we are already in, the
-    // observation genuinely carries nothing on any track. Only then is it ignored outright.
-    if (regressed && merged.state === known.state) {
+    const merged = mergeBrokerOrderSnapshot(known, candidate, { observedCumulativeQty: observedFilled });
+    // When the quantity went backwards AND nothing else moved, the observation genuinely carries
+    // nothing on any track. Only then is it ignored outright.
+    if (regressed && merged.order.state === known.state && merged.order.filled_quantity === known.filled_quantity) {
       this.streamObservationsIgnored++;
       return clone(known);
     }
-    merged.updated_at = update.observedAtWall ?? this.clock.now();
-    this.orders.set(update.clientOrderId, merged);
+    this.orders.set(update.clientOrderId, merged.order);
+    this.markFill(update.clientOrderId, merged.order.filled_quantity);
     this.streamObservationsApplied++;
     this.wakeOrderWaiters(update.clientOrderId);
-    return clone(merged);
+    return clone(merged.order);
   }
 
   streamObservationStats(): { applied: number; ignored: number } {
@@ -944,61 +979,116 @@ export class KiteBrokerAdapter implements BrokerAdapter {
 
   private async protectiveCancelAndConfirm(order: BrokerOrder): Promise<BrokerOrder> {
     if (!order.broker_order_id || isBrokerOrderTerminal(order.state)) return order;
-    order.state = "CANCEL_REQUESTED";
-    order.updated_at = this.clock.now();
-    this.mark(order.client_order_id, "cancel_requested");
+    const clientOrderId = order.client_order_id;
+    const brokerOrderId = order.broker_order_id;
+    this.commit(clientOrderId, { ...cloneBrokerOrder(order), state: "CANCEL_REQUESTED", updated_at: this.clock.now() });
+    this.mark(clientOrderId, "cancel_requested");
     try {
       await withDeadline(
-        this.call(() => this.transport.cancelOrder(order.broker_order_id as string), "order_cancel"),
+        this.call(() => this.transport.cancelOrder(brokerOrderId), "order_cancel"),
         this.config.cancelTimeoutMs,
         "Protective cancellation timed out.",
       );
-      this.mark(order.client_order_id, "cancel_acknowledged");
-      return await this.confirmTerminalAfterCancel(order);
+      this.mark(clientOrderId, "cancel_acknowledged");
+      return await this.confirmTerminalAfterCancel(clientOrderId);
     } catch (error) {
       this.penalizeIfRateLimited(error);
-      order.state = "RECONCILIATION_REQUIRED";
-      order.updated_at = this.clock.now();
+      // Quarantine the LATEST accepted state, not the pre-await snapshot: a fill observed while the
+      // cancel was in flight is real exposure and must travel with the quarantine.
+      const quarantined = this.quarantine(clientOrderId, order);
       throw new BrokerAmbiguousSubmitError(
-        order.client_order_id,
+        clientOrderId,
         "Protective cancellation could not establish terminal cumulative quantity; order is quarantined.",
         error,
-        clone(order),
+        clone(quarantined),
       );
     }
   }
 
-  private async confirmTerminalAfterCancel(order: BrokerOrder): Promise<BrokerOrder> {
+  /**
+   * Poll until the cancellation is terminal.
+   *
+   * Keyed by client order id, NOT by a captured object: `refresh` commits through the map, so
+   * holding an object across iterations would reintroduce the stale-base problem. The wait is
+   * `waitOrObservation` rather than a plain sleep so a fill racing the cancel is seen on the EVENT —
+   * this loop is exactly where the cancel-versus-fill race is decided.
+   */
+  private async confirmTerminalAfterCancel(clientOrderId: string): Promise<BrokerOrder> {
     const deadline = this.clock.now() + this.config.cancelTimeoutMs;
     while (this.clock.now() <= deadline) {
-      order = await this.refresh(order);
-      if (isBrokerOrderTerminal(order.state)) return order;
-      await this.clock.wait(Math.max(1, this.config.brokerMinIntervalMs));
+      const known = this.orders.get(clientOrderId);
+      if (!known) break;
+      const refreshed = await this.refresh(known);
+      if (isBrokerOrderTerminal(refreshed.state)) return refreshed;
+      await this.waitOrObservation(Math.max(1, this.config.brokerMinIntervalMs), clientOrderId);
+      const observed = this.orders.get(clientOrderId);
+      if (observed && isBrokerOrderTerminal(observed.state)) return observed;
     }
-    order.state = "RECONCILIATION_REQUIRED";
-    order.updated_at = this.clock.now();
+    const quarantined = this.quarantine(clientOrderId, this.orders.get(clientOrderId));
     throw new BrokerAmbiguousSubmitError(
-      order.client_order_id,
+      clientOrderId,
       "Cancellation was acknowledged locally but broker terminal quantity remains uncertain.",
       undefined,
-      clone(order),
+      clone(quarantined),
     );
   }
 
+  /**
+   * Move the LATEST accepted state to RECONCILIATION_REQUIRED.
+   *
+   * A confirmed TERMINAL state is left alone: quarantining an order the broker has already resolved
+   * would manufacture uncertainty and send a settled order back through recovery.
+   */
+  private quarantine(clientOrderId: string, fallback: BrokerOrder | undefined): BrokerOrder {
+    const current = this.orders.get(clientOrderId) ?? fallback;
+    if (!current) {
+      // AMBIGUOUS, not a generic fault. Every caller of this helper is on a path that previously
+      // guaranteed a BrokerAmbiguousSubmitError, and the manager routes on that type to decide
+      // whether an order may still exist at the broker. A plain Error would lose that classification.
+      throw new BrokerAmbiguousSubmitError(
+        clientOrderId,
+        `Order ${clientOrderId} vanished from the session projection before it could be quarantined; ` +
+          "reconciliation is required.",
+      );
+    }
+    if (isBrokerOrderTerminal(current.state)) return current;
+    return this.commit(clientOrderId, {
+      ...cloneBrokerOrder(current),
+      state: "RECONCILIATION_REQUIRED",
+      updated_at: this.clock.now(),
+    });
+  }
+
+  /**
+   * Re-read one order and merge the result into the session projection.
+   *
+   * BOTH the merge BASE and the write target are read AFTER the await, so a stream observation that
+   * landed during the round trip is neither ignored (it sets `priorFilled`, which is what makes the
+   * evidence reader's monotonic floor meaningful) nor overwritten. See {@link commit}.
+   */
   private async refresh(order: BrokerOrder): Promise<BrokerOrder> {
     if (!order.broker_order_id) return order;
+    const clientOrderId = order.client_order_id;
     const raw = await this.call(() => this.transport.getOrder(order.broker_order_id as string));
+    // ── NO AWAIT BEYOND THIS POINT ───────────────────────────────────────────────────────────
+    // The latest ACCEPTED state, which may have advanced on the stream while the read was in flight.
+    const current = this.orders.get(clientOrderId) ?? order;
     if (!raw) {
-      order.state = "UNKNOWN";
-      order.updated_at = this.clock.now();
-      return order;
+      // MISSING-RESPONSE BRANCH. Returning the pre-await snapshot here discarded an intervening
+      // stream update. UNKNOWN is still recorded — the broker may own something we cannot read — but
+      // it is merged, so a confirmed fill survives and a confirmed TERMINAL state is not reopened.
+      return this.commit(clientOrderId, {
+        ...cloneBrokerOrder(current),
+        state: "UNKNOWN",
+        updated_at: this.clock.now(),
+      });
     }
-    const normalized = normalizeKiteOrder(raw, order, this.clock.now());
-    // TIMING: the broker's CUMULATIVE quantity. The recorder ignores anything that is not an
-    // increase, so re-polling an unchanged order does not manufacture extra "fill" events.
-    this.markFill(order.client_order_id, normalized.filled_quantity);
-    this.orders.set(order.client_order_id, normalized);
-    return normalized;
+    const normalized = normalizeKiteOrder(raw, current, this.clock.now());
+    // The RAW reading is handed to the merge so a payload describing a smaller fill cannot donate
+    // its average price to a larger accepted cumulative quantity.
+    return this.commit(clientOrderId, normalized, {
+      observedCumulativeQty: readNonNegativeInteger(raw.filled_quantity).value,
+    });
   }
 
   /**
@@ -1021,6 +1111,46 @@ export class KiteBrokerAdapter implements BrokerAdapter {
     } catch {
       /* telemetry must never affect execution */
     }
+  }
+
+  /**
+   * COMMIT ONE OBSERVATION — the ONLY way a REST path may write the session projection.
+   *
+   * WHY THIS EXISTS. Every REST path used to capture a snapshot, `await` the transport, then write a
+   * value derived from that PRE-AWAIT snapshot back into the map. A WebSocket observation applied
+   * during the await (`applyOrderUpdate` is synchronous, so it lands whole) was therefore both
+   * invisible to the merge and destroyed by the write — the reproduced "cached 30, stream 75, older
+   * REST CANCELLED/30 wins" lost update.
+   *
+   * THE INVARIANT. This method re-reads the map and merges and writes with NO `await` anywhere in
+   * between, so the whole read-merge-write runs in one JS tick and is atomic with respect to
+   * `applyOrderUpdate` for the same reason `applyOrderUpdate` itself is safe. Callers must therefore
+   * call it only AFTER their last await, and must use its RETURN value rather than the snapshot they
+   * were holding.
+   */
+  private commit(
+    clientOrderId: string,
+    candidate: BrokerOrder,
+    options?: BrokerOrderMergeOptions,
+  ): BrokerOrder {
+    const merged = mergeBrokerOrderSnapshot(this.orders.get(clientOrderId), candidate, options);
+    this.orders.set(clientOrderId, merged.order);
+    if (merged.conflict !== null) {
+      // NEVER SILENT. A conflict means the two observations asserted mutually exclusive facts; the
+      // merge has already moved the order to RECONCILIATION_REQUIRED, and this is the only place an
+      // operator can learn WHY without reading the durable audit.
+      console.warn(`[Kite] execution evidence conflict for ${clientOrderId}: ${merged.conflict}`);
+    }
+    // A CONFLICTING broker id is deliberately NOT registered: it belongs to a different broker order,
+    // so attributing this client order id to it would compound the attribution fault. The order is in
+    // RECONCILIATION_REQUIRED and the reconciler owns it from here.
+    if (merged.order.broker_order_id && merged.conflict === null) {
+      this.clientByBroker.set(merged.order.broker_order_id, clientOrderId);
+    }
+    // TIMING: the broker's CUMULATIVE quantity. The recorder ignores anything that is not an
+    // increase, so re-polling an unchanged order does not manufacture extra "fill" events.
+    this.markFill(clientOrderId, merged.order.filled_quantity);
+    return merged.order;
   }
 
   private isEnabled(): boolean {

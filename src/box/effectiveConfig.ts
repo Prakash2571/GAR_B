@@ -139,10 +139,22 @@ const KNOBS: readonly KnobSpec[] = [
   { key: "liveConsecutiveFailureLimit", envVar: "BOX_LIVE_CONSECUTIVE_FAILURE_LIMIT", kind: "int", default: 3, min: 1, max: 100 },
 
   // ---- Economic admission (fresh funds/margin evidence) ----
+  //
+  // ALL FOUR FUNDING CONTROLS BELONG HERE. `liveRequireStageFunding` and
+  // `liveRecoveryReserveRupees` were previously absent from this registry, so the two most
+  // consequential funding knobs never appeared on the published effective-config surface. An
+  // operator reviewing a deployment could not tell whether stage funding was enforced or what
+  // recovery reserve was held back, which is precisely the configuration risk this registry exists
+  // to remove. Every default here is the code default in src/box/config.ts.
   { key: "liveRequireFundsCover", envVar: "BOX_LIVE_REQUIRE_FUNDS_COVER", kind: "bool", default: false },
   { key: "liveRequireMarginEvidence", envVar: "BOX_LIVE_REQUIRE_MARGIN_EVIDENCE", kind: "bool", default: false },
+  { key: "liveRequireStageFunding", envVar: "BOX_LIVE_REQUIRE_STAGE_FUNDING", kind: "bool", default: false },
+  { key: "liveRecoveryReserveRupees", envVar: "BOX_LIVE_RECOVERY_RESERVE_RUPEES", kind: "int", default: 0, min: 0, max: 100_000_000 },
   { key: "liveFundsFreshnessMaxAgeMs", envVar: "BOX_LIVE_FUNDS_FRESHNESS_MAX_AGE_MS", kind: "int", default: 5_000, min: 250, max: 600_000 },
   { key: "liveMarginFreshnessMaxAgeMs", envVar: "BOX_LIVE_MARGIN_FRESHNESS_MAX_AGE_MS", kind: "int", default: 5_000, min: 250, max: 600_000 },
+  { key: "liveEvidenceReadTimeoutMs", envVar: "BOX_LIVE_EVIDENCE_READ_TIMEOUT_MS", kind: "int", default: 2_500, min: 100, max: 60_000 },
+  { key: "liveEvidenceFutureSkewGraceMs", envVar: "BOX_LIVE_EVIDENCE_FUTURE_SKEW_GRACE_MS", kind: "int", default: 1_000, min: 0, max: 60_000 },
+  { key: "liveEvidenceConcurrentReads", envVar: "BOX_LIVE_EVIDENCE_CONCURRENT_READS", kind: "bool", default: false },
 
   // ---- Freshness / coherence (whole-second exchange stamps: NO sub-second exchange threshold) ----
   { key: "quoteMaxAgeMs", envVar: "BOX_QUOTE_MAX_AGE_MS", kind: "number", default: 15_000 },
