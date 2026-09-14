@@ -3,12 +3,15 @@
 # GTS Algo Research — production release script.
 #
 #   ./start.sh                 full release
+#   ./start.sh --frontend-only publish the UI only; never touches the DB or the backend process
 #   ./start.sh --dry-run       print every command, change nothing
 #   ./start.sh --help          all flags
 #
 # ─────────────────────────────────────────────────────────────────────────────────────────────
 # THE PIPELINE
 # ─────────────────────────────────────────────────────────────────────────────────────────────
+#    0  preflight           tools, paths, .env, AND that PostgreSQL actually answers — every
+#                           check that can fail is made BEFORE the host is modified
 #    1  git pull            GAR_B and GAR_F (fast-forward only, refuses a dirty tree)
 #    2  npm ci              both repos, from the lockfiles
 #    3  build               backend (tsc -b) and frontend (tsc -b && vite build)
@@ -45,6 +48,18 @@
 # "undo" it by checking out the old commit, because that would leave code older than the schema.
 # On failure it prints the exact previous commits and the backup file so a human can decide.
 #
+# ─────────────────────────────────────────────────────────────────────────────────────────────
+# --frontend-only
+# ─────────────────────────────────────────────────────────────────────────────────────────────
+# Ships a UI change when the backend is fine as it is (or when the database is broken and the fix
+# is unrelated). It pulls, builds and publishes the frontend and reloads nginx, and it does NOT
+# back up, migrate, restart the backend or wait for health — so a database problem cannot block a
+# frontend fix, and a frontend fix cannot disturb a running engine.
+#
+# It is still safe because the contract check is NOT skipped: before publishing, the digest the
+# RUNNING backend serves is compared with the one the frontend pinned, so a UI can never be
+# published against a wire shape that process does not speak.
+#
 # Safe to re-run: every step is idempotent, and a second run with nothing to do is a no-op.
 
 set -Eeuo pipefail
@@ -74,16 +89,19 @@ DRY_RUN=0
 SKIP_PULL=0
 SKIP_BACKUP=0
 SKIP_FRONTEND=0
+FRONTEND_ONLY=0
 ASSUME_YES=0
 
 usage() {
-  sed -n '2,48p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,63p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
   cat <<'EOF'
 
 FLAGS
   --dry-run          Print what would run. Changes nothing.
   --skip-pull        Deploy the working tree as-is (no git pull).
   --skip-frontend    Backend only; leaves the web root and nginx untouched.
+  --frontend-only    UI only. No pg_dump, no migration, no pm2, no health wait.
+                     The running backend's contract is still verified before publishing.
   --no-backup        Skip pg_dump. REFUSED when a migration is pending.
   -y, --yes          Do not prompt.
   -h, --help         This text.
@@ -102,6 +120,7 @@ while [[ $# -gt 0 ]]; do
     --dry-run) DRY_RUN=1 ;;
     --skip-pull) SKIP_PULL=1 ;;
     --skip-frontend) SKIP_FRONTEND=1 ;;
+    --frontend-only) FRONTEND_ONLY=1 ;;
     --no-backup) SKIP_BACKUP=1 ;;
     -y|--yes) ASSUME_YES=1 ;;
     -h|--help) usage; exit 0 ;;
@@ -109,6 +128,13 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
+
+if (( FRONTEND_ONLY && SKIP_FRONTEND )); then
+  printf -- '--frontend-only and --skip-frontend are opposites; pick one\n' >&2; exit 2
+fi
+# --frontend-only means the backup and the migration are not merely skipped, they are not reached.
+# Setting SKIP_BACKUP keeps a single source of truth for "no pg_dump was taken in this run".
+(( FRONTEND_ONLY )) && SKIP_BACKUP=1
 
 # ── output helpers ───────────────────────────────────────────────────────────────────────────
 
@@ -238,12 +264,13 @@ log "web root   ${WEB_ROOT}"
 log "pm2 app    ${PM2_APP}"
 log "public     ${PUBLIC_BASE}"
 (( DRY_RUN )) && warn "DRY RUN — nothing will be changed"
+(( FRONTEND_ONLY )) && log "mode       FRONTEND ONLY — the database and ${PM2_APP} will not be touched"
 
 step "Preflight"
 
 for c in git npm node curl tar; do need_cmd "$c"; done
 have rsync || log "rsync not present — using the tar fallback for the frontend copy"
-need_cmd pm2
+(( FRONTEND_ONLY )) || need_cmd pm2
 (( SKIP_FRONTEND )) || need_cmd nginx
 [[ -d "$GAR_B_DIR/.git" ]] || die "not a git repo: ${GAR_B_DIR}"
 [[ -d "$GAR_F_DIR/.git" ]] || die "frontend repo not found at ${GAR_F_DIR} (set GAR_F_DIR in deploy.env)"
@@ -251,8 +278,10 @@ need_cmd pm2
 # script cd's into a repo.
 GAR_B_DIR="$(cd -- "$GAR_B_DIR" && pwd)"
 GAR_F_DIR="$(cd -- "$GAR_F_DIR" && pwd)"
-[[ -f "$GAR_B_DIR/ecosystem.config.cjs" ]] || die "missing ecosystem.config.cjs in ${GAR_B_DIR}"
-[[ -f "$GAR_B_DIR/.env" ]] || die "missing ${GAR_B_DIR}/.env — the release cannot validate config or reach the database"
+if ! (( FRONTEND_ONLY )); then
+  [[ -f "$GAR_B_DIR/ecosystem.config.cjs" ]] || die "missing ecosystem.config.cjs in ${GAR_B_DIR}"
+  [[ -f "$GAR_B_DIR/.env" ]] || die "missing ${GAR_B_DIR}/.env — the release cannot validate config or reach the database"
+fi
 
 # `.env` supplies DATABASE_URL and PORT. index.ts and migrate.ts load it themselves via
 # `dotenv/config`, but effectiveConfig.js does NOT, and neither does pg_dump.
@@ -302,23 +331,92 @@ process.stdout.write(value);
 NODE
 }
 
-DATABASE_URL="$(read_env DATABASE_URL)"
-[[ -n "$DATABASE_URL" ]] || die "DATABASE_URL is not set in ${GAR_B_DIR}/.env"
-export DATABASE_URL
-PORT="$(read_env PORT)"; PORT="${PORT:-3001}"
+DATABASE_URL=""
+PORT=""
+if [[ -f "$GAR_B_DIR/.env" ]]; then
+  PORT="$(read_env PORT)"
+  if ! (( FRONTEND_ONLY )); then
+    DATABASE_URL="$(read_env DATABASE_URL)"
+    [[ -n "$DATABASE_URL" ]] || die "DATABASE_URL is not set in ${GAR_B_DIR}/.env"
+    export DATABASE_URL
+  fi
+fi
+PORT="${PORT:-3001}"
 HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:${PORT}/api/health}"
+LOCAL_API="${LOCAL_API:-http://127.0.0.1:${PORT}}"
 (( SKIP_BACKUP )) || need_cmd pg_dump
 
 node_major="$(node -p 'process.versions.node.split(".")[0]')"
 (( node_major >= 20 )) || die "Node 20+ required, found $(node -v)"
-ok "node $(node -v), npm $(npm -v), pm2 $(pm2 -v 2>/dev/null | tail -1)"
+if (( FRONTEND_ONLY )); then
+  ok "node $(node -v), npm $(npm -v)"
+else
+  ok "node $(node -v), npm $(npm -v), pm2 $(pm2 -v 2>/dev/null | tail -1)"
+fi
 
-run $SUDO mkdir -p "$LOG_DIR" "$BACKUP_DIR"
+# Print a connection string with the password removed, so a failure can name the URL it used
+# without putting the credential into a terminal, a log file or a screenshot.
+redact_url() {
+  RAW_URL="$1" node <<'NODE' 2>/dev/null || printf '%s' "the DATABASE_URL in .env"
+try {
+  const u = new URL(process.env.RAW_URL);
+  if (u.password) u.password = "***";
+  process.stdout.write(u.href);
+} catch { process.stdout.write("(unparseable DATABASE_URL)"); }
+NODE
+}
+
+# ── the database must answer BEFORE the host is modified ─────────────────────────────────────
+#
+# This check exists because of a real failure: the release reached the pg_dump step, found the
+# database refusing connections, and stopped — but by then `npm ci` had already deleted and
+# reinstalled node_modules in both repos and both had been rebuilt. A connection problem is a
+# PREFLIGHT problem: the right time to discover it is while nothing has been touched.
+#
+# It is read-only (a schema dump discarded to /dev/null), so it also runs under --dry-run, and it
+# deliberately uses the SAME tool and the SAME connection string the backup step will use. That
+# proves more than an open port: it proves the server answers, the credentials are accepted, and
+# the database exists.
+if ! (( FRONTEND_ONLY )); then
+  db_err=""
+  if have pg_dump; then
+    # `-w` (never prompt): without it a missing password makes pg_dump sit waiting on a terminal,
+    # and an unattended release would hang instead of failing. PGCONNECT_TIMEOUT bounds a host
+    # that accepts the TCP connection but never completes the handshake.
+    db_err="$(PGCONNECT_TIMEOUT=10 pg_dump -w --schema-only --no-owner --no-acl \
+      --file=/dev/null "$DATABASE_URL" 2>&1)" && db_ok=1 || db_ok=0
+  elif have pg_isready; then
+    db_err="$(PGCONNECT_TIMEOUT=10 pg_isready -d "$DATABASE_URL" 2>&1)" && db_ok=1 || db_ok=0
+  else
+    db_ok=1
+    warn "neither pg_dump nor pg_isready is installed — the database cannot be verified before deploying"
+  fi
+  if ! (( db_ok )); then
+    printf '%s\n' "$db_err" | sed 's/^/      /' >&2
+    die "cannot reach PostgreSQL — nothing on this host has been changed.
+
+    connection string : $(redact_url "$DATABASE_URL")
+    read from         : ${GAR_B_DIR}/.env
+
+    Check in this order:
+      1. is the server running?        systemctl status postgresql   (or: pg_isready)
+      2. is host/port right?           the DATABASE_URL line in ${GAR_B_DIR}/.env
+      3. can the role log in?          sudo -u postgres psql -c '\\du'
+      4. does the database exist?      sudo -u postgres psql -c '\\l'
+
+    The backup, the migrations and the backend all need this database, so the release stops here.
+    To ship a FRONTEND change while this is being fixed:  ./start.sh --frontend-only"
+  fi
+  have pg_dump && ok "PostgreSQL reachable and credentials accepted"
+fi
+
+run $SUDO mkdir -p "$LOG_DIR"
+(( SKIP_BACKUP )) || run $SUDO mkdir -p "$BACKUP_DIR"
 ok "preflight passed"
 
 # ── 1. git pull ──────────────────────────────────────────────────────────────────────────────
 
-step "Pull GAR_B and GAR_F"
+if (( FRONTEND_ONLY )); then step "Pull GAR_F"; else step "Pull GAR_B and GAR_F"; fi
 
 # Reports the pre-pull commit in the global PULL_BEFORE rather than on stdout: this function LOGS,
 # and capturing it with $(...) would swallow every log line into the variable instead of showing it.
@@ -350,31 +448,59 @@ pull_repo() {
   fi
 }
 
-pull_repo "$GAR_B_DIR" GAR_B; GAR_B_BEFORE="$PULL_BEFORE"
+# --frontend-only leaves GAR_B COMPLETELY alone — not even a pull.
+#
+# That is deliberate, and it is what makes the mode trustworthy. Pulling the backend would move its
+# source ahead of the dist/ the live process is actually running, so the next pm2 restart (including
+# an automatic one after a crash) would run stale code against new source. Leaving the repo where it
+# is also means GAR_B/contract/ still describes the backend that is genuinely deployed, which is
+# precisely what the frontend needs to be checked against.
+if (( FRONTEND_ONLY )); then
+  log "GAR_B is not pulled, built or restarted in --frontend-only mode"
+  GAR_B_BEFORE="$(git -C "$GAR_B_DIR" rev-parse HEAD)"
+else
+  pull_repo "$GAR_B_DIR" GAR_B; GAR_B_BEFORE="$PULL_BEFORE"
+fi
 pull_repo "$GAR_F_DIR" GAR_F; GAR_F_BEFORE="$PULL_BEFORE"
 
 # ── 2. npm ci ────────────────────────────────────────────────────────────────────────────────
 
-step "Install dependencies (npm ci, from the lockfiles)"
+if (( FRONTEND_ONLY )); then
+  step "Install frontend dependencies (npm ci, from the lockfile)"
+else
+  step "Install dependencies (npm ci, from the lockfiles)"
+fi
 
 # From here on the host has been changed, so a failure prints the recovery report.
 MUTATED=1
 
 # `npm ci` deletes node_modules and installs EXACTLY the lockfile. devDependencies are required:
 # both repos build with TypeScript, and the frontend needs vite.
-( cd "$GAR_B_DIR" && run npm ci --no-audit --no-fund )
-ok "GAR_B dependencies installed"
+#
+# In --frontend-only the backend install is skipped for a safety reason, not just for speed: `npm ci`
+# DELETES node_modules, and doing that under a live process means any restart in that window — a pm2
+# reload, or an automatic restart after a crash — boots into a directory with no dependencies.
+if (( FRONTEND_ONLY )); then
+  log "GAR_B node_modules left in place (removing it under the live process is not worth the risk)"
+else
+  ( cd "$GAR_B_DIR" && run npm ci --no-audit --no-fund )
+  ok "GAR_B dependencies installed"
+fi
 ( cd "$GAR_F_DIR" && run npm ci --no-audit --no-fund )
 ok "GAR_F dependencies installed"
 
 # ── 3. build ─────────────────────────────────────────────────────────────────────────────────
 
-step "Build backend and frontend"
+if (( FRONTEND_ONLY )); then step "Build frontend"; else step "Build backend and frontend"; fi
 
 # tsconfig sets noEmitOnError, so a type error produces NO dist rather than a half-built one.
-( cd "$GAR_B_DIR" && run npm run build )
-[[ -f "$GAR_B_DIR/dist/index.js" ]] || (( DRY_RUN )) || die "backend build produced no dist/index.js"
-ok "backend built"
+if (( FRONTEND_ONLY )); then
+  log "GAR_B dist/ untouched — the running process keeps the build it was started with"
+else
+  ( cd "$GAR_B_DIR" && run npm run build )
+  [[ -f "$GAR_B_DIR/dist/index.js" ]] || (( DRY_RUN )) || die "backend build produced no dist/index.js"
+  ok "backend built"
+fi
 
 ( cd "$GAR_F_DIR" && run npm run build )
 [[ -f "$GAR_F_DIR/dist/index.html" ]] || (( DRY_RUN )) || die "frontend build produced no dist/index.html"
@@ -425,24 +551,61 @@ fi
 
 # ── 5. backup ────────────────────────────────────────────────────────────────────────────────
 
-step "Back up PostgreSQL"
+if (( FRONTEND_ONLY )); then step "PostgreSQL backup (skipped)"; else step "Back up PostgreSQL"; fi
 
 # PostgreSQL is the backup of record (docs/DEPLOYMENT.md §7 — MongoDB Atlas is an async reporting
 # replica and is NOT a backup). Taken BEFORE the schema can change, and a failure here stops the
 # release: migrating without a backup is the one irreversible step in this pipeline.
 if (( SKIP_BACKUP )); then
-  warn "--no-backup: skipping pg_dump"
+  if (( FRONTEND_ONLY )); then
+    log "--frontend-only: the database is not touched, so no backup is taken"
+  else
+    warn "--no-backup: skipping pg_dump"
+  fi
 else
-  BACKUP_FILE="${BACKUP_DIR}/gts_$(date +%Y%m%d-%H%M%S).dump"
+  backup_target="${BACKUP_DIR}/gts_$(date +%Y%m%d-%H%M%S).dump"
   run $SUDO mkdir -p "$BACKUP_DIR"
   if (( DRY_RUN )); then
-    printf '%s      would run:%s pg_dump --format=custom --file=%s "$DATABASE_URL"\n' \
-      "$C_DIM" "$C_RESET" "$BACKUP_FILE"
+    printf '%s      would run:%s pg_dump --format=custom "$DATABASE_URL" -> %s\n' \
+      "$C_DIM" "$C_RESET" "$backup_target"
   else
-    $SUDO -E pg_dump --format=custom --no-owner --file="$BACKUP_FILE" "$DATABASE_URL" \
-      || die "pg_dump FAILED — refusing to continue to migrations without a backup"
-    $SUDO test -s "$BACKUP_FILE" || die "pg_dump produced an empty file: ${BACKUP_FILE}"
-    ok "backup written: ${BACKUP_FILE} ($($SUDO du -h "$BACKUP_FILE" | cut -f1))"
+    # THE DUMP RUNS AS THE INVOKING USER. THE SUDO IS ONLY FOR THE FILE.
+    #
+    # This step used to be `sudo -E pg_dump --file=/var/backups/...`, which conflated two entirely
+    # different needs: permission to WRITE into /var/backups/gts (root), and identity to CONNECT to
+    # PostgreSQL (this user). Running the dump through sudo broke the second one two ways:
+    #
+    #   * a normal sudoers policy refuses `-E` outright — "preserving the entire environment is not
+    #     supported, '-E' is ignored" — so DATABASE_URL did not even reach pg_dump, and
+    #   * as root the connection loses this user's identity: peer/ident authentication, ~/.pgpass,
+    #     PGUSER/PGHOST. The dump then connects as the wrong role, or not at all.
+    #
+    # So the dump is taken as the invoking user into a private temp file, and root is used for the
+    # one thing that genuinely requires it: installing the finished file into BACKUP_DIR, 0600,
+    # because a database dump must not be world-readable.
+    tmp_dump="$(mktemp "${TMPDIR:-/tmp}/gts-dump.XXXXXXXX")"
+    if ! PGCONNECT_TIMEOUT=10 pg_dump -w --format=custom --no-owner \
+        --file="$tmp_dump" "$DATABASE_URL"; then
+      rm -f "$tmp_dump"
+      die "pg_dump FAILED — refusing to continue to migrations without a backup.
+    The database answered during preflight, so this is a dump-time problem (permissions on a
+    specific table, disk space in ${TMPDIR:-/tmp}, or the server going away mid-dump)."
+    fi
+    # An empty dump is worse than no dump, because it looks like a backup.
+    if [[ ! -s "$tmp_dump" ]]; then
+      rm -f "$tmp_dump"
+      die "pg_dump exited 0 but produced an empty file — treating that as no backup at all"
+    fi
+    backup_size="$(du -h "$tmp_dump" | cut -f1)"
+    if ! $SUDO install -m 600 "$tmp_dump" "$backup_target"; then
+      rm -f "$tmp_dump"
+      die "the dump was taken but could not be installed into ${BACKUP_DIR} — check the directory's ownership"
+    fi
+    rm -f "$tmp_dump"
+    # Set only now that the file really exists, so the recovery report never points at a dump that
+    # was never written.
+    BACKUP_FILE="$backup_target"
+    ok "backup written: ${BACKUP_FILE} (${backup_size})"
     # Prune old dumps, but only ever inside BACKUP_DIR.
     $SUDO find "$BACKUP_DIR" -maxdepth 1 -name 'gts_*.dump' -mtime "+${BACKUP_RETENTION_DAYS}" \
       -delete 2>/dev/null || true
@@ -451,13 +614,15 @@ fi
 
 # ── 6. migrate ───────────────────────────────────────────────────────────────────────────────
 
-step "Database migrations"
+if (( FRONTEND_ONLY )); then step "Database migrations (skipped)"; else step "Database migrations"; fi
 
 # `migrate -- --check` is assert-only: exit 0 = schema current, non-zero = behind. Asking first
 # means a release with no schema change never stops the app, and a release WITH one stops it before
 # touching the schema — docs/DEPLOYMENT.md: "Never migrate under a live, armed process."
 MIGRATION_PENDING=0
-if (( DRY_RUN )); then
+if (( FRONTEND_ONLY )); then
+  log "--frontend-only: the schema is neither inspected nor changed"
+elif (( DRY_RUN )); then
   printf '%s      would run:%s npm run migrate -- --check\n' "$C_DIM" "$C_RESET"
 else
   if ( cd "$GAR_B_DIR" && npm run --silent migrate -- --check >/dev/null 2>&1 ); then
@@ -485,12 +650,18 @@ fi
 
 # ── 7. effective config ──────────────────────────────────────────────────────────────────────
 
-step "Validate the effective backend configuration"
+if (( FRONTEND_ONLY )); then
+  step "Backend configuration (skipped)"
+else
+  step "Validate the effective backend configuration"
+fi
 
 # A .env is a REQUEST for a configuration; the value in force can differ (unset → default,
 # out-of-range → clamped, unparseable → default). This prints what will ACTUALLY run, with
 # provenance, and refuses a config that would not boot (the CLI exits 2 for that).
-if (( DRY_RUN )); then
+if (( FRONTEND_ONLY )); then
+  log "--frontend-only: the running backend keeps the configuration it booted with"
+elif (( DRY_RUN )); then
   printf '%s      would run:%s node dist/box/effectiveConfig.js\n' "$C_DIM" "$C_RESET"
 else
   # `-r dotenv/config` is how index.ts gets its environment; effectiveConfig.js has no dotenv import
@@ -535,9 +706,13 @@ fi
 
 # ── 8. pm2 ───────────────────────────────────────────────────────────────────────────────────
 
-step "Start / reload ${PM2_APP}"
+if (( FRONTEND_ONLY )); then step "${PM2_APP} (untouched)"; else step "Start / reload ${PM2_APP}"; fi
 
-if (( DRY_RUN )); then
+if (( FRONTEND_ONLY )); then
+  # Not restarting is the POINT of this mode: a UI fix must not interrupt an engine that may be
+  # holding open positions.
+  log "--frontend-only: ${PM2_APP} is left running exactly as it is"
+elif (( DRY_RUN )); then
   printf '%s      would run:%s pm2 start ecosystem.config.cjs  (or reload if already running)\n' \
     "$C_DIM" "$C_RESET"
 elif pm2 describe "$PM2_APP" >/dev/null 2>&1; then
@@ -555,10 +730,44 @@ else
   ( cd "$GAR_B_DIR" && run pm2 start ecosystem.config.cjs --only "$PM2_APP" )
   ok "${PM2_APP} started"
 fi
-run pm2 save --force
+(( FRONTEND_ONLY )) || run pm2 save --force
 
 # ── 9. health ────────────────────────────────────────────────────────────────────────────────
 
+if (( FRONTEND_ONLY )); then
+  step "Check the RUNNING backend's contract before publishing"
+
+  # This is the check that makes --frontend-only safe.
+  #
+  # Step 4 proved the frontend matches the backend SOURCE now checked out. In this mode the backend
+  # process was NOT restarted, so it is still serving whatever it booted with — which may be older
+  # than that source. Publishing a UI built for a newer wire shape than the live process speaks is
+  # exactly the breakage this mode could otherwise introduce, so it is caught here, BEFORE the web
+  # root is touched and while a refusal costs nothing.
+  if (( DRY_RUN )); then
+    printf '%s      would read:%s %s/api/box/status and compare its contract digest\n' \
+      "$C_DIM" "$C_RESET" "$LOCAL_API"
+  else
+    running_digest="$(curl -fsS --max-time 10 "${LOCAL_API}/api/box/status" 2>/dev/null \
+      | node -pe 'try{JSON.parse(require("fs").readFileSync(0,"utf8")).contract?.schemas_sha256??""}catch{""}' 2>/dev/null || true)"
+    if [[ -z "$running_digest" ]]; then
+      # The status surface is behind the access gate, so an empty answer can mean "not authorised"
+      # just as easily as "not running". Either way it is unknowable from here, and this must not be
+      # reported as a mismatch.
+      warn "could not read the running backend's contract digest from ${LOCAL_API}/api/box/status"
+      warn "(it may be down, or the status surface may require the access gate). Publishing anyway"
+      warn "because --frontend-only was requested. If the UI shows shape errors, run a full release."
+    elif [[ "$running_digest" != "${frontend_pin:-}" ]]; then
+      printf '    running backend serves : %s\n' "$running_digest" >&2
+      printf '    frontend pinned        : %s\n' "${frontend_pin:-<unread>}" >&2
+      die "the RUNNING backend speaks a different contract than this frontend was built for.
+    Nothing was published. The backend source in ${GAR_B_DIR} is probably ahead of the process
+    that is live, so a frontend-only release is not enough here — run a full ./start.sh."
+    else
+      ok "the running backend serves the contract this frontend pinned (${running_digest:0:12}…)"
+    fi
+  fi
+else
 step "Wait for the backend to report ready"
 
 # The backend binds its socket EARLY and answers /api/health with 503 until boot finishes
@@ -586,6 +795,7 @@ else
     sleep 2
   done
   ok "backend is ready: ${body}"
+fi
 fi
 
 # ── 10. publish the frontend ─────────────────────────────────────────────────────────────────
@@ -625,7 +835,10 @@ step "Verify the public URLs"
 check_url() {
   local url="$1" want="$2" desc="$3" code
   if (( DRY_RUN )); then printf '%s      would check:%s %s\n' "$C_DIM" "$C_RESET" "$url"; return 0; fi
-  code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "$url" 2>/dev/null || echo 000)"
+  # Same reason as the health check below: curl prints %{http_code} (as "000") on a failed transfer,
+  # so an `|| echo 000` fallback would concatenate two codes and never compare equal to anything.
+  code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "$url" 2>/dev/null)" || true
+  code="${code:-000}"
   if [[ "$code" == "$want" ]]; then
     ok "${code}  ${url}  (${desc})"
   else
@@ -636,11 +849,34 @@ check_url() {
 check_url "${PUBLIC_BASE}/"           200 "public site"
 check_url "${PUBLIC_BASE}/box"        200 "SPA route — nginx try_files must fall back to index.html"
 if ! (( DRY_RUN )); then
-  health="$(curl -fsS --max-time 15 "${PUBLIC_BASE}/api/health" 2>/dev/null)" \
-    || die "${PUBLIC_BASE}/api/health did not return 200 — nginx is not reaching the backend"
-  [[ "$(printf '%s' "$health" | node -pe 'JSON.parse(require("fs").readFileSync(0,"utf8")).ready' 2>/dev/null)" == "true" ]] \
-    || die "${PUBLIC_BASE}/api/health reports not-ready: ${health}"
-  ok "200  ${PUBLIC_BASE}/api/health  (${health})"
+  # DELIBERATELY NOT `curl -f`. The backend answers /api/health with 503 AND a JSON body saying WHY
+  # it is not ready. `-f` discards that body and leaves only "did not return 200", which then reads
+  # like an nginx routing problem when the truth might be "PostgreSQL is unavailable". The body IS
+  # the diagnosis, so the status line and the body are captured separately and both are reported.
+  # No `|| printf '\n000'` fallback: curl writes its --write-out string even when the transfer
+  # FAILS, so a fallback appended a second code and the body then rendered as a stray "000" line.
+  # curl's own output already ends in "\n000" on a failure, so only its exit status is discarded.
+  health_raw="$(curl -sS -w '\n%{http_code}' --max-time 15 "${PUBLIC_BASE}/api/health" 2>/dev/null)" || true
+  health_code="${health_raw##*$'\n'}"      # text after the LAST newline
+  health_code="${health_code:-000}"        # curl produced nothing at all
+  health="${health_raw%$'\n'*}"            # everything before it
+  health_ready="$(printf '%s' "$health" | node -pe 'try{JSON.parse(require("fs").readFileSync(0,"utf8")).ready===true}catch{false}' 2>/dev/null || echo false)"
+  if [[ "$health_code" == "200" && "$health_ready" == "true" ]]; then
+    ok "200  ${PUBLIC_BASE}/api/health  (${health})"
+  elif (( FRONTEND_ONLY )); then
+    # A frontend-only release did not start, reload or configure the backend, so its state is not
+    # this run's result and must not be reported as this run's failure. Rolling the UI back would
+    # not fix a backend that was already unhealthy before the script ran — it would only discard the
+    # change that did succeed. So: say it plainly, and leave the published frontend in place.
+    warn "${PUBLIC_BASE}/api/health returned HTTP ${health_code}: ${health:-<empty body>}"
+    warn "This run did not touch the backend, so that is a PRE-EXISTING condition, not a failure of"
+    warn "this release. The frontend was published and is being kept. Investigate separately:"
+    warn "  pm2 logs ${PM2_APP} --lines 50"
+  elif [[ "$health_code" == "000" ]]; then
+    die "${PUBLIC_BASE}/api/health could not be reached at all — nginx is not reaching the backend"
+  else
+    die "${PUBLIC_BASE}/api/health returned HTTP ${health_code} and does not report ready: ${health:-<empty body>}"
+  fi
 
   # The UI is only usable if it was built against the contract this backend serves. Compare the
   # digest the running backend reports with what the frontend pinned.
@@ -654,9 +890,15 @@ fi
 # ── done ─────────────────────────────────────────────────────────────────────────────────────
 
 trap - EXIT
-printf '\n%s%sRELEASE COMPLETE%s\n' "$C_BOLD" "$C_GREEN" "$C_RESET"
+if (( FRONTEND_ONLY )); then
+  printf '\n%s%sFRONTEND RELEASE COMPLETE%s  (backend and database untouched)\n' \
+    "$C_BOLD" "$C_GREEN" "$C_RESET"
+else
+  printf '\n%s%sRELEASE COMPLETE%s\n' "$C_BOLD" "$C_GREEN" "$C_RESET"
+fi
 if ! (( DRY_RUN )); then
-  printf '  GAR_B      %s\n' "$(git -C "$GAR_B_DIR" rev-parse --short HEAD)"
+  printf '  GAR_B      %s%s\n' "$(git -C "$GAR_B_DIR" rev-parse --short HEAD)" \
+    "$( (( FRONTEND_ONLY )) && printf '  (not pulled, not rebuilt, not restarted)' || true )"
   printf '  GAR_F      %s\n' "$(git -C "$GAR_F_DIR" rev-parse --short HEAD)"
   [[ -n "$BACKUP_FILE" ]] && printf '  DB backup  %s\n' "$BACKUP_FILE"
   (( MIGRATED )) && printf '  migrations APPLIED in this run\n'
