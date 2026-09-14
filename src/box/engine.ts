@@ -130,6 +130,12 @@ import {
   type OperationalReadinessDecision,
   type ReadinessBlocker,
 } from "./operationalReadiness.js";
+import {
+  brokerFundingLimitations,
+  fundingReadinessBlockers,
+  type FundingReadiness,
+} from "./fundingReadiness.js";
+import type { EconomicAdmissionReport } from "./boxCapital.js";
 import type { OrderStreamHealth } from "./orderUpdateProjection.js";
 import { OrderStreamConsumer } from "./orderStreamConsumer.js";
 import { createDhanOrderStreamHandlers } from "./dhanOrderStreamWiring.js";
@@ -5417,8 +5423,16 @@ export class BoxEngine {
        * completion; recovery costs and unresolved exposure are counted, never hidden.
        */
       execution_funnel: this.funnel.snapshot(),
-      /** The economic-admission decision (five distinct quantities), when a control is enabled. */
-      economic_admission: this.centralGateway?.economicDiagnostics() ?? null,
+      /**
+       * The economic-admission decision (five distinct quantities), when a control is enabled.
+       *
+       * NULL means NO evidence gate is enabled, so nothing was read and NOTHING IS CLAIMED about
+       * funding. That is deliberately not the same as "checked and sufficient", and clients render it
+       * as such. When a gate IS enabled the decision carries a `funding_readiness` block naming the
+       * funding state and the EFFECTIVE gate settings (see fundingReadiness.ts); a refusal also
+       * appears as an entry-scoped blocker in `operational_readiness`.
+       */
+      economic_admission: this.economicAdmissionStatus(),
       database_healthy: isBoxDbEnabled() && (!live || live.health.persistence === "healthy"),
       daily_risk_seed_healthy: live ? live.health.daily_risk_seed === "healthy" : null,
       reconciliation_complete: live?.health.reconciliation_complete ?? true,
@@ -5773,6 +5787,26 @@ export class BoxEngine {
    * idleness clock, so it must be called BEFORE the consumer's health is snapshotted — otherwise the
    * decision could carry a lifecycle one poll staler than the health beside it.
    */
+  /**
+   * The published `economic_admission` leaf.
+   *
+   * NULL is preserved exactly as before when no evidence gate is enabled — that is the honest
+   * "nothing was checked, nothing is claimed" signal, and clients already render it that way. When a
+   * decision DOES exist it is enriched with the funding-readiness block, which names the state
+   * (`verified` / `refused`) and the EFFECTIVE gate settings including the stage-funding implication.
+   * `economic_admission` is an OPEN contract leaf, so adding this field needs no schema change.
+   */
+  private economicAdmissionStatus(): (EconomicAdmissionReport & { funding_readiness: FundingReadiness }) | null {
+    const gateway = this.centralGateway;
+    if (!gateway) return null;
+    const report = gateway.economicDiagnostics();
+    if (!report) return null;
+    return {
+      ...report,
+      funding_readiness: gateway.fundingReadiness(brokerFundingLimitations(this.deps.activeBroker())),
+    };
+  }
+
   operationalReadiness(): OperationalReadinessDecision {
     // Drive both machines' age-based demotions FIRST, then read everything from the settled states.
     const marketDataState = this.marketDataState();
@@ -5870,6 +5904,24 @@ export class BoxEngine {
           `${live?.unknownOrders} order(s) are not yet reconciled with the broker. Their fills are ` +
           `unknown, not zero, so no new exposure is taken on top of them.`,
       });
+    }
+    // FUNDING ADMISSION, surfaced in the ONE authoritative readiness decision.
+    //
+    // Previously a funding refusal existed only inside the OPEN `economic_admission` blob, so the
+    // readiness verdict — the thing a client is required to render — never mentioned it. These
+    // blockers are emitted ONLY when a gate is ENABLED and the last decision REFUSED: disabled gates
+    // deliberately produce none, because turning the default-off configuration into a trading stop
+    // would change a deployment's controls rather than report on them (that state is reported as
+    // `checks_disabled` by `fundingReadiness()` and reviewed via `node dist/box/effectiveConfig.js`).
+    //
+    // Every one is `scope: "entry"`, so an account that cannot fund a NEW box can still exit,
+    // reduce and protectively cancel the exposure it already holds.
+    if (this.centralGateway) {
+      engineBlockers.push(
+        ...fundingReadinessBlockers(
+          this.centralGateway.fundingReadiness(brokerFundingLimitations(activeBroker)),
+        ),
+      );
     }
 
     return buildOperationalReadiness({

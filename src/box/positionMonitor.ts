@@ -1337,9 +1337,31 @@ export class BoxPositionMonitor {
    * the executor actually does.
    */
   private exitExecutionOk(pos: BoxOpenPosition, metrics: BoxExitMetrics): boolean {
-    if (this.deps.cfg.executionMode === "paper_legging" || this.deps.cfg.executionMode === "live") {
+    if (this.deps.cfg.executionMode === "live") {
       const est = this.deps.executionSim.estimateExecutableExit(pos);
       if (est.length === 0) return false;
+      // LIVE ISOLATES PER LEG, so this gate must too.
+      //
+      // `every` here was the second half of the all-or-nothing exit defect: one outstanding role
+      // with no book (or a stale/thin one) made the whole predicate false, so `runExit` returned at
+      // the EXIT_SKIPPED_LIQUIDITY branch and `simulateLeggingExit` was never called at all. The
+      // per-leg isolation inside the gateway was therefore unreachable in production, and a
+      // risk-reducing close on a leg with perfectly good depth was suppressed by an unrelated leg.
+      //
+      // `some` asks the question this gate is actually for: is there ANY work worth attempting? It
+      // does NOT decide what gets sent. The gateway still prechecks every leg individually and the
+      // order manager still re-validates at CHECKPOINT 3 (dequeue) and CHECKPOINT 5 (pre-POST), so
+      // relaxing this cannot transmit anything against an unusable book — it can only stop the
+      // monitor from refusing to look. Legs that remain unexecutable are reported as withheld and
+      // the exit is never reported as fully closed.
+      return est.some((e) => e.fresh && e.executable >= e.remaining);
+    }
+    if (this.deps.cfg.executionMode === "paper_legging") {
+      const est = this.deps.executionSim.estimateExecutableExit(pos);
+      if (est.length === 0) return false;
+      // paper_legging keeps the whole-position gate: its simulator resolves a wave as one unit and
+      // has no per-leg withholding, so admitting a partially executable position there would model
+      // an execution the paper executor cannot actually perform. One implementation per model.
       return est.every((e) => e.fresh && e.executable >= e.remaining);
     }
     return exitLiquidityOk(metrics.legs);

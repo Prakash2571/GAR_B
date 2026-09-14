@@ -77,6 +77,7 @@ import {
   dhanCorrelationId,
   isValidDhanCorrelationId,
 } from "../brokers/dhan/correlation.js";
+import { mergeBrokerOrderSnapshot, type BrokerOrderMergeOptions } from "./brokerOrderMerge.js";
 import type {
   DhanClient,
   DhanOrder,
@@ -442,52 +443,52 @@ export class DhanBrokerAdapter implements BrokerAdapter {
     // along with the stale number, leaving the order "working" in the snapshot with its waiters never
     // woken. So the quantity is PINNED to what we already hold — never rewound — and the label is
     // resolved against that accepted quantity.
-    const regressed = observedQuantity.present && (observedQuantity.value ?? 0) < known.filled_quantity;
-    const acceptedFilled = regressed ? known.filled_quantity : verdict.filledQuantity;
+    const observedFilled = observedQuantity.present ? (observedQuantity.value ?? 0) : null;
+    const regressed = observedFilled !== null && observedFilled < known.filled_quantity;
+    const at = update.observedAtWall ?? Date.now();
 
-    const merged: BrokerOrder = cloneOrder(known);
-    merged.filled_quantity = acceptedFilled;
-    merged.pending_quantity = Math.max(0, known.quantity - acceptedFilled);
-    // A stale observation's average price describes a SMALLER fill than we already hold, so it is not
-    // better evidence and is not adopted.
-    if (verdict.averagePrice !== null && !regressed) merged.average_price = verdict.averagePrice;
-    if (!regressed) merged.execution_evidence = verdict.quality;
-    if (update.brokerOrderId) {
-      merged.broker_order_id = update.brokerOrderId;
-      this.clientByBroker.set(update.brokerOrderId, update.clientOrderId);
-    }
-    // The state is re-derived from the ACCEPTED quantity, exactly as `project()` does, so a
+    // The candidate is RAW-FAITHFUL — it reports exactly what THIS observation said — and
+    // `mergeBrokerOrderSnapshot` applies the monotonic quantity floor, the price rule, the terminal
+    // guard and the fill-record rule. Stream and REST now share one implementation of that
+    // authority, which is what stops the two paths from disagreeing.
+    const candidate: BrokerOrder = cloneOrder(known);
+    candidate.filled_quantity = observedFilled ?? verdict.filledQuantity;
+    candidate.pending_quantity = Math.max(0, known.quantity - candidate.filled_quantity);
+    candidate.average_price = verdict.averagePrice;
+    candidate.execution_evidence = verdict.quality;
+    if (update.brokerOrderId) candidate.broker_order_id = update.brokerOrderId;
+    // The state is re-derived from the OBSERVED quantity, exactly as `project()` does, so a
     // contradictory label (TRADED with a short fill, CANCELLED with a fill) resolves the same way
     // whichever source reported it.
-    merged.state = verdict.sufficient
-      ? dhanOrderState(label, acceptedFilled, known.quantity)
+    candidate.state = verdict.sufficient
+      ? dhanOrderState(label, candidate.filled_quantity, known.quantity)
       : known.state;
-    if (!verdict.sufficient && !regressed) merged.reject_reason = verdict.detail;
-    // NEVER regress a terminal state to a working one on a late event.
-    if (isBrokerOrderTerminal(known.state) && !isBrokerOrderTerminal(merged.state)) {
-      merged.state = known.state;
-    }
-    if (acceptedFilled > 0 && merged.fills.length === 0) {
-      merged.fills = [{
-        fill_id: `dhan:stream:${merged.broker_order_id ?? update.clientOrderId}:${acceptedFilled}:${merged.average_price ?? "unpriced"}`,
-        quantity: acceptedFilled,
-        price: merged.average_price,
-        at: update.observedAtWall ?? Date.now(),
-      }];
-    }
-    merged.updated_at = update.observedAtWall ?? Date.now();
+    if (!verdict.sufficient) candidate.reject_reason = verdict.detail;
+    candidate.fills = candidate.filled_quantity > 0
+      ? [{
+        fill_id: `dhan:stream:${candidate.broker_order_id ?? update.clientOrderId}:${candidate.filled_quantity}:${verdict.averagePrice ?? "unpriced"}`,
+        quantity: candidate.filled_quantity,
+        price: verdict.averagePrice,
+        at,
+      }]
+      : [];
+    candidate.updated_at = at;
 
-    // When the quantity went backwards AND the label resolves to the state we are already in, the
-    // observation genuinely carries nothing on any track. Only then is it ignored outright.
-    if (regressed && merged.state === known.state) {
+    const merged = mergeBrokerOrderSnapshot(known, candidate, { observedCumulativeQty: observedFilled });
+    // When the quantity went backwards AND nothing else moved, the observation genuinely carries
+    // nothing on any track. Only then is it ignored outright.
+    if (regressed && merged.order.state === known.state && merged.order.filled_quantity === known.filled_quantity) {
       this.streamObservationsIgnored++;
       return cloneOrder(known);
     }
-    this.orders.set(update.clientOrderId, merged);
+    this.orders.set(update.clientOrderId, merged.order);
+    if (merged.order.broker_order_id) {
+      this.clientByBroker.set(merged.order.broker_order_id, update.clientOrderId);
+    }
     this.streamObservationsApplied++;
-    this.markFill(update.clientOrderId, merged.filled_quantity);
+    this.markFill(update.clientOrderId, merged.order.filled_quantity);
     this.wakeOrderWaiters(update.clientOrderId);
-    return cloneOrder(merged);
+    return cloneOrder(merged.order);
   }
 
   /** How many external (stream) observations this session applied vs ignored. */
@@ -697,35 +698,35 @@ export class DhanBrokerAdapter implements BrokerAdapter {
       }
       // A DEFINITIVE 4xx (not 429) means Dhan understood and refused.
       if (err instanceof DhanError && err.isDefinitive && !(err instanceof DhanRateLimitError)) {
-        order.state = "REJECTED";
-        order.reject_family = err instanceof DhanAuthError ? "auth" : classifyDhanReject(err.code, err.message);
-        order.reject_reason = err.message;
-        order.updated_at = Date.now();
-        this.orders.set(req.client_order_id, order);
-        throw new BrokerOrderRejectedError(cloneOrder(order), err);
+        // Merged, not written blind: if a fill was observed on the stream while the POST was in
+        // flight, a bare REJECTED would erase real exposure. The merge routes that contradiction to
+        // RECONCILIATION_REQUIRED instead of silently choosing one side.
+        const rejected = this.commit(req.client_order_id, {
+          ...cloneOrder(this.orders.get(req.client_order_id) ?? order),
+          state: "REJECTED",
+          reject_family: err instanceof DhanAuthError ? "auth" : classifyDhanReject(err.code, err.message),
+          reject_reason: err.message,
+          updated_at: Date.now(),
+        });
+        throw new BrokerOrderRejectedError(cloneOrder(rejected), err);
       }
 
       // AMBIGUOUS. The order may be live. Reconcile by correlation id — never
       // re-POST. This is the single most important branch in this file.
       const reconciled = await this.reconcileByCorrelation(req, correlationId).catch(() => null);
       if (reconciled) {
-        this.orders.set(req.client_order_id, reconciled);
-        if (reconciled.broker_order_id) {
-          this.clientByBroker.set(reconciled.broker_order_id, req.client_order_id);
-        }
+        const accepted = this.commit(req.client_order_id, reconciled.order, reconciled.options);
         // The order DOES exist; carry on with its real state.
-        return this.waitForResolution(req.client_order_id, reconciled);
+        return this.waitForResolution(req.client_order_id, accepted);
       }
       // Could not prove either way: quarantine for the durable reconciler.
-      order.state = "RECONCILIATION_REQUIRED";
-      order.reject_reason = err instanceof Error ? err.message : String(err);
-      order.updated_at = Date.now();
-      this.orders.set(req.client_order_id, order);
+      const reason = err instanceof Error ? err.message : String(err);
+      const quarantined = this.quarantine(req.client_order_id, order, reason);
       throw new BrokerAmbiguousSubmitError(
         req.client_order_id,
-        `Dhan order submission outcome is unknown and correlation lookup did not resolve it: ${order.reject_reason}`,
+        `Dhan order submission outcome is unknown and correlation lookup did not resolve it: ${reason}`,
         err,
-        cloneOrder(order),
+        cloneOrder(quarantined),
       );
     }
 
@@ -733,13 +734,12 @@ export class DhanBrokerAdapter implements BrokerAdapter {
       // A 200 with no order id is ambiguous too, and gets the same treatment.
       const reconciled = await this.reconcileByCorrelation(req, correlationId).catch(() => null);
       if (reconciled) {
-        this.orders.set(req.client_order_id, reconciled);
-        return this.waitForResolution(req.client_order_id, reconciled);
+        const accepted = this.commit(req.client_order_id, reconciled.order, reconciled.options);
+        return this.waitForResolution(req.client_order_id, accepted);
       }
-      order.state = "RECONCILIATION_REQUIRED";
-      order.reject_reason = "Dhan accepted the request but returned no orderId.";
-      this.orders.set(req.client_order_id, order);
-      throw new BrokerAmbiguousSubmitError(req.client_order_id, order.reject_reason, placed, cloneOrder(order));
+      const reason = "Dhan accepted the request but returned no orderId.";
+      const quarantined = this.quarantine(req.client_order_id, order, reason);
+      throw new BrokerAmbiguousSubmitError(req.client_order_id, reason, placed, cloneOrder(quarantined));
     }
 
     order.broker_order_id = placed.orderId;
@@ -773,24 +773,23 @@ export class DhanBrokerAdapter implements BrokerAdapter {
     if (claimsTerminal) {
       // Ask for authoritative evidence. A TRADED label with no verified quantity must never
       // become a fully accounted execution on the label alone.
+      // `refresh` now commits its own merge, so `verified` IS the accepted state; the explicit
+      // `orders.set` calls that used to follow each branch would have re-written an already-merged
+      // value and are gone.
       const verified = await this.refresh(req.client_order_id).catch(() => undefined);
-      const current = this.orders.get(req.client_order_id) ?? order;
       if (verified && this.hasAuthoritativeQuantity(verified, placed.orderStatus)) {
         // Reconcile contradictions here too: `project()` already re-derives the state from the
         // OBSERVED filled quantity, so a "CANCELLED with a nonzero fill" surfaces as a real
         // partial and a "TRADED with a short fill" as PARTIALLY_FILLED rather than COMPLETE.
         if (verified.state === "REJECTED") {
-          this.orders.set(req.client_order_id, verified);
           throw new BrokerOrderRejectedError(cloneOrder(verified), placed);
         }
-        this.orders.set(req.client_order_id, verified);
         return this.waitForResolution(req.client_order_id, verified);
       }
       // A REJECTED label with a verified ZERO fill is genuinely terminal and carries no
       // exposure, so it is safe to accept as a rejection — but only once the read has CONFIRMED
       // the zero, not merely inferred it from the label.
       if (verified && verified.state === "REJECTED" && verified.filled_quantity === 0) {
-        this.orders.set(req.client_order_id, verified);
         throw new BrokerOrderRejectedError(cloneOrder(verified), placed);
       }
       // EVIDENCE NOT YET VISIBLE: the read SUCCEEDED and PROJECTED a genuine working state (the
@@ -806,7 +805,6 @@ export class DhanBrokerAdapter implements BrokerAdapter {
           || verified.state === "ACKNOWLEDGED"
           || verified.state === "PARTIALLY_FILLED");
       if (projectedAWorkingState) {
-        this.orders.set(req.client_order_id, verified);
         return this.waitForResolution(req.client_order_id, verified);
       }
       // Could not obtain authoritative quantity/price for a terminal-looking placement — either
@@ -814,21 +812,44 @@ export class DhanBrokerAdapter implements BrokerAdapter {
       // a quantity/price. RETAIN UNCERTAINTY: quarantine so dependent entries are blocked, rather
       // than fabricating a fill or a rejection. The durable reconciler resolves it against
       // confirmed evidence.
-      current.state = "RECONCILIATION_REQUIRED";
-      current.reject_reason =
+      const reason =
         `Dhan reported '${placed.orderStatus}' at placement but no authoritative cumulative quantity/price could be read; ` +
         "the execution is unproven and must be reconciled before any dependent leg.";
-      current.updated_at = Date.now();
-      this.orders.set(req.client_order_id, current);
-      throw new BrokerAmbiguousSubmitError(req.client_order_id, current.reject_reason, placed, cloneOrder(current));
+      const quarantined = this.quarantine(req.client_order_id, order, reason);
+      throw new BrokerAmbiguousSubmitError(req.client_order_id, reason, placed, cloneOrder(quarantined));
     }
 
     // A non-terminal placement (TRANSIT / PENDING): the order is working. Seed the provisional
     // acknowledged/open state and let waitForResolution poll to a VERIFIED terminal outcome,
     // where every quantity comes from an order/trade read via project().
-    order.state = dhanOrderState(placed.orderStatus, 0, req.quantity);
-    this.orders.set(req.client_order_id, order);
-    return this.waitForResolution(req.client_order_id, order);
+    //
+    // COMMITTED THROUGH THE MAP. `order` was built before the POST; a socket fill that arrived while
+    // the POST response was in flight is already merged into the map entry, and writing `order`
+    // blind would replace it with "ACKNOWLEDGED/OPEN, filled 0". The placement label is a WORKING
+    // state, so the merge cannot use it to rewind a stream-confirmed terminal state either.
+    const acknowledged = this.commit(req.client_order_id, {
+      ...cloneOrder(order),
+      state: dhanOrderState(placed.orderStatus, 0, req.quantity),
+      updated_at: Date.now(),
+    });
+    return this.waitForResolution(req.client_order_id, acknowledged);
+  }
+
+  /**
+   * Move the LATEST accepted state to RECONCILIATION_REQUIRED.
+   *
+   * A confirmed TERMINAL state is left alone: quarantining an order the broker has already resolved
+   * would manufacture uncertainty and send a settled order back through recovery.
+   */
+  private quarantine(clientOrderId: string, fallback: BrokerOrder, reason: string): BrokerOrder {
+    const current = this.orders.get(clientOrderId) ?? fallback;
+    if (isBrokerOrderTerminal(current.state)) return current;
+    return this.commit(clientOrderId, {
+      ...cloneOrder(current),
+      state: "RECONCILIATION_REQUIRED",
+      reject_reason: reason,
+      updated_at: Date.now(),
+    });
   }
 
   /**
@@ -872,11 +893,20 @@ export class DhanBrokerAdapter implements BrokerAdapter {
   private async reconcileByCorrelation(
     req: BrokerOrderRequest,
     correlationId: string,
-  ): Promise<BrokerOrder | null> {
+  ): Promise<{ order: BrokerOrder; options: BrokerOrderMergeOptions } | null> {
     const found = await this.call(() => this.client.getOrderByCorrelationId(correlationId));
     if (!found) return null;
     const fills = await this.fetchFills(found.orderId);
-    return this.project(req, found, correlationId, fills);
+    // ── NO AWAIT BEYOND THIS POINT ─────────────────────────────────────────────────────────────
+    // The template used to be the REQUEST, whose `priorFilled` is 0, so this path had NO monotonic
+    // floor at all: a lookup that came back with a lower (or absent) quantity than a stream event had
+    // already proven would silently reduce exposure. The template is now the latest ACCEPTED state
+    // when there is one, re-read after both awaits.
+    const template = this.orders.get(req.client_order_id) ?? req;
+    return {
+      order: this.project(template, found, correlationId, fills),
+      options: { observedCumulativeQty: readCumulativeQuantity(found).value },
+    };
   }
 
   /** Poll until terminal, then protectively cancel if the deadline passes. */
@@ -944,16 +974,17 @@ export class DhanBrokerAdapter implements BrokerAdapter {
   ): Promise<BrokerOrder> {
     const order = this.orders.get(clientOrderId) ?? current;
     if (order.broker_order_id) {
-      order.state = "CANCEL_REQUESTED";
-      order.updated_at = Date.now();
-      this.orders.set(clientOrderId, order);
+      const brokerOrderId = order.broker_order_id;
+      // Written THROUGH the map rather than mutated in place: an in-place mutation would apply to a
+      // detached object if a stream observation replaced the map entry during the DELETE below.
+      this.commit(clientOrderId, { ...cloneOrder(order), state: "CANCEL_REQUESTED", updated_at: Date.now() });
       // CANCEL REQUESTED. Opens cancel_request_to_terminal_ms — the measured span that sizes
       // paper's cancel-vs-fill race window. Marked before the DELETE, because the race begins the
       // moment we commit to cancelling.
       this.mark(clientOrderId, "cancel_requested");
       try {
         await this.call(
-          () => this.client.cancelOrder(order.broker_order_id!, {
+          () => this.client.cancelOrder(brokerOrderId, {
             // A protective cancel is bounded by its OWN confirmation window, started here so the
             // pacer wait counts against it (Defect D).
             deadline: Deadline.in(this.cfg.cancelTimeoutMs, () => this.mono()),
@@ -984,13 +1015,13 @@ export class DhanBrokerAdapter implements BrokerAdapter {
       const refreshed = await this.refresh(clientOrderId);
       if (refreshed && isBrokerOrderTerminal(refreshed.state)) return cloneOrder(refreshed);
     }
-    const quarantined = this.orders.get(clientOrderId) ?? order;
-    quarantined.state = "RECONCILIATION_REQUIRED";
-    quarantined.reject_reason =
-      "Dhan did not confirm a terminal state after a protective cancel within the deadline.";
-    quarantined.updated_at = Date.now();
-    this.orders.set(clientOrderId, quarantined);
-    return cloneOrder(quarantined);
+    // A stream event may have confirmed a terminal outcome between the last poll and here; the
+    // quarantine helper leaves a confirmed terminal state alone rather than manufacturing doubt.
+    return cloneOrder(this.quarantine(
+      clientOrderId,
+      order,
+      "Dhan did not confirm a terminal state after a protective cancel within the deadline.",
+    ));
   }
 
   /**
@@ -1014,7 +1045,32 @@ export class DhanBrokerAdapter implements BrokerAdapter {
     }
   }
 
-  /** Re-read one order and update the session projection. */
+  /**
+   * COMMIT ONE OBSERVATION — the ONLY way a REST path may write the session projection.
+   *
+   * See kiteBrokerAdapter.commit and brokerOrderMerge.ts. The read-merge-write below contains NO
+   * `await`, so it runs in a single JS tick and is atomic with respect to `applyOrderUpdate`.
+   * Dhan needed this most: `refresh` spans TWO awaits (the order read and the trade-book read), so
+   * its window for a lost update was the widest in the codebase, and its previous monotonic guard
+   * compared against a `known` captured before both of them.
+   */
+  private commit(
+    clientOrderId: string,
+    candidate: BrokerOrder,
+    options?: BrokerOrderMergeOptions,
+  ): BrokerOrder {
+    const merged = mergeBrokerOrderSnapshot(this.orders.get(clientOrderId), candidate, options);
+    this.orders.set(clientOrderId, merged.order);
+    if (merged.order.broker_order_id) {
+      this.clientByBroker.set(merged.order.broker_order_id, clientOrderId);
+    }
+    // TIMING: the broker's CUMULATIVE quantity. The recorder ignores anything that is not an
+    // increase, so re-polling an unchanged order manufactures no extra "fill" events.
+    this.markFill(clientOrderId, merged.order.filled_quantity);
+    return merged.order;
+  }
+
+  /** Re-read one order and merge the result into the session projection. */
   private async refresh(clientOrderId: string): Promise<BrokerOrder | undefined> {
     const known = this.orders.get(clientOrderId);
     if (!known) return undefined;
@@ -1022,34 +1078,27 @@ export class DhanBrokerAdapter implements BrokerAdapter {
       const remote = known.broker_order_id
         ? await this.call(() => this.client.getOrder(known.broker_order_id!))
         : await this.call(() => this.client.getOrderByCorrelationId(this.correlationFor(clientOrderId)));
-      if (!remote) return known;
-      const fills = await this.fetchFills(remote.orderId);
-      const projected = this.project(known, remote, known.tag ?? this.correlationFor(clientOrderId), fills);
-      // MONOTONIC CUMULATIVE FILLS (Defect 2). A later read must NEVER regress the observed
-      // cumulative quantity: overlapping REST reads and (in production) stream events can arrive
-      // out of order, and a fleeting lower `filledQty` from the order book would otherwise
-      // rewrite exposure downward and could turn a real fill back into "nothing executed". Once
-      // a quantity is confirmed it can only stay the same or grow.
-      if (projected.filled_quantity < known.filled_quantity) {
-        projected.filled_quantity = known.filled_quantity;
-        projected.pending_quantity = Math.max(0, known.quantity - known.filled_quantity);
-        // Keep the richer of the two fill records so a dropped trade-book row cannot erase a
-        // fill we already saw (deduplicated by fill_id at consumption).
-        if (projected.fills.length < known.fills.length) projected.fills = known.fills.map((f) => ({ ...f }));
-        if (projected.average_price === null && known.average_price !== null) {
-          projected.average_price = known.average_price;
-        }
+      if (!remote) {
+        // MISSING-RESPONSE BRANCH: return the LATEST accepted state, not the pre-await snapshot.
+        return this.orders.get(clientOrderId) ?? known;
       }
-      // TIMING: the broker's CUMULATIVE quantity. The recorder ignores anything that is not an
-      // increase, so re-polling an unchanged order manufactures no extra "fill" events.
-      this.markFill(clientOrderId, projected.filled_quantity);
-      this.orders.set(clientOrderId, projected);
-      if (projected.broker_order_id) this.clientByBroker.set(projected.broker_order_id, clientOrderId);
-      return projected;
+      const fills = await this.fetchFills(remote.orderId);
+      // ── NO AWAIT BEYOND THIS POINT ─────────────────────────────────────────────────────────
+      // Re-read AFTER both awaits. This is both the merge BASE (so `priorFilled` is current, which
+      // is what makes the evidence reader's monotonic floor meaningful) and the write target.
+      const current = this.orders.get(clientOrderId) ?? known;
+      const projected = this.project(current, remote, current.tag ?? this.correlationFor(clientOrderId), fills);
+      // The RAW reading is handed to the merge so a payload describing a smaller fill cannot donate
+      // its average price to a larger accepted cumulative quantity. This replaces the old inline
+      // monotonic block, which compared against a snapshot captured two awaits earlier.
+      return this.commit(clientOrderId, projected, {
+        observedCumulativeQty: readCumulativeQuantity(remote).value,
+      });
     } catch (err) {
       if (err instanceof DhanAuthError) throw err;
-      // A transient read failure must not rewrite state.
-      return known;
+      // A transient read failure must not rewrite state — and must not report a PRE-AWAIT snapshot
+      // as current, which would discard a stream observation applied during the failed read.
+      return this.orders.get(clientOrderId) ?? known;
     }
   }
 
@@ -1221,12 +1270,17 @@ export class DhanBrokerAdapter implements BrokerAdapter {
       }),
       "order_modify",
     );
-    known.pricing = { ...known.pricing, limit_price: request.limit_price };
-    known.limit_price = request.limit_price;
-    known.updated_at = Date.now();
-    this.orders.set(clientOrderId, known);
+    // `known` is the PRE-AWAIT snapshot. The new limit price is applied to the LATEST accepted state
+    // instead, so a fill observed during the modify round trip is not overwritten.
+    const current = this.orders.get(clientOrderId) ?? known;
+    const repriced = this.commit(clientOrderId, {
+      ...cloneOrder(current),
+      pricing: { ...current.pricing, limit_price: request.limit_price },
+      limit_price: request.limit_price,
+      updated_at: Date.now(),
+    });
     const refreshed = await this.refresh(clientOrderId);
-    return cloneOrder(refreshed ?? known);
+    return cloneOrder(refreshed ?? repriced);
   }
 
   async getOrder(clientOrderId: string): Promise<BrokerOrder | undefined> {
@@ -1238,6 +1292,10 @@ export class DhanBrokerAdapter implements BrokerAdapter {
   async listOrders(): Promise<BrokerOrder[]> {
     this.ensureEnabled();
     const remote = await this.call(() => this.client.listOrders());
+    // ── NO AWAIT BEYOND THIS POINT ─────────────────────────────────────────────────────────────
+    // The map reads below are post-await, but the PAYLOAD predates any stream event that landed
+    // during the round trip, and this loop previously wrote it back with no monotonic or terminal
+    // guard at all. Every write now goes through the merge.
     const out: BrokerOrder[] = [];
     for (const order of remote) {
       const clientId =
@@ -1246,8 +1304,9 @@ export class DhanBrokerAdapter implements BrokerAdapter {
       const known = clientId ? this.orders.get(clientId) : undefined;
       if (known) {
         const projected = this.project(known, order, known.tag ?? "", []);
-        this.orders.set(known.client_order_id, projected);
-        out.push(cloneOrder(projected));
+        out.push(cloneOrder(this.commit(known.client_order_id, projected, {
+          observedCumulativeQty: readCumulativeQuantity(order).value,
+        })));
         continue;
       }
       // An order this session did not create. Surfaced with an explicit ORPHAN
@@ -1312,10 +1371,11 @@ export class DhanBrokerAdapter implements BrokerAdapter {
       },
       limit_price: intent.limit_price,
     };
-    this.orders.set(intent.client_order_id, adopted);
-    if (adopted.broker_order_id) this.clientByBroker.set(adopted.broker_order_id, intent.client_order_id);
     this.clientByCorrelation.set(correlation, intent.client_order_id);
-    return cloneOrder(adopted);
+    // ADOPTION MERGES. An unconditional write discarded a session entry that a stream observation
+    // had already advanced — restart adoption and a live stream can overlap. Every durable immutable
+    // field is still asserted above before we get here.
+    return cloneOrder(this.commit(intent.client_order_id, adopted));
   }
 
   async margins(): Promise<BrokerMargin | null> {

@@ -14,7 +14,7 @@
  * including the expected-state CAS the safety argument depends on).
  */
 
-import { CentralBoxExecutionGateway } from "../../dist/box/executionGateway.js";
+import { CentralBoxExecutionGateway, checkedFeedBlockReason } from "../../dist/box/executionGateway.js";
 import { BoxOrderManager } from "../../dist/box/orderManager.js";
 import { BoxQuoteStore } from "../../dist/box/quotes.js";
 import { entrySideFor } from "../../dist/box/math.js";
@@ -245,6 +245,27 @@ export async function liveStack({
    */
   clock: gatewayClock = { now: () => NOW },
   /**
+   * Feed warmth per token. Defaults to "every token is warm", which is what an entry test wants.
+   *
+   * A test that must reproduce a PARTIALLY AVAILABLE book passes a mutable predicate (or flips a
+   * shared flag after the entry) so exactly one leg looks unusable to `precheck`. This is the first
+   * of `precheck`'s four refusal conditions and the cheapest one to steer, so it stands in for
+   * "this leg has no current executable depth" without disturbing the other three legs' books.
+   */
+  isTokenWarm = () => true,
+  /**
+   * Wire the manager's CHECKPOINT 3 / CHECKPOINT 5 current-feed re-validation, exactly as
+   * src/box/engine.ts does.
+   *
+   * OPT-IN, and default OFF, deliberately. `checkedFeedBlockReason` fails CLOSED on a missing
+   * stamp, and several existing tests call `manager.submit(request)` directly with no stamp as a
+   * shortcut to exercise the manager's own gating (priority, ownership, breaker). Production never
+   * does that — every live submit path stamps its request via `precheck` first — so switching this
+   * on by default would make those tests fail for a reason they are not about. A test that wants to
+   * assert send-boundary behaviour turns it on.
+   */
+  feedRevalidation = false,
+  /**
    * Durable persistence. Defaults to the in-memory CAS model for fast unit coverage; the MongoDB
    * integration suite injects the PRODUCTION `boxOrderIntentPersistence` here, so the very same
    * gateway/manager wiring runs against the real Mongoose model and the real update pipeline.
@@ -260,6 +281,18 @@ export async function liveStack({
   const adapter = recordingAdapter(adapterOptions);
   const violations = [];
   let clock = NOW;
+  const FEED_GENERATION = 7;
+  // The resolved config, hoisted so the manager's send-boundary validator and the gateway share
+  // exactly one set of feed thresholds — as they do in production.
+  const boxCfg = cfg({
+    executionMode: "live",
+    liveTradingEnabled: true,
+    queueModel: "none",
+    liveMaxChaseTicks: 2,
+    legMaxChaseTicks: 2,
+    unwindMaxChaseTicks: 5,
+    ...config,
+  });
   const manager = new BoxOrderManager({
     adapter,
     persistence,
@@ -267,6 +300,25 @@ export async function liveStack({
     controls: { entryEnabled: true, liveOrderEnabled: true, emergencyFlatten: true },
     clock: { now: () => clock++ },
     istDayKey: () => "2026-09-02",
+    // CHECKPOINT 3 (at dequeue) and CHECKPOINT 5 (immediately pre-POST), wired EXACTLY as
+    // src/box/engine.ts wires them. Without this the manager's `checkedFeedBlockReason` returns
+    // null and the harness silently omits the final send-boundary authority — so a test asserting
+    // "the feed died while this leg was queued and it was refused" would be measuring nothing.
+    ...(feedRevalidation
+      ? {
+        revalidateQueuedRequest: (request, stamp) => checkedFeedBlockReason({
+          request,
+          stamp,
+          currentGeneration: FEED_GENERATION,
+          tokenCurrent: isTokenWarm(request.token),
+          quote: quotes.get(request.token),
+          now: gatewayClock.now(),
+          quoteMaxAgeMs: boxCfg.quoteMaxAgeMs,
+          queueModel: boxCfg.queueModel,
+          queueLiquidityHaircutPct: boxCfg.queueLiquidityHaircutPct,
+        }),
+      }
+      : {}),
   });
   manager.seedLimits({ tradingDay: "2026-09-02" });
   manager.setFeedHealthy(true);
@@ -276,15 +328,7 @@ export async function liveStack({
   manager.invariantViolation = (reason) => { violations.push(reason); return originalViolation(reason); };
 
   const gateway = new CentralBoxExecutionGateway({
-    cfg: cfg({
-      executionMode: "live",
-      liveTradingEnabled: true,
-      queueModel: "none",
-      liveMaxChaseTicks: 2,
-      legMaxChaseTicks: 2,
-      unwindMaxChaseTicks: 5,
-      ...config,
-    }),
+    cfg: boxCfg,
     simulator: {
       hasCapacity: () => false,
       estimateExecutableExit: () => [],
@@ -294,8 +338,8 @@ export async function liveStack({
     manager,
     broker: () => "zerodha",
     allocateTradeId: () => "trade-live-1",
-    isTokenWarm: () => true,
-    feedGeneration: () => 7,
+    isTokenWarm: (token) => isTokenWarm(token),
+    feedGeneration: () => FEED_GENERATION,
     now: () => gatewayClock.now(),
     chargeTotal: () => 0,
   });

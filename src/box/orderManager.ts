@@ -8,6 +8,7 @@ import {
   type BrokerOrderRequest,
   type BrokerOrderState,
 } from "./brokerAdapter.js";
+import { mergeBrokerOrderSnapshot } from "./brokerOrderMerge.js";
 import { BoundedTtlCache } from "../boundedCache.js";
 import type { BoxConfig } from "./config.js";
 import { CumulativeFillLedger } from "./orderLifecycle.js";
@@ -1908,8 +1909,14 @@ export class BoxOrderManager {
   private async executeCancel(action: CancelQueueAction): Promise<void> {
     try {
       const order = await this.deps.adapter.cancelOrder(action.intent.client_order_id);
-      if (order) await this.persistOrder(action.intent, order, "protective cancel reconciliation");
-      action.resolve(order);
+      if (!order) {
+        action.resolve(order);
+        return;
+      }
+      const durable = await this.persistOrder(action.intent, order, "protective cancel reconciliation");
+      // A cancel that raced a fill must report the DURABLE quantity: this snapshot decides whether a
+      // hedge is still needed and how much residual is outstanding.
+      action.resolve(this.authoritativeOrder(order, durable));
     } catch (error) {
       action.reject(error);
     }
@@ -1940,8 +1947,8 @@ export class BoxOrderManager {
         // hide or rewrite an identity that may already exist at the broker.
         const reconciled = await this.deps.adapter.getOrder(request.client_order_id);
         if (!reconciled) throw new Error("Existing durable intent requires reconciliation before resubmit.");
-        await this.persistOrder(intent, reconciled, "existing intent reconciled before resubmit");
-        action.resolve(reconciled);
+        const durable = await this.persistOrder(intent, reconciled, "existing intent reconciled before resubmit");
+        action.resolve(this.authoritativeOrder(reconciled, durable));
         return;
       }
 
@@ -2102,32 +2109,37 @@ export class BoxOrderManager {
         return;
       }
 
+      // The DURABLE row is the authority the caller is resolved with — see authoritativeOrder().
+      let accepted = order;
       if (RECONCILE_STATES.has(order.state)) {
-        await this.persistOrder(intent, order, "adapter returned uncertain state; no retry");
+        const durable = await this.persistOrder(intent, order, "adapter returned uncertain state; no retry");
+        accepted = this.authoritativeOrder(order, durable);
         this.noteFailure("adapter returned uncertain order state");
-        hedgeFailureReason = `broker state ${order.state} is not proof of a hedge`;
+        hedgeFailureReason = `broker state ${accepted.state} is not proof of a hedge`;
         // UNKNOWN/RECONCILIATION_REQUIRED is not a terminal proven quantity. Deliberately leave
         // `terminalOrder` null so the ledger records no coverage: an unprovable hedge must never
         // authorise the naked SELL that depends on it.
       } else {
-        await this.persistOrder(intent, order, "adapter order snapshot");
+        const durable = await this.persistOrder(intent, order, "adapter order snapshot");
+        accepted = this.authoritativeOrder(order, durable);
         // AUTHORITATIVE SNAPSHOT for coverage. Whatever the state — COMPLETE, CANCELLED, OPEN,
-        // PARTIALLY_FILLED — this is the broker's own report of the leg, and the ledger decides
-        // coverage from its terminal-ness and filled quantity, NOT from whether we named it a
-        // failure. This is the crux of the fix: a CANCELLED/zero-fill hedge now yields zero proven
-        // coverage and blocks the dependent SELL, instead of silently authorising it.
-        terminalOrder = order;
-        if (order.state === "REJECTED") {
+        // PARTIALLY_FILLED — this is the broker's own report of the leg reconciled with the durable
+        // row, and the ledger decides coverage from its terminal-ness and filled quantity, NOT from
+        // whether we named it a failure. This is the crux of the fix: a CANCELLED/zero-fill hedge
+        // now yields zero proven coverage and blocks the dependent SELL, instead of silently
+        // authorising it.
+        terminalOrder = accepted;
+        if (accepted.state === "REJECTED") {
           this.rejects++;
-          this.noteBrokerReject(order, order.reject_reason ?? "broker rejected order");
+          this.noteBrokerReject(accepted, accepted.reject_reason ?? "broker rejected order");
           this.noteFailure("broker rejected order");
-          hedgeFailureReason = order.reject_reason ?? "broker rejected order";
-        } else if (order.state === "COMPLETE") {
+          hedgeFailureReason = accepted.reject_reason ?? "broker rejected order";
+        } else if (accepted.state === "COMPLETE") {
           this.consecutiveFailures = 0;
         }
       }
       this.evaluateLimits();
-      action.resolve(order);
+      action.resolve(accepted);
     } catch (error) {
       this.health.persistence = "unhealthy";
       this.noteFailure("order intent persistence failure");
@@ -2198,8 +2210,8 @@ export class BoxOrderManager {
     this.knownIntents.set(current.client_order_id, current);
     const reconciled = await this.deps.adapter.getOrder(current.client_order_id);
     if (reconciled) {
-      await this.persistOrder(current, reconciled, "concurrent durable submission owner reconciled");
-      action.resolve(reconciled);
+      const durable = await this.persistOrder(current, reconciled, "concurrent durable submission owner reconciled");
+      action.resolve(this.authoritativeOrder(reconciled, durable));
       return;
     }
     if (!isBrokerOrderTerminal(current.state)) this.unknownOrders++;
@@ -2518,6 +2530,45 @@ export class BoxOrderManager {
       }
       throw error;
     }
+  }
+
+  /**
+   * Reconcile the adapter's snapshot with the DURABLE row that `persistOrder` returned.
+   *
+   * WHY THIS EXISTS. `persistOrder` returns the durable intent, and that row can legitimately hold a
+   * HIGHER cumulative quantity than the snapshot just written: the PostgreSQL compare-and-set
+   * refuses a regressing `filled_quantity` and returns the current row instead, which is exactly
+   * what happens when a stream-fed reconcile pass has already persisted more. Every caller but one
+   * discarded that return value and resolved the ORIGINAL adapter snapshot, so an under-reported
+   * quantity reached:
+   *   • the hedge-coverage ledger (a dependent SELL judged against too little proven cover),
+   *   • `entryLegOutcomes` / gateway results,
+   *   • unwind sizing (`result.filled_quantity`), which then unwinds LESS than is actually held,
+   *   • residual classification and downstream exposure arithmetic.
+   *
+   * Attribution was never affected — `durableFillDelta` already reads the pre-image the locked row
+   * recorded — so this closes the reporting gap only. It does not relax any durable guard.
+   *
+   * The same merge authority as the adapters is reused, so "authoritative" means the same thing at
+   * every layer: monotonic cumulative quantity, no price borrowed from a smaller fill, no terminal
+   * state reopened, and contradictions routed to reconciliation rather than silently resolved.
+   */
+  private authoritativeOrder(order: BrokerOrder, durable: IBoxOrderIntent): BrokerOrder {
+    const durableView: BrokerOrder = {
+      ...order,
+      broker_order_id: durable.broker_order_id,
+      state: durable.state,
+      filled_quantity: durable.filled_quantity,
+      pending_quantity: Math.max(0, durable.quantity - durable.filled_quantity),
+      average_price: durable.average_price,
+      reject_family: (durable.reject_family as BrokerOrder["reject_family"]) ?? null,
+      reject_reason: durable.reject_reason,
+      updated_at: durable.updated_at.getTime(),
+    };
+    const merged = mergeBrokerOrderSnapshot(order, durableView, {
+      observedCumulativeQty: durable.filled_quantity,
+    });
+    return merged.order;
   }
 
   private async transition(
