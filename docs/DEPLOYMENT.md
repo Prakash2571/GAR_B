@@ -32,6 +32,9 @@ Two behaviours worth knowing before the first run:
 - **PostgreSQL is verified in preflight**, before `npm ci` or any build. A release
   that cannot reach the database stops while the host is still untouched, and the
   error names the connection string with the password masked.
+- **`DATABASE_URL` is linted as a string first**, because the node driver and the
+  PostgreSQL command-line tools do not parse it the same way. See the warning below —
+  this has already caused one production release failure.
 - **`pg_dump` runs as the invoking user, not as root.** Only the file write into
   `BACKUP_DIR` uses `sudo` (installed `0600`). Running the dump itself through
   `sudo` loses this user's PostgreSQL identity — peer/ident auth, `~/.pgpass`,
@@ -42,6 +45,38 @@ Two behaviours worth knowing before the first run:
 or while a database problem is being fixed separately. It does not pull, rebuild
 or restart GAR_B — but it still refuses to publish a frontend whose pinned
 contract digest differs from the one the **running** backend serves.
+
+### Percent-encode special characters in the DATABASE_URL password
+
+> A password containing `@` makes the backend work and every PostgreSQL
+> command-line tool fail. This is not a bug in either one — they disagree by design.
+
+`pg.Pool({ connectionString })` in [`src/pg/pool.ts`](../src/pg/pool.ts) goes through
+`pg-connection-string`, which follows the WHATWG URL rules and splits the userinfo at
+the **last** `@`. `pg_dump`, `psql` and `pg_isready` use libpq, which stops at the
+**first** `@` and reads everything after it as the host:
+
+| `DATABASE_URL` | node driver sees | libpq sees |
+| --- | --- | --- |
+| `postgresql://gts:pw@@10.0.0.1/gts` | host `10.0.0.1`, password `pw@` | host `@10.0.0.1` — **fails** |
+| `postgresql://gts:pw%40@10.0.0.1/gts` | host `10.0.0.1`, password `pw@` | host `10.0.0.1`, password `pw@` |
+
+So a release can fail at the backup step on a host whose backend has been serving
+traffic for weeks. Encode these characters in the **password**:
+
+| character | write as |     | character | write as |
+| --- | --- | --- | --- | --- |
+| `@` | `%40` |  | `#` | `%23` |
+| `/` | `%2F` |  | `?` | `%3F` |
+| `%` | `%25` |  | space | `%20` |
+
+Encoding does not change the password — both parsers decode the escapes, so the
+backend keeps connecting with the identical credential. `start.sh` refuses the
+release with a named diagnosis if any of these are unencoded, without attempting a
+connection and without printing the password.
+
+To avoid the question entirely, keep the password out of the URL: use a local Unix
+socket with peer authentication (`postgres:///strikedge`, §1) or a `~/.pgpass` entry.
 
 ## 1. PostgreSQL installation, database and role
 

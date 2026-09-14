@@ -356,13 +356,28 @@ fi
 
 # Print a connection string with the password removed, so a failure can name the URL it used
 # without putting the credential into a terminal, a log file or a screenshot.
+#
+# STRING SURGERY, NOT `new URL(...).href`. The WHATWG parser silently REPAIRS a malformed URL — it
+# re-encodes a stray '@' in the password as %40 — so printing its href would display a perfectly
+# valid URL while reporting that the URL is invalid, hiding the exact defect being diagnosed. The
+# password is masked from the first ':' to the FIRST '@', which is where libpq ends the userinfo, so
+# a second unencoded '@' stays visible in the output instead of being absorbed into the mask.
 redact_url() {
   RAW_URL="$1" node <<'NODE' 2>/dev/null || printf '%s' "the DATABASE_URL in .env"
-try {
-  const u = new URL(process.env.RAW_URL);
-  if (u.password) u.password = "***";
-  process.stdout.write(u.href);
-} catch { process.stdout.write("(unparseable DATABASE_URL)"); }
+const raw = process.env.RAW_URL ?? "";
+const i = raw.indexOf("://");
+if (i < 0) { process.stdout.write("(not a URI — keyword/value conninfo?)"); }
+else {
+  const head = raw.slice(0, i + 3);
+  const rest = raw.slice(i + 3);
+  let end = rest.length;
+  for (const ch of ["/", "?"]) { const j = rest.indexOf(ch); if (j >= 0 && j < end) end = j; }
+  const auth = rest.slice(0, end), tail = rest.slice(end);
+  const colon = auth.indexOf(":"), at = auth.indexOf("@");
+  process.stdout.write(colon >= 0 && at > colon
+    ? head + auth.slice(0, colon + 1) + "***" + auth.slice(at) + tail
+    : head + auth + tail);
+}
 NODE
 }
 
@@ -378,6 +393,133 @@ NODE
 # proves more than an open port: it proves the server answers, the credentials are accepted, and
 # the database exists.
 if ! (( FRONTEND_ONLY )); then
+  # ── the URL is linted as a STRING first, before anything tries to connect ───────────────────
+  #
+  # The node driver and the PostgreSQL command-line tools DO NOT parse this URL the same way, and a
+  # password containing '@' is exactly where they disagree:
+  #
+  #   * src/pg/pool.ts passes DATABASE_URL to pg.Pool({connectionString}), which follows the WHATWG
+  #     URL rules and splits the userinfo at the LAST '@'. It reads such a password correctly.
+  #   * pg_dump, psql and pg_isready use libpq, which stops at the FIRST '@' and reads everything
+  #     after it as the HOST.
+  #
+  # The result is a release that looks impossible: the backend has been serving traffic for weeks,
+  # and the release's backup step cannot connect at all. A parse bug must not be reported as "the
+  # server is down", so the shape is diagnosed by name here.
+  #
+  # Nothing secret is printed — never the password, only which of its characters need encoding.
+  db_lint="$(RAW_URL="$DATABASE_URL" node <<'NODE'
+const raw = process.env.RAW_URL ?? "";
+const notes = [];      // advisory
+const faults = [];     // certain to break libpq
+const enc = (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0");
+// Characters that terminate or re-delimit the userinfo for libpq. A password may contain any of
+// them, but only percent-encoded.
+const MUST_ENCODE = ["@", "/", "?", "#", "[", "]", " "];
+
+const m = /^(postgres(?:ql)?):\/\/([\s\S]*)$/i.exec(raw);
+if (!m) {
+  if (/^\s*[A-Za-z_]+\s*=/.test(raw)) {
+    notes.push("this is a keyword/value conninfo string, not a URI — its shape is not linted here.");
+  } else {
+    faults.push(`does not begin with postgres:// or postgresql://, so libpq will not read it as a connection URI.`);
+  }
+} else {
+  const rest = m[2];
+  let end = rest.length;
+  for (const ch of ["/", "?"]) { const i = rest.indexOf(ch); if (i >= 0 && i < end) end = i; }
+  const authority = rest.slice(0, end);
+  const dbname = rest.slice(end).replace(/^\//, "").split("?")[0];
+  const atCount = (authority.match(/@/g) || []).length;
+
+  if (atCount >= 2) {
+    // THE case this lint exists for.
+    const first = authority.indexOf("@");
+    const libpqHost = authority.slice(first + 1).replace(/:\d*$/, "");
+    const badChars = [...new Set([...authority.slice(authority.indexOf(":") + 1, authority.lastIndexOf("@"))]
+      .filter((c) => MUST_ENCODE.includes(c)))];
+    faults.push(
+      `the userinfo section contains ${atCount} unencoded '@' characters.\n` +
+      `  libpq stops at the FIRST one, so pg_dump/psql read the host as:  ${libpqHost}\n` +
+      `  which is not a host at all — hence a connection that cannot possibly succeed.\n` +
+      `  The node driver splits at the LAST '@' instead, which is why the backend still works.\n` +
+      `  Percent-encode ${badChars.map((c) => `'${c}' as ${enc(c)}`).join(", ") || "the offending characters"} in the PASSWORD.`
+    );
+  } else {
+    const at = authority.indexOf("@");
+    const userinfo = at >= 0 ? authority.slice(0, at) : "";
+    let hostport = at >= 0 ? authority.slice(at + 1) : authority;
+    const colon = userinfo.indexOf(":");
+    const password = colon >= 0 ? userinfo.slice(colon + 1) : "";
+    const user = colon >= 0 ? userinfo.slice(0, colon) : userinfo;
+
+    const bad = [...new Set([...password].filter((c) => MUST_ENCODE.includes(c)))];
+    if (bad.length) {
+      faults.push(`the password contains unencoded ${bad.map((c) => `'${c}' (write it as ${enc(c)})`).join(", ")}.`);
+    }
+    // A lone '%' that is not a valid escape is decoded inconsistently between the two parsers.
+    if (/%(?![0-9A-Fa-f]{2})/.test(password)) {
+      faults.push("the password contains a '%' that is not a valid percent-escape. A literal '%' must be written as %25.");
+    }
+
+    // IPv6 literals are bracketed; strip the bracketed part before looking for the port.
+    let host = hostport.startsWith("[")
+      ? hostport.slice(0, hostport.indexOf("]") + 1)
+      : hostport.replace(/:\d*$/, "");
+    const portMatch = hostport.slice(host.length).match(/^:(\d*)$/);
+    const port = portMatch ? (portMatch[1] || "(empty)") : "5432 (default)";
+    let decodedHost = host;
+    try { decodedHost = decodeURIComponent(host); } catch { /* leave as-is */ }
+
+    if (decodedHost.startsWith("/")) {
+      // This is the shape that produces: connection to server on socket "<dir>/.s.PGSQL.<port>"
+      const line = `host resolves to the Unix-socket DIRECTORY ${decodedHost}` +
+        `, so libpq connects to ${decodedHost}/.s.PGSQL.${/^\d+$/.test(port) ? port : "5432"} and never uses TCP.`;
+      if (/^\/(\d{1,3}\.){3}\d{1,3}$/.test(decodedHost) || /^\/localhost$/.test(decodedHost)) {
+        faults.push(line + `\n  A leading '/' in front of an address is almost always a mistake: for TCP write ` +
+          `${decodedHost.slice(1)} with no slash.`);
+      } else {
+        notes.push(line);
+      }
+    } else if (host === "") {
+      notes.push("no host given, so libpq uses its default Unix-socket directory (peer authentication).");
+    } else {
+      notes.push(`host ${decodedHost}, port ${port} over TCP.`);
+    }
+    // A '/' inside the password ends the authority early, so the real '@' lands in what libpq then
+    // reads as the DATABASE NAME. That is the tell, and it is unambiguous.
+    if (dbname.includes("@")) {
+      faults.push("the database-name section contains '@', which means the password contains an unencoded '/'." +
+        "\n  A '/' ends the host section, so everything after it is misread. Write it as %2F.");
+    }
+    // Whatever is left as the host must not still contain a ':' — that means the ':' was not a port
+    // separator, so the split happened in the wrong place.
+    if (!host.startsWith("[") && host.includes(":")) {
+      faults.push(`the host section reads as '${host}', which still contains ':' — that is not a host:port pair.` +
+        "\n  Usually a character in the password ('@', '/' or a space) was not percent-encoded.");
+    }
+    if (user) notes.push(`role ${user}${password ? "" : ", no password in the URL (.pgpass or peer auth)"}.`);
+    if (dbname) notes.push(`database ${dbname}.`); else faults.push("no database name in the URL.");
+  }
+}
+for (const n of notes) console.log("  " + n);
+for (const f of faults) console.log("  PROBLEM: " + f);
+process.exit(faults.length ? 1 : 0);
+NODE
+)" && lint_ok=1 || lint_ok=0
+  [[ -n "$db_lint" ]] && printf '%s\n' "$db_lint" >&2
+  if ! (( lint_ok )); then
+    die "DATABASE_URL is malformed — no connection was attempted and nothing on this host was changed.
+
+    as written (password masked) : $(redact_url "$DATABASE_URL")
+    read from                    : ${GAR_B_DIR}/.env
+
+    Fix the DATABASE_URL line above, then re-run. Percent-encoding the password does NOT change the
+    password: both the node driver and libpq decode the escapes, so the backend keeps working.
+
+    To ship a FRONTEND change while this is being fixed:  ./start.sh --frontend-only"
+  fi
+
   db_err=""
   if have pg_dump; then
     # `-w` (never prompt): without it a missing password makes pg_dump sit waiting on a terminal,
