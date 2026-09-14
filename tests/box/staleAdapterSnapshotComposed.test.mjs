@@ -36,7 +36,7 @@ import assert from "node:assert/strict";
 
 import { BOX_ENTRY_SIDES_BY_DIRECTION } from "../../dist/box/types.js";
 import { entrySubmissionOrder } from "../../dist/box/entrySubmissionOrder.js";
-import { brokerOrderFor, liveStack, runEntry } from "./liveEntryHarness.mjs";
+import { MemoryPersistence, brokerOrderFor, liveStack, runEntry } from "./liveEntryHarness.mjs";
 
 const LOTS = 75;
 
@@ -122,6 +122,29 @@ function postsFor(adapter, role, purpose) {
   return adapter.posts.filter((post) => post.role === role && (!purpose || post.purpose === purpose));
 }
 
+/**
+ * Persistence that also models `repository.updateBoxOrderIntent`'s STATE-PREDECESSOR guard for the
+ * one case this test needs: a row that is already TERMINAL accepts no further transition and the
+ * existing row is returned untouched.
+ *
+ * `INTENT_STATE_PREDECESSORS` is module-private in repository.ts and is deliberately not exported
+ * just to be tested, so the narrow behaviour is modelled here instead of widening production API.
+ */
+class TerminalGuardedPersistence extends MemoryPersistence {
+  async update(clientOrderId, patch, audit, expectedStates) {
+    const current = this.rows.get(clientOrderId);
+    if (current && ["COMPLETE", "CANCELLED", "REJECTED"].includes(current.state) && patch.state !== current.state) {
+      return {
+        intent: structuredClone(current),
+        applied: false,
+        previous_filled_quantity: current.filled_quantity,
+        current_filled_quantity: current.filled_quantity,
+      };
+    }
+    return super.update(clientOrderId, patch, audit, expectedStates);
+  }
+}
+
 for (const direction of ["LONG_BOX", "SHORT_BOX"]) {
   const { hedges, shorts, sides } = geometry(direction);
   const staleHedge = hedges[0];
@@ -189,3 +212,64 @@ for (const direction of ["LONG_BOX", "SHORT_BOX"]) {
     );
   });
 }
+
+
+/* ══════════ breaker accounting must follow the BROKER's verdict, not the merged label ══════════ */
+
+/**
+ * `authoritativeOrder` blends the durable row into the resolved snapshot, which is right for
+ * exposure. But the durable state-predecessor guard can refuse a transition and return the existing
+ * row, so the merged LABEL can differ from what the broker actually said. Branching the reject
+ * accounting on that merged label made a genuine broker rejection invisible to `rejects` and
+ * `consecutiveFailures` — the counters the circuit breaker trips on — whenever the durable row was
+ * already terminal for another reason.
+ */
+test("a broker REJECTION is still counted when the durable row is already terminally CANCELLED", async () => {
+  const persistence = new TerminalGuardedPersistence();
+  let stack;
+  const rejectedRole = geometry("LONG_BOX").hedges[0];
+
+  stack = await liveStack({
+    direction: "LONG_BOX",
+    persistence,
+    adapterOptions: {
+      duringPacing: async (req) => {
+        if (req.role !== rejectedRole || req.purpose !== "ENTRY") return;
+        // A concurrent actor terminalised the row as CANCELLED while this leg was in pacing.
+        const row = persistence.rows.get(req.client_order_id);
+        if (!row) return;
+        row.state = "CANCELLED";
+        row.terminal_at = new Date(row.updated_at);
+        persistence.rows.set(req.client_order_id, row);
+      },
+      submit: async (req) => {
+        if (req.purpose !== "ENTRY") return brokerOrderFor(req, req.quantity, "COMPLETE");
+        if (req.role === rejectedRole) {
+          // The BROKER refused this order outright.
+          const rejected = brokerOrderFor(req, 0, "REJECTED");
+          rejected.reject_family = "margin";
+          rejected.reject_reason = "insufficient margin";
+          return rejected;
+        }
+        return brokerOrderFor(req, req.quantity, "COMPLETE");
+      },
+    },
+  });
+
+  const before = stack.manager.status().rejects;
+  await runEntry(stack);
+  const after = stack.manager.status().rejects;
+
+  // The durable row refused the REJECTED transition, so the merged state is CANCELLED …
+  const row = persistence.rows.get(
+    [...persistence.rows.keys()].find((k) => k.includes(rejectedRole)),
+  );
+  assert.equal(row.state, "CANCELLED", "fixture: the durable guard refused the transition");
+  // … but the broker DID reject us, and the breaker must hear about it.
+  assert.equal(
+    after,
+    before + 1,
+    "a broker rejection must be counted even when the durable label differs; otherwise it never " +
+      "reaches the reject limit or the consecutive-failure breaker",
+  );
+});

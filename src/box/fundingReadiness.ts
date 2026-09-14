@@ -285,6 +285,14 @@ const REASON_DETAIL: Readonly<Record<EconomicRefusalReason, string>> = {
  * Emitted ONLY when a gate is enabled and the last decision refused. Disabled gates produce NO
  * blocker — see the module header for why that is deliberate — and every blocker is `scope: "entry"`
  * so risk reduction is structurally unaffected.
+ *
+ * STALENESS, STATED HONESTLY. The input derives from the gateway's LAST economic decision, which is
+ * retained until the next entry is evaluated. So this reports "the most recent entry was refused on
+ * funding grounds", not "an entry attempted right now would be refused" — the live entry gate is the
+ * stream/permission table, not this decision. The two are usually the same (funds do not appear
+ * between candidates) and erring toward reporting a refusal is the safe direction, but a surface
+ * MUST NOT present this as a real-time enforcement state. `evaluated_at` is published so a reader can
+ * see how old the verdict is.
  */
 export function fundingReadinessBlockers(readiness: FundingReadiness): ReadinessBlocker[] {
   if (readiness.status !== "refused") return [];

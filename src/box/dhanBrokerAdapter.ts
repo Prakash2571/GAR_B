@@ -1061,7 +1061,12 @@ export class DhanBrokerAdapter implements BrokerAdapter {
   ): BrokerOrder {
     const merged = mergeBrokerOrderSnapshot(this.orders.get(clientOrderId), candidate, options);
     this.orders.set(clientOrderId, merged.order);
-    if (merged.order.broker_order_id) {
+    if (merged.conflict !== null) {
+      // NEVER SILENT — see the Kite adapter's counterpart for the reasoning.
+      console.warn(`[Dhan] execution evidence conflict for ${clientOrderId}: ${merged.conflict}`);
+    }
+    // A CONFLICTING broker id is deliberately NOT registered: it belongs to a different broker order.
+    if (merged.order.broker_order_id && merged.conflict === null) {
       this.clientByBroker.set(merged.order.broker_order_id, clientOrderId);
     }
     // TIMING: the broker's CUMULATIVE quantity. The recorder ignores anything that is not an

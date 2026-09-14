@@ -498,6 +498,27 @@ export class BoxPositionMonitor {
       return;
     }
 
+    // ATTEMPT-CADENCE THROTTLE FOR A STILL-WHOLE BOX.
+    //
+    // The PARTIALLY_EXITED branch above is throttled, but a box whose admitted legs all came back
+    // with ZERO fill never becomes PARTIALLY_EXITED: it stays here, `OPEN`. That was harmless while
+    // the liquidity gate demanded EVERY leg be executable, because a book bad enough to close nothing
+    // usually failed the gate too. Now that live exits proceed when only SOME legs are executable, a
+    // single healthy book would re-fire the whole attempt on every monitor cycle — a fresh
+    // `stableAttemptId`, hence a fresh durable intent and a fresh POST per admitted leg, indefinitely.
+    //
+    // The same throttle is therefore applied here. It bounds retry CADENCE only: nothing about which
+    // legs are eligible changes.
+    //
+    // The EXPIRY-SAFETY WINDOW is exempt, and the exemption keys on the WINDOW rather than on the
+    // reason name. Inside the window a box that has also converged is named EDGE_CONVERGED, so
+    // testing the reason would have thrown away the exemption in exactly the case where the position
+    // both can and must be closed. A position that has to be flat before expiry cannot be made to wait.
+    if (!expirySafety && this.deps.cfg.executionMode === "live") {
+      const throttle = Math.max(250, this.deps.cfg.legTimeoutMs);
+      if (now - (pos.last_exit_attempt_at ?? 0) < throttle) return;
+    }
+
     // For a convergence/profit exit the net P&L must still be genuinely positive.
     // Expiry safety overrides profitability but still refuses invented prices.
     if (reason !== "EXPIRY_SAFETY") {

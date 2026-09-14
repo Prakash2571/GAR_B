@@ -133,6 +133,24 @@ interface ExitWaveOutcome {
  * generation. A newer book may proceed only when it still executes the immutable
  * quantity within the immutable bounded LIMIT; generation changes always refuse.
  */
+/**
+ * Make a withheld-leg reason safe to embed in the exit `detail` string.
+ *
+ * WHY THIS IS NOT COSMETIC. `positionMonitor.applyLeggingExitResult` decides whether a failed exit
+ * sends the position to RECOVERY by matching `/uncertain|reconcil/i` against `result.detail`. A
+ * withheld leg is the OPPOSITE of uncertain — nothing was transmitted, so zero filled is proven —
+ * and it must not be classified as an unprovable outcome. Since a per-leg reason can now carry
+ * arbitrary broker/pricing error text into that string, the two words the classifier keys on are
+ * neutralised here rather than left to chance.
+ *
+ * The reason stays fully readable for the operator; only the classifier's trigger tokens are broken.
+ */
+function withheldReason(reason: string): string {
+  return reason
+    .replace(/uncertain/gi, "not-established")
+    .replace(/reconcil/gi, "re-check");
+}
+
 export function checkedFeedBlockReason(args: {
   request: BrokerOrderRequest;
   stamp: CheckedFeedStamp | undefined;
@@ -935,13 +953,13 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
           request = build(leg.role, leg.quantity);
         } catch (error) {
           byRole.set(leg.role, { filled: 0, certain: true });
-          withheld.push(`${leg.role} not submitted: ${errorMessage(error)}`);
+          withheld.push(`${leg.role} not submitted: ${withheldReason(errorMessage(error))}`);
           continue;
         }
         const verdict = this.precheckOne(request, checkedAt, feedGeneration);
         if (verdict.reason !== null) {
           byRole.set(leg.role, { filled: 0, certain: true });
-          withheld.push(`${leg.role} not submitted: ${verdict.reason}`);
+          withheld.push(`${leg.role} not submitted: ${withheldReason(verdict.reason)}`);
           continue;
         }
         checkedFeed.set(request.client_order_id, verdict.stamp);

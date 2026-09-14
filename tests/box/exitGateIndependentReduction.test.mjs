@@ -54,7 +54,7 @@ import {
  * `estimateExecutableExit` and nothing else, and the question under test is purely whether
  * `simulateLeggingExit` is reached.
  */
-function harness({ executionMode, estimate }) {
+function harness({ executionMode, estimate, expiryToday = false }) {
   const { candidate } = goodCandidate();
   const conf = cfg({ executionMode, liveTradingEnabled: executionMode === "live" });
   const now = Date.now();
@@ -64,7 +64,13 @@ function harness({ executionMode, estimate }) {
   seedStore(quotes, exitQuotes(candidate, 198, { at: now, qty: 150 }), now);
 
   const positions = new BoxPositionBook();
-  const position = positionFrom(candidate, { opened_at: now - 60_000, last_persist_at: now });
+  const ist = "2026-08-29";
+  const position = positionFrom(candidate, {
+    opened_at: now - 60_000,
+    last_persist_at: now,
+    // Matching the IST day key puts the position in the expiry-safety window below.
+    ...(expiryToday ? { expiry: ist } : {}),
+  });
   positions.add(position);
 
   const exitCalls = [];
@@ -108,13 +114,14 @@ function harness({ executionMode, estimate }) {
     persistLive: async () => {},
     persistPartialExit: async () => true,
     onEvent: (event, pos, metrics, detail) => events.push({ event, detail }),
-    istDayKey: () => "2026-08-29",
-    istMinutesOfDay: () => 11 * 60,
+    istDayKey: () => ist,
+    // Late in the session when the test wants the expiry-safety window, mid-session otherwise.
+    istMinutesOfDay: () => (expiryToday ? 15 * 60 + 20 : 11 * 60),
     isMarketOpen: () => true,
     isFeedHealthy: () => true,
   });
 
-  return { monitor, positions, position, events, closes, exitCalls, quotes, candidate };
+  return { monitor, positions, position, events, closes, exitCalls, quotes, candidate, conf };
 }
 
 /** Every outstanding role can execute its full remaining quantity. */
@@ -202,4 +209,61 @@ test("PAPER_LEGGING: a fully executable exit still reaches the simulator (contro
   const h = harness({ executionMode: "paper_legging", estimate: allExecutable });
   await h.monitor.cycle();
   assert.equal(h.exitCalls.length, 1);
+});
+
+/* ─────────────────── attempt cadence, the cost of relaxing the gate ─────────────────── */
+
+/**
+ * Relaxing the gate from `every` to `some` removed the last brake on retry cadence for a box that
+ * closes NOTHING. Such a box never becomes PARTIALLY_EXITED — `applyLeggingExitResult` takes the
+ * "closed 0 legs" path and leaves it OPEN — so the PARTIALLY_EXITED throttle never applies to it.
+ * Under `every` this loop needed all four books healthy; under `some` a single healthy book would
+ * re-fire the whole attempt every monitor cycle, each with a fresh attempt id and therefore a fresh
+ * durable intent and POST per admitted leg.
+ */
+test("LIVE: a repeated exit that closes nothing is THROTTLED, not re-fired every cycle", async () => {
+  const h = harness({ executionMode: "live", estimate: oneLegUnavailable });
+
+  await h.monitor.cycle();
+  assert.equal(h.exitCalls.length, 1, "the first attempt runs");
+  assert.equal(h.positions.size, 1, "nothing closed, so the box stays OPEN (never PARTIALLY_EXITED)");
+  assert.notEqual(
+    h.position.position_state,
+    "PARTIALLY_EXITED",
+    "fixture: this is exactly the state the existing throttle does NOT cover",
+  );
+
+  // Immediately re-evaluating must not re-POST.
+  await h.monitor.cycle();
+  await h.monitor.cycle();
+  assert.equal(
+    h.exitCalls.length,
+    1,
+    "a box that closed nothing must not re-fire the exit on every monitor cycle — each attempt " +
+      "would mint a new durable intent and a new POST per admitted leg",
+  );
+});
+
+test("LIVE: the throttle bounds cadence only — it expires and the exit is retried", async () => {
+  const h = harness({ executionMode: "live", estimate: oneLegUnavailable });
+  await h.monitor.cycle();
+  assert.equal(h.exitCalls.length, 1);
+
+  // Age the last attempt past the throttle window.
+  h.position.last_exit_attempt_at = Date.now() - (Math.max(250, h.conf.legTimeoutMs) + 50);
+  await h.monitor.cycle();
+  assert.equal(h.exitCalls.length, 2, "the retry happens once the window has elapsed");
+});
+
+test("LIVE: EXPIRY_SAFETY is exempt from the cadence throttle", async () => {
+  // Inside the expiry-safety window a position that must be closed cannot be made to wait.
+  const h = harness({ executionMode: "live", estimate: oneLegUnavailable, expiryToday: true });
+  await h.monitor.cycle();
+  const first = h.exitCalls.length;
+  assert.ok(first >= 1, "the expiry-safety exit runs");
+  await h.monitor.cycle();
+  assert.ok(
+    h.exitCalls.length > first,
+    "an expiry-safety exit is retried immediately; the throttle must not delay it",
+  );
 });

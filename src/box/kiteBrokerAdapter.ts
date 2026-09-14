@@ -485,20 +485,29 @@ export class KiteBrokerAdapter implements BrokerAdapter {
           // The order DOES exist. Carry on with its real state, exactly as Dhan does.
           return await this.resolveAdopted(req, adopted);
         }
-        order.state = "RECONCILIATION_REQUIRED";
-        order.updated_at = this.clock.now();
+        // Quarantine the LATEST accepted state, not the pre-POST object: a postback that landed
+        // while the POST was in flight replaced the map entry, so mutating `order` here would mutate
+        // an orphan and the thrown error would carry `filled 0` over a real fill.
+        const quarantined = this.quarantine(req.client_order_id, order);
         throw new BrokerAmbiguousSubmitError(
           req.client_order_id,
           `${errorMessage(error)} (${describeAmbiguity(error)}; tag lookup did not uniquely identify an order, so reconciliation is required and NO retry was attempted)`,
           error,
-          clone(order),
+          clone(quarantined),
         );
       }
-      order.state = "REJECTED";
-      order.reject_family = classifyKiteReject(error);
-      order.reject_reason = errorMessage(error);
-      order.updated_at = this.clock.now();
-      throw new BrokerOrderRejectedError(clone(order), error);
+      // A DEFINITIVE rejection, merged rather than written blind — the same treatment Dhan's
+      // definitive-4xx path gets. If a fill was observed on the stream while the POST was in flight,
+      // a bare REJECTED would erase real exposure; the merge routes that contradiction to
+      // RECONCILIATION_REQUIRED instead of silently choosing one side.
+      const rejected = this.commit(req.client_order_id, {
+        ...cloneBrokerOrder(this.orders.get(req.client_order_id) ?? order),
+        state: "REJECTED",
+        reject_family: classifyKiteReject(error),
+        reject_reason: errorMessage(error),
+        updated_at: this.clock.now(),
+      });
+      throw new BrokerOrderRejectedError(clone(rejected), error);
     }
 
     // THE ACK-OVERWRITES-FILL WINDOW. `order` was created before the POST. A postback for this
@@ -1033,7 +1042,14 @@ export class KiteBrokerAdapter implements BrokerAdapter {
   private quarantine(clientOrderId: string, fallback: BrokerOrder | undefined): BrokerOrder {
     const current = this.orders.get(clientOrderId) ?? fallback;
     if (!current) {
-      throw new Error(`Cannot quarantine unknown order ${clientOrderId}.`);
+      // AMBIGUOUS, not a generic fault. Every caller of this helper is on a path that previously
+      // guaranteed a BrokerAmbiguousSubmitError, and the manager routes on that type to decide
+      // whether an order may still exist at the broker. A plain Error would lose that classification.
+      throw new BrokerAmbiguousSubmitError(
+        clientOrderId,
+        `Order ${clientOrderId} vanished from the session projection before it could be quarantined; ` +
+          "reconciliation is required.",
+      );
     }
     if (isBrokerOrderTerminal(current.state)) return current;
     return this.commit(clientOrderId, {
@@ -1119,7 +1135,16 @@ export class KiteBrokerAdapter implements BrokerAdapter {
   ): BrokerOrder {
     const merged = mergeBrokerOrderSnapshot(this.orders.get(clientOrderId), candidate, options);
     this.orders.set(clientOrderId, merged.order);
-    if (merged.order.broker_order_id) {
+    if (merged.conflict !== null) {
+      // NEVER SILENT. A conflict means the two observations asserted mutually exclusive facts; the
+      // merge has already moved the order to RECONCILIATION_REQUIRED, and this is the only place an
+      // operator can learn WHY without reading the durable audit.
+      console.warn(`[Kite] execution evidence conflict for ${clientOrderId}: ${merged.conflict}`);
+    }
+    // A CONFLICTING broker id is deliberately NOT registered: it belongs to a different broker order,
+    // so attributing this client order id to it would compound the attribution fault. The order is in
+    // RECONCILIATION_REQUIRED and the reconciler owns it from here.
+    if (merged.order.broker_order_id && merged.conflict === null) {
       this.clientByBroker.set(merged.order.broker_order_id, clientOrderId);
     }
     // TIMING: the broker's CUMULATIVE quantity. The recorder ignores anything that is not an

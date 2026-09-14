@@ -2129,11 +2129,19 @@ export class BoxOrderManager {
         // now yields zero proven coverage and blocks the dependent SELL, instead of silently
         // authorising it.
         terminalOrder = accepted;
-        if (accepted.state === "REJECTED") {
+        // BREAKER ACCOUNTING FOLLOWS THE ADAPTER'S OWN VERDICT, NOT THE MERGED LABEL.
+        //
+        // `accepted` blends in the durable row, and the durable state-predecessor guard can refuse a
+        // transition and return the existing row — so a row already terminally CANCELLED would make
+        // the merge report CANCELLED for an order the BROKER rejected, and the rejection would vanish
+        // from `rejects` and `consecutiveFailures`, the counters the circuit breaker trips on.
+        // Coverage still reads `accepted` (a terminal zero-fill credits nothing either way); only the
+        // "did the broker refuse us" question is answered by `order`.
+        if (order.state === "REJECTED") {
           this.rejects++;
-          this.noteBrokerReject(accepted, accepted.reject_reason ?? "broker rejected order");
+          this.noteBrokerReject(order, order.reject_reason ?? "broker rejected order");
           this.noteFailure("broker rejected order");
-          hedgeFailureReason = accepted.reject_reason ?? "broker rejected order";
+          hedgeFailureReason = order.reject_reason ?? "broker rejected order";
         } else if (accepted.state === "COMPLETE") {
           this.consecutiveFailures = 0;
         }
@@ -2561,6 +2569,11 @@ export class BoxOrderManager {
       filled_quantity: durable.filled_quantity,
       pending_quantity: Math.max(0, durable.quantity - durable.filled_quantity),
       average_price: durable.average_price,
+      // The durable row carries a quantity and an average price but NO fill records. Copying the
+      // adapter's rows alongside a HIGHER durable quantity would publish detail that under-sums the
+      // quantity printed beside it, so when the row is ahead the records are dropped and the merge's
+      // own rule rebuilds a coherent aggregate for the accepted quantity.
+      fills: durable.filled_quantity > order.filled_quantity ? [] : order.fills.map((fill) => ({ ...fill })),
       reject_family: (durable.reject_family as BrokerOrder["reject_family"]) ?? null,
       reject_reason: durable.reject_reason,
       updated_at: durable.updated_at.getTime(),

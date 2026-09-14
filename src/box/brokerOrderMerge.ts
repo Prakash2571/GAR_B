@@ -271,7 +271,23 @@ export function mergeBrokerOrderSnapshot(
   const base = candidateWasStale ? current : candidate;
 
   const conflict = resolved.conflict ?? brokerConflict;
-  const state = resolved.conflict !== null ? "RECONCILIATION_REQUIRED" : resolved.state;
+  // ANY conflict routes to reconciliation, INCLUDING a broker-identity conflict.
+  //
+  // Previously only a state contradiction forced the uncertain state, so two different broker orders
+  // claiming one client order id left a COMPLETE order with a conflict sentence in `reject_reason` —
+  // no quarantine, nothing for the reconciler. `repository.updateBoxOrderIntent` treats a broker-id
+  // reassignment as a HARD guard failure; the session projection must not be more permissive.
+  const state = conflict !== null ? "RECONCILIATION_REQUIRED" : resolved.state;
+
+  // The broker's OWN classification and message are preserved even on the reconciliation route.
+  // Nulling them there discarded exactly what an operator needs to resolve the conflict, and
+  // `outcomeStore.recordReject` attributes on the family.
+  // Taken from whichever side actually carries one. `base` alone is not enough: the classic case is
+  // a REJECTED observation contradicting a held fill, where the rejection is on the side the merge
+  // classified as STALE, so `base` is the cached order and the broker's family/message live on the
+  // candidate. Losing them there would strip the evidence exactly on the reconciliation route.
+  const rejectFamily = base.reject_family ?? current.reject_family ?? candidate.reject_family;
+  const brokerReason = base.reject_reason ?? current.reject_reason ?? candidate.reject_reason;
 
   const merged: BrokerOrder = {
     ...base,
@@ -285,8 +301,10 @@ export function mergeBrokerOrderSnapshot(
     pending_quantity: Math.max(0, requested - accepted),
     average_price: averagePrice,
     fills,
-    reject_family: state === "REJECTED" ? (base.reject_family ?? current.reject_family) : null,
-    reject_reason: conflict ?? (state === "REJECTED" ? (base.reject_reason ?? current.reject_reason) : base.reject_reason),
+    reject_family: state === "REJECTED" || conflict !== null ? rejectFamily : null,
+    reject_reason: conflict !== null
+      ? (brokerReason ? `${conflict} (broker reported: ${brokerReason})` : conflict)
+      : (state === "REJECTED" ? brokerReason : base.reject_reason),
     created_at: current.created_at,
     // Never let the observation clock run backwards for this identity.
     updated_at: Math.max(current.updated_at, candidate.updated_at),
@@ -330,15 +348,14 @@ function resolveState(args: {
   const rejectedAgainstFill = (state: BrokerOrderState): boolean => state === "REJECTED" && accepted > 0;
 
   if (curTerminal && candTerminal) {
-    if (current.state === candidate.state) {
-      if (rejectedAgainstFill(current.state)) {
-        return {
-          state: "REJECTED",
-          conflict: `${id} is REJECTED yet a cumulative fill of ${accepted} is confirmed; execution evidence conflicts`,
-        };
-      }
-      return { state: current.state, conflict: null };
-    }
+    // CONTRADICTIONS ARE TESTED FIRST, BEFORE ANY LABEL-BASED RESOLUTION.
+    //
+    // The order of these checks is the whole correctness of this branch. Resolving on the labels
+    // first meant the same contradiction was escalated from one cached state and silently accepted
+    // from another: cached CANCELLED + observed COMPLETE at 30/100 hit the "partial then cancelled"
+    // rule and resolved to CANCELLED/30 with no conflict, while cached OPEN + the identical
+    // observation correctly reconciled. A contradiction is a property of the two observations, not
+    // of which one happened to be cached, so it must be judged before anything else.
     if (rejectedAgainstFill(current.state) || rejectedAgainstFill(candidate.state)) {
       return {
         state: "RECONCILIATION_REQUIRED",
@@ -347,13 +364,24 @@ function resolveState(args: {
           `with a confirmed cumulative fill of ${accepted}`,
       };
     }
-    // A cancellation that raced a complete fill: once the accepted cumulative quantity covers the
-    // whole request there is nothing left that could have been cancelled.
-    if (accepted >= requested && (current.state === "COMPLETE" || candidate.state === "COMPLETE")) {
+    // COMPLETE asserts the WHOLE request executed. Reachable on Kite, where `kiteState` returns
+    // COMPLETE from the status label before it inspects the quantity, so a COMPLETE row whose
+    // `filled_quantity` field lags produces exactly this.
+    if ((current.state === "COMPLETE" || candidate.state === "COMPLETE") && accepted < requested) {
+      return {
+        state: "RECONCILIATION_REQUIRED",
+        conflict:
+          `${id} was labelled COMPLETE but the confirmed cumulative fill is ${accepted} of ${requested}`,
+      };
+    }
+    // Once the accepted cumulative quantity covers the whole request the order COMPLETED, whatever
+    // either side called it — including two CANCELLED labels, where nothing remained to cancel.
+    if (accepted >= requested && requested > 0) {
       return { state: "COMPLETE", conflict: null };
     }
+    if (current.state === candidate.state) return { state: current.state, conflict: null };
     // Partially filled and then cancelled is an ordinary, fully consistent outcome.
-    if (accepted < requested && (current.state === "CANCELLED" || candidate.state === "CANCELLED")) {
+    if (current.state === "CANCELLED" || candidate.state === "CANCELLED") {
       return { state: "CANCELLED", conflict: null };
     }
     return {
@@ -409,6 +437,15 @@ function resolveState(args: {
     return { state: "RECONCILIATION_REQUIRED", conflict: null };
   }
   if (candidateWasStale) {
+    // UNCERTAINTY IS NOT DISSOLVED BY OLDER EVIDENCE.
+    //
+    // UNKNOWN is what an empty or failed read records — "the broker may own something we cannot
+    // read" — and two protections key on it: `executionAccountingComplete()` short-circuits to false
+    // whatever the recorded marker says, and OrderManager's RECONCILE_STATES path credits NO hedge
+    // coverage. The coherence upgrade below used to convert a cached UNKNOWN into PARTIALLY_FILLED
+    // on the strength of an observation this function has ALREADY classified as older, removing both.
+    // The quantity floor was never at stake; the deliberate refusal to claim a readable state was.
+    if (current.state === "UNKNOWN") return { state: "UNKNOWN", conflict: null };
     // Provably an older observation: keep the cached label, but never present a state that
     // contradicts the accepted quantity.
     if (accepted > 0 && accepted < args.requested && workingRank(current.state) < workingRank("PARTIALLY_FILLED")) {
