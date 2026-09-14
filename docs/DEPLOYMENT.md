@@ -14,6 +14,35 @@ PostgreSQL is this backend's operational authority; treat it accordingly.
 > durability, monitoring, restart/recovery, config precedence, and the requirement that
 > the predecessor codebase Box execution be disabled first.
 
+## 0. `./start.sh` — the automated release
+
+Sections 2–9 below describe each step by hand, and they remain the reference for
+*what* each step means. [`start.sh`](../start.sh) performs them in order on the
+host, fails closed at the first error, and refuses to arm anything:
+
+```bash
+./start.sh --help            # the full pipeline and every flag
+./start.sh --dry-run         # print every command; change nothing
+./start.sh                   # full release: pull → build → contract → backup → migrate → pm2 → publish
+./start.sh --frontend-only   # publish the UI only; database and backend process untouched
+```
+
+Two behaviours worth knowing before the first run:
+
+- **PostgreSQL is verified in preflight**, before `npm ci` or any build. A release
+  that cannot reach the database stops while the host is still untouched, and the
+  error names the connection string with the password masked.
+- **`pg_dump` runs as the invoking user, not as root.** Only the file write into
+  `BACKUP_DIR` uses `sudo` (installed `0600`). Running the dump itself through
+  `sudo` loses this user's PostgreSQL identity — peer/ident auth, `~/.pgpass`,
+  `PGUSER` — and `sudo -E` is refused by a normal sudoers policy, so the
+  connection string never even reaches `pg_dump`.
+
+`--frontend-only` is for shipping a UI change while the backend is fine as it is,
+or while a database problem is being fixed separately. It does not pull, rebuild
+or restart GAR_B — but it still refuses to publish a frontend whose pinned
+contract digest differs from the one the **running** backend serves.
+
 ## 1. PostgreSQL installation, database and role
 
 Install PostgreSQL (14+; 15/16 fine) from your distro or the PGDG repo. Then
