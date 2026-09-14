@@ -247,6 +247,10 @@ need_cmd pm2
 (( SKIP_FRONTEND )) || need_cmd nginx
 [[ -d "$GAR_B_DIR/.git" ]] || die "not a git repo: ${GAR_B_DIR}"
 [[ -d "$GAR_F_DIR/.git" ]] || die "frontend repo not found at ${GAR_F_DIR} (set GAR_F_DIR in deploy.env)"
+# Normalise to absolute paths so a relative value in deploy.env cannot change meaning once the
+# script cd's into a repo.
+GAR_B_DIR="$(cd -- "$GAR_B_DIR" && pwd)"
+GAR_F_DIR="$(cd -- "$GAR_F_DIR" && pwd)"
 [[ -f "$GAR_B_DIR/ecosystem.config.cjs" ]] || die "missing ecosystem.config.cjs in ${GAR_B_DIR}"
 [[ -f "$GAR_B_DIR/.env" ]] || die "missing ${GAR_B_DIR}/.env — the release cannot validate config or reach the database"
 
@@ -257,6 +261,26 @@ need_cmd pm2
 # backticks or `$(...)` either breaks the release or executes on this host, and a real .env is full
 # of passwords, URLs and JSON. The reader below only ever assigns the ONE key it is asked for.
 # Values are passed in through the environment so no shell quoting is involved anywhere.
+# Read one field from a JSON file.
+#
+# Deliberately NOT `require(path)`: require resolves a path without a leading ./ as a MODULE, so a
+# relative directory in deploy.env made the read fail and return an empty string. Comparing an empty
+# string then produced a confusing "contract mismatch" for what was really a bad path. This reads the
+# file explicitly and fails loudly with the real reason.
+json_field() {
+  JSON_FILE="$1" JSON_FIELD="$2" node <<'NODE'
+const fs = require("node:fs");
+try {
+  const obj = JSON.parse(fs.readFileSync(process.env.JSON_FILE, "utf8"));
+  const v = obj[process.env.JSON_FIELD];
+  process.stdout.write(v === undefined || v === null ? "" : String(v));
+} catch (err) {
+  process.stderr.write(`cannot read ${process.env.JSON_FIELD} from ${process.env.JSON_FILE}: ${err.message}\n`);
+  process.exit(1);
+}
+NODE
+}
+
 read_env() {
   ENV_FILE="$GAR_B_DIR/.env" ENV_KEY="$1" node <<'NODE'
 const fs = require("node:fs");
@@ -374,13 +398,17 @@ step "Verify the frontend/backend contract"
 ok "frontend contract is internally consistent"
 
 if ! (( DRY_RUN )); then
-  backend_digest="$(cd "$GAR_B_DIR" && node contract/digest.mjs)"
-  frontend_pin="$(node -e 'const p=require(process.argv[1]);process.stdout.write(p.schemas_sha256??"")' \
-    "$GAR_F_DIR/contract/BACKEND_CONTRACT.json")"
-  backend_version="$(node -e 'const p=require(process.argv[1]);process.stdout.write(p.contract_version??"")' \
-    "$GAR_B_DIR/contract/version.json")"
-  frontend_version="$(node -e 'const p=require(process.argv[1]);process.stdout.write(p.contract_version??"")' \
-    "$GAR_F_DIR/contract/BACKEND_CONTRACT.json")"
+  backend_digest="$(cd "$GAR_B_DIR" && node contract/digest.mjs)" \
+    || die "could not compute the backend contract digest"
+  frontend_pin="$(json_field "$GAR_F_DIR/contract/BACKEND_CONTRACT.json" schemas_sha256)" \
+    || die "could not read the frontend's pinned contract digest"
+  backend_version="$(json_field "$GAR_B_DIR/contract/version.json" contract_version)" || die "unreadable backend contract/version.json"
+  frontend_version="$(json_field "$GAR_F_DIR/contract/BACKEND_CONTRACT.json" contract_version)" || die "unreadable frontend BACKEND_CONTRACT.json"
+
+  # An EMPTY value means the file or field is missing, which is a different problem from a genuine
+  # mismatch and must not be reported as one.
+  [[ -n "$backend_digest" ]] || die "the backend contract digest came back empty"
+  [[ -n "$frontend_pin" ]] || die "GAR_F/contract/BACKEND_CONTRACT.json has no schemas_sha256"
 
   if [[ "$backend_digest" != "$frontend_pin" ]]; then
     printf '    backend  contract/ digest : %s\n' "$backend_digest" >&2
