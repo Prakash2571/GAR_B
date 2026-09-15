@@ -102,6 +102,15 @@ export type TokenUnavailableReason =
   | "no_session"
   | "session_expired"
   | "session_stale_day"
+  /**
+   * A token is stored but the value it must be PAIRED with is missing.
+   *
+   * Zerodha authenticates with `api_key:access_token`, so a token without its api key is
+   * unusable. Reported as unavailable rather than served with a blank identity, because a
+   * caller has no way to tell a blank identity from a working credential until the broker
+   * 403s it.
+   */
+  | "no_identity"
   | "store_unavailable";
 
 export type TokenLookup =
@@ -269,6 +278,8 @@ function describeUnavailable(broker: BrokerId, reason: TokenUnavailableReason): 
       return `The stored ${broker} token has passed its expiry. Sign in to ${broker} again.`;
     case "session_stale_day":
       return `The stored ${broker} token is from an earlier trading day. Sign in to ${broker} again.`;
+    case "no_identity":
+      return `The stored ${broker} session has no api key to pair the token with, so the token cannot be used. Sign in to ${broker} again.`;
     case "store_unavailable":
       return "The token store is temporarily unavailable.";
     default:

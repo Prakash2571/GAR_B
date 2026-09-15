@@ -46,6 +46,14 @@ The callback also refuses while the process is not `ready`, because a login
 completing mid-boot could be silently discarded by `restore()` adopting the stored
 session moments later.
 
+**Cheap refusals never consume the pending login.** Because this route cannot require a
+session, anything it consumes an anonymous caller can consume. A request that lacks a
+credential, carries a broker-reported denial, or presents a wrong/absent `state` is
+rejected **without** spending the operator's in-flight sign-in — otherwise one bare
+`GET` would deny them a login, repeatably, with an error blaming their own browser.
+Only a matched claim is spent (and then it is strictly single-use). The route is
+additionally rate limited to 20 requests/minute/IP.
+
 ### 2. `GET /api/tokens/zerodha` and `GET /api/tokens/dhan` — token exposure
 
 Callers are **other servers**, not browsers, so a session cookie is the wrong
@@ -86,8 +94,8 @@ Only these, and nothing else:
 | GET | `/api/access/status` | public | is there a live session? returns the CSRF token if so |
 | POST | `/api/access/logout` | session + CSRF + Origin | revoke the session row, clear cookies |
 | POST | `/api/broker/{broker}/login/start` | session + CSRF + Origin | begin a browser login; returns the broker's consent URL |
-| GET | `/api/broker/{broker}/callback` | single-use pending-login nonce | the broker's redirect; exchanges the code for a token |
-| POST | `/api/broker/{broker}/logout` | session + CSRF + Origin | drop ONE broker's session |
+| GET | `/api/broker/{broker}/callback` | single-use pending-login nonce, rate limited | the broker's redirect; exchanges the code for a token |
+| POST | `/api/broker/{broker}/logout` | session + CSRF + Origin | drop ONE broker's session; `409` if it still owns exposure |
 | GET | `/api/tokens/{broker}` | `x-token-access-key` header | serve the current access token to a sibling service |
 
 ## The passcode check

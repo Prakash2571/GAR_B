@@ -475,13 +475,25 @@ test("a claimed login is SINGLE-USE, so a replayed callback does nothing", () =>
   });
 });
 
-test("a failed nonce check still consumes the initiation, so it cannot be retried", () => {
+test("a FAILED nonce check does NOT consume the login, so it cannot be used to deny a sign-in", () => {
   const store = new PendingLoginStore();
   const entry = store.start("zerodha", { startedBy: "full" });
   const wrong = "x".repeat(entry.nonce.length);
+
+  // The callback is unauthenticated by necessity, so anything it consumes, ANYONE can
+  // consume. Spending the entry on a failed proof would let a stranger destroy the
+  // operator's in-flight sign-in with one request — repeatably, and with an error message
+  // that blamed the operator's own browser.
   assert.deepEqual(store.consume("zerodha", wrong, { requireNonce: true }), {
     ok: false, reason: "state_mismatch",
   });
+  assert.deepEqual(store.consume("zerodha", null, { requireNonce: true }), {
+    ok: false, reason: "state_missing",
+  });
+  assert.equal(store.isPending("zerodha"), true, "the real login must survive both attempts");
+
+  // The genuine redirect still works, and THAT claim is single-use.
+  assert.equal(store.consume("zerodha", entry.nonce, { requireNonce: true }).ok, true);
   assert.deepEqual(store.consume("zerodha", entry.nonce, { requireNonce: true }), {
     ok: false, reason: "no_pending_login",
   });
@@ -494,6 +506,22 @@ test("omitting `state` cannot downgrade the nonce requirement", () => {
   // happened to send — otherwise dropping `state` would bypass the check entirely.
   assert.deepEqual(store.consume("zerodha", null, { requireNonce: true }), {
     ok: false, reason: "state_missing",
+  });
+});
+
+test("a lapsed entry is removed even though a failed proof is not", () => {
+  // The two are different: an expired entry can never be claimed again, so keeping it would
+  // only make a later caller see `login_expired` instead of the truthful `no_pending_login`.
+  // A WRONG PROOF, by contrast, says nothing about the entry's validity.
+  let now = 1_000_000;
+  const store = new PendingLoginStore({ ttlMs: 600_000, now: () => now });
+  const entry = store.start("zerodha", { startedBy: "full" });
+  now += 600_001;
+  assert.deepEqual(store.consume("zerodha", entry.nonce, { requireNonce: true }), {
+    ok: false, reason: "login_expired",
+  });
+  assert.deepEqual(store.consume("zerodha", entry.nonce, { requireNonce: true }), {
+    ok: false, reason: "no_pending_login",
   });
 });
 

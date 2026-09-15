@@ -340,6 +340,18 @@ function autoFallbackToDhanFromEnv(env: NodeJS.ProcessEnv = process.env): boolea
   return raw === "true" || raw === "1" || raw === "yes";
 }
 
+/**
+ * Does this deployment run its own broker login?
+ *
+ * Mirrors `brokerLoginModeFromEnv` in src/index.ts, which owns the authoritative parse and
+ * the warning for an unrecognised value. Anything that is not exactly `provider` is treated
+ * as in-app, matching that function's safe default, so the two can never disagree about
+ * which mode is active.
+ */
+function inAppLoginFromEnv(env: NodeJS.ProcessEnv = process.env): boolean {
+  return (env.BROKER_LOGIN_MODE ?? "").trim().toLowerCase() !== "provider";
+}
+
 export class ActiveBrokerManager {
   private active: BrokerId = defaultActiveBrokerFromEnv();
   /**
@@ -347,6 +359,15 @@ export class ActiveBrokerManager {
    * behaviour without a restart.
    */
   private readonly autoFallbackToDhan: boolean = autoFallbackToDhanFromEnv();
+  /**
+   * Whether THIS deployment mints its own broker tokens (`BROKER_LOGIN_MODE=in_app`).
+   *
+   * Read once at construction, like `autoFallbackToDhan`, so a mid-session env edit cannot
+   * change how readiness is reported. It gates only the CREDENTIAL problem reporting: a
+   * provider-mode deployment legitimately has no app secret, and must not be told it is
+   * misconfigured for that.
+   */
+  private readonly inAppLogin: boolean = inAppLoginFromEnv();
   private probe: ExposureProbe | null = null;
   private hooks: SwitchHooks | null = null;
 
@@ -711,20 +732,52 @@ export class ActiveBrokerManager {
 
   /** Stop BOTH lanes of BOTH brokers, and forget their subscriptions. */
   private stopAllLanes(): void {
-    const attempt = (what: string, fn: () => void) => {
-      try {
-        fn();
-      } catch (err) {
-        console.warn(`[Broker] ${what} failed:`, err);
-      }
-    };
-    attempt("tickerHub.stop()", () => this.deps.tickerHub.stop());
-    attempt("dhanFeed.stop()", () => this.dhanFeed?.stop());
-    attempt("boxZerodhaFeed.stop()", () => this.boxZerodhaFeed?.stop());
-    attempt("boxDhanFeed.stop()", () => this.boxDhanFeed?.stop());
-    // A stopped ZerodhaFeed is permanently disposed, so the next lane use must build a
-    // fresh one under the NEW generation rather than resurrect the old socket object.
+    this.stopZerodhaLanes();
+    this.stopDhanLanes();
+  }
+
+  /** Run a teardown step without letting its failure abandon the remaining steps. */
+  private attemptStop(what: string, fn: () => void): void {
+    try {
+      fn();
+    } catch (err) {
+      console.warn(`[Broker] ${what} failed:`, err);
+    }
+  }
+
+  /**
+   * Stop BOTH Zerodha lanes and drop their socket objects.
+   *
+   * Split out from `stopAllLanes` because a per-broker operation must be able to tear down
+   * ONE broker without touching the other. Signing out of a standby Zerodha while Dhan
+   * trades must not stop the Dhan feed, and the reverse must hold too — a single
+   * `stopAllLanes()` in a per-broker path would silently break the isolation the whole
+   * dual-session design rests on.
+   *
+   * The references are nulled because a stopped `ZerodhaFeed` is permanently disposed: the
+   * next lane use must build a fresh one, which is also what makes it pick up a NEW access
+   * token. The `TickerHub` re-reads its credentials on the next `ensureSocket` precisely
+   * because the handle is gone.
+   */
+  private stopZerodhaLanes(): void {
+    this.attemptStop("tickerHub.stop()", () => this.deps.tickerHub.stop());
+    this.attemptStop("boxZerodhaFeed.stop()", () => this.boxZerodhaFeed?.stop());
     this.boxZerodhaFeed = null;
+  }
+
+  /**
+   * Stop BOTH Dhan lanes and drop their socket objects.
+   *
+   * `dhanFeed` is nulled here as well as `boxDhanFeed`. It previously survived a stop,
+   * which left a disposed-but-referenced object that later code could mistake for a live
+   * feed — and it is why signing into Dhan used to be able to clear the ACTIVE broker's
+   * tick clock (the recycle branch tested `if (this.dhanFeed)`, which stayed true forever
+   * once Dhan had ever been active).
+   */
+  private stopDhanLanes(): void {
+    this.attemptStop("dhanFeed.stop()", () => this.dhanFeed?.stop());
+    this.attemptStop("boxDhanFeed.stop()", () => this.boxDhanFeed?.stop());
+    this.dhanFeed = null;
     this.boxDhanFeed = null;
   }
 
@@ -993,6 +1046,23 @@ export class ActiveBrokerManager {
     return this.loginErrors[broker];
   }
 
+  /**
+   * Forget the Zerodha session metadata after the FEED reported the token dead.
+   *
+   * The feed-death hook in src/index.ts clears the in-memory token and invalidates the
+   * stored row, but the manager also holds the account/login-day metadata. Left behind, it
+   * keeps projecting an account label and a login day for a session that no longer exists,
+   * and — because `zerodhaTokenStale()` needs a login day to detect staleness — makes
+   * `inAppTokenState` report `waiting` ("sign in") instead of `invalid` ("sign in AGAIN").
+   * That is the exact distinction the five-state vocabulary exists to preserve.
+   *
+   * Idempotent, and deliberately does NOT stop a feed: the caller is the feed.
+   */
+  forgetZerodhaSession(reason: string): void {
+    this.zerodhaSessionMeta = null;
+    this.loginErrors.zerodha = reason;
+  }
+
   /* ------------------------- Zerodha in-app login ------------------------ */
 
   /**
@@ -1062,13 +1132,42 @@ export class ActiveBrokerManager {
     // Bring the runtime up on the new session ONLY when Zerodha owns it. A standby
     // sign-in must not open a Zerodha socket while Dhan is active.
     if (this.active === "zerodha") {
+      /**
+       * RECYCLE THE SOCKETS FIRST. THIS IS NOT OPTIONAL.
+       *
+       * A re-authentication REPLACES the access token, so any socket opened with the
+       * previous one must not survive: it authenticates with a credential that has just
+       * been superseded, and the broker may drop it at any moment while the runtime still
+       * believes the feed is live.
+       *
+       * Neither Zerodha lane re-authenticates an already-open connection on its own, so
+       * without this the new token would never reach the wire:
+       *   • `TickerHub.ensureSocket` reads the credentials but only USES them when it has
+       *     no handle; with a live handle it just subscribes on the old socket.
+       *   • `ZerodhaFeed.subscribeTokens` computes only the tokens it is not already
+       *     subscribed to, which on a replay is an empty set — so it does nothing at all.
+       * And `startActiveFeed()` is deliberately a no-op for Zerodha (the hub connects
+       * lazily on subscribe), so it cannot rescue this either.
+       *
+       * Worse than a stale binding: when the broker eventually retires the old token, the
+       * box lane's auth-death path tears down WITHOUT scheduling a reconnect, so the lane
+       * would stay dead until the next strike-window diff. Dropping the sockets here means
+       * the replay below rebuilds both on the new credential.
+       *
+       * This mirrors what `completeDhanLogin` already does, and it is scoped to the
+       * Zerodha lanes so a live Dhan feed is untouched.
+       */
+      this.stopZerodhaLanes();
+      this.lastTickAt = null;
+
       await this.instrumentProvider.load(true).catch((err) =>
         console.warn("[Zerodha] universe load after login failed:", err),
       );
       this.startActiveFeed();
       // Replay EACH LANE's own table onto its own socket. The token namespace is
       // unchanged (same broker), so the coordinators' tables are still valid — only the
-      // credential behind the socket is new.
+      // credential behind the socket is new, and the sockets were just dropped so each
+      // lane rebuilds against it.
       const wanted = this.subscriptions.activeTokens();
       const wantedBox = this.boxSubscriptions.activeTokens();
       if (wanted.length > 0 || wantedBox.length > 0) {
@@ -1079,6 +1178,9 @@ export class ActiveBrokerManager {
         this.subscribeUpstream("futures", wanted);
         this.subscribeUpstream("box", wantedBox);
       }
+      // The books were priced by the PREVIOUS session's socket. Drop them rather than let
+      // the scanner treat pre-reconnect depth as current.
+      this.hooks?.invalidateBooks();
       this.hooks?.publish();
     }
     return this.sessionFor("zerodha");
@@ -1094,9 +1196,18 @@ export class ActiveBrokerManager {
     this.deps.kite.clearSession();
     this.zerodhaSessionMeta = null;
     this.loginErrors.zerodha = null;
-    await clearKiteSession("operator signed out").catch(() => undefined);
+    // See logoutDhan: a failed durable clear must not look like a clean sign-out.
+    await clearKiteSession("operator signed out").catch((err) => {
+      console.warn("[Zerodha] failed to clear the stored session:", err);
+      this.loginErrors.zerodha =
+        "Signed out, but the stored session could not be cleared — it may still be served " +
+        "to other services and may be restored on restart. Retry the sign-out.";
+    });
+    // Scoped to the ZERODHA lanes (not `stopAllLanes`): if Zerodha is somehow active while
+    // a Dhan socket is up, tearing down Dhan here would be a cross-broker side effect this
+    // operation has no business having.
     if (this.active === "zerodha") {
-      this.stopAllLanes();
+      this.stopZerodhaLanes();
       this.instrumentProvider.invalidate();
       this.lastTickAt = null;
       this.hooks?.invalidateBooks();
@@ -1114,8 +1225,15 @@ export class ActiveBrokerManager {
    */
   private computeZerodhaProblems(): string[] {
     const problems: string[] = [];
-    const creds = readZerodhaCredentials();
-    if (!creds.ok) problems.push(creds.reason);
+    // ONLY an in-app deployment needs the app credentials. A `provider`-mode deployment
+    // gets its token from an external service and has no reason to hold KITE_API_SECRET, so
+    // demanding it there would put a permanent, false "Zerodha is not configured" beside a
+    // perfectly working session — and the frontend renders any problem matching
+    // /not configured/ as "configuration error", which is the most alarming label it has.
+    if (this.inAppLogin) {
+      const creds = readZerodhaCredentials();
+      if (!creds.ok) problems.push(creds.reason);
+    }
 
     const token = this.deps.kite.getAccessToken();
     if (token === null) {
@@ -1190,14 +1308,19 @@ export class ActiveBrokerManager {
     // token must not survive: it authenticates with a credential we have just
     // superseded, and Dhan may drop it at any moment while the runtime still believes
     // the feed is live. Recycle it explicitly.
-    if (this.dhanFeed) {
-      console.log("[Broker] recycling the Dhan feed onto the new access token");
-      this.dhanFeed.stop();
-      // Drop the feed object entirely: its token reader is a closure over session
-      // state, and a fresh instance is cheaper to reason about than a mutated one.
-      this.dhanFeed = null;
-      this.lastTickAt = null;
-    }
+    // BOTH Dhan lanes are recycled, not just the futures one: the box lane's socket is
+    // authenticated with the same superseded token and would otherwise keep streaming
+    // option strikes on a credential that has just been replaced.
+    //
+    // Drop the feed objects entirely: their token reader is a closure over session state,
+    // and a fresh instance is cheaper to reason about than a mutated one.
+    console.log("[Broker] recycling the Dhan feeds onto the new access token");
+    this.stopDhanLanes();
+    // `lastTickAt` is the ACTIVE broker's tick clock, NOT Dhan's — clearing it while
+    // Zerodha is active would demote a perfectly live Zerodha feed to "connecting" and
+    // make it fail the usability check. Signing into a STANDBY broker must not be able to
+    // do that, so the reset is scoped to the case where Dhan actually owns the clock.
+    if (this.active === "dhan") this.lastTickAt = null;
 
     // Verify the static IP NOW. Establishing a session is the first moment the check
     // is even possible (it needs the token), and without this nothing in the normal
@@ -1244,10 +1367,23 @@ export class ActiveBrokerManager {
     this.dhanAccessToken = null;
     this.dhanTokenExpiry = null;
     this.dhanSessionMeta = null;
-    this.dhanFeed?.stop();
+    this.loginErrors.dhan = null;
+    // BOTH lanes, not just the futures feed. The box lane's socket is separately
+    // authenticated, so stopping only `dhanFeed` left it delivering option-strike ticks
+    // into the quote store — refilling the very books `invalidateBooks()` drops below, for
+    // a broker the operator has just signed out of.
+    this.stopDhanLanes();
     this.dhanInstruments.clear();
     this.dhanProblems = ["Dhan is not connected"];
-    await clearDhanSession().catch(() => undefined);
+    // A FAILED durable clear is reported, not swallowed: the row stays `active`, so the
+    // token-exposure endpoint would keep serving the credential of a signed-out broker.
+    // The operator has to know that "signed out here" did not mean "revoked everywhere".
+    await clearDhanSession().catch((err) => {
+      console.warn("[Dhan] failed to clear the stored session:", err);
+      this.loginErrors.dhan =
+        "Signed out, but the stored session could not be cleared — it may still be served " +
+        "to other services and may be restored on restart. Retry the sign-out.";
+    });
     if (this.active === "dhan") {
       this.hooks?.invalidateBooks();
       this.hooks?.publish();
@@ -1264,7 +1400,9 @@ export class ActiveBrokerManager {
     console.warn(`[Dhan] session lost: ${reason}`);
     this.dhanAccessToken = null;
     this.dhanTokenExpiry = null;
-    this.dhanFeed?.stop();
+    // BOTH lanes: a lost session invalidates the box lane's socket exactly as much as the
+    // futures one, and leaving it open would keep publishing depth from a dead credential.
+    this.stopDhanLanes();
     this.dhanProblems = ["Dhan session expired — reconnect Dhan"];
     await clearDhanSession().catch(() => undefined);
     if (this.active === "dhan") {
@@ -2232,13 +2370,64 @@ export class ActiveBrokerManager {
       const creds = readDhanCredentials();
       if (!creds.ok) blockers.push({ reason: "broker_not_configured", detail: creds.reason });
     }
+    blockers.push(...this.exposureBlockers("changing broker"));
+
+    // Unresolved intents on the broker we are LEAVING can only ever be reconciled
+    // through that broker, and after the switch its adapter is gone.
+    const probe = this.probe;
+    const leaving = this.active;
+    if (probe && leaving !== target) {
+      const outstanding = await probe.unresolvedIntentsFor(leaving).catch(() => 0);
+      if (outstanding > 0) {
+        blockers.push({
+          reason: "foreign_unresolved_intents",
+          detail:
+            `${outstanding} unresolved ${leaving} order intent(s) remain. They can only be reconciled ` +
+            `through ${leaving}, so resolve them before switching to ${target}.`,
+        });
+      }
+    }
+    return blockers;
+  }
+
+  /**
+   * Why dropping `broker`'s session right now would be unsafe.
+   *
+   * SIGNING OUT OF A STANDBY BROKER IS ALWAYS SAFE — it owns no exposure, no feed and no
+   * in-flight work, so the list is empty and the operator is never obstructed.
+   *
+   * Signing out of the ACTIVE broker is a different act entirely, and it used to be
+   * completely unguarded. It drops the credential that exits, protective cancellation and
+   * reconciliation all depend on: `usableDhanToken()` starts returning null and
+   * `KiteClient.authHeader()` starts throwing. Doing that while a Box is open or an order is
+   * working strands real exposure with no way to reduce it.
+   *
+   * `switchBroker` has always refused in exactly those conditions. A sign-out reaches the
+   * same end state — no usable session for the broker that owns the position — so it is held
+   * to the same standard, computed from the SAME probe rather than a second opinion. The
+   * frontend also confirms, but a browser dialog is not a control: the API must refuse.
+   */
+  async logoutBlockers(broker: BrokerId): Promise<SwitchBlocker[]> {
+    if (broker !== this.active) return [];
+    return this.exposureBlockers("signing out");
+  }
+
+  /**
+   * The exposure/in-flight checks shared by `switchBlockers` and `logoutBlockers`.
+   *
+   * Extracted so the two paths cannot drift: a sign-out that skipped one of these while a
+   * switch refused on it would be a way to reach, by a different route, precisely the state
+   * the switch guard exists to prevent. `action` only shapes the operator-facing sentence.
+   */
+  private exposureBlockers(action: string): SwitchBlocker[] {
+    const blockers: SwitchBlocker[] = [];
     const probe = this.probe;
     if (!probe) return blockers;
 
     if (probe.scannerRunning()) {
       blockers.push({
         reason: "scanner_running",
-        detail: "The Box scanner is running. Press STOP before changing broker.",
+        detail: `The Box scanner is running. Press STOP before ${action}.`,
       });
     }
     const openCount = probe.openPositionCount();
@@ -2253,7 +2442,7 @@ export class ActiveBrokerManager {
     if (working > 0) {
       blockers.push({
         reason: "working_orders",
-        detail: `${working} broker order(s) still working. Cancel them before changing broker.`,
+        detail: `${working} broker order(s) still working. Cancel them before ${action}.`,
       });
     }
     if (probe.executionInFlight()) {
@@ -2279,22 +2468,8 @@ export class ActiveBrokerManager {
     if (unknown > 0) {
       blockers.push({
         reason: "unknown_order_state",
-        detail: `${unknown} order(s) are in an unknown state. Reconcile before changing broker.`,
+        detail: `${unknown} order(s) are in an unknown state. Reconcile before ${action}.`,
       });
-    }
-    // Unresolved intents on the broker we are LEAVING can only ever be reconciled
-    // through that broker, and after the switch its adapter is gone.
-    const leaving = this.active;
-    if (leaving !== target) {
-      const outstanding = await probe.unresolvedIntentsFor(leaving).catch(() => 0);
-      if (outstanding > 0) {
-        blockers.push({
-          reason: "foreign_unresolved_intents",
-          detail:
-            `${outstanding} unresolved ${leaving} order intent(s) remain. They can only be reconciled ` +
-            `through ${leaving}, so resolve them before switching to ${target}.`,
-        });
-      }
     }
     return blockers;
   }

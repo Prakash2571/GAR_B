@@ -102,10 +102,22 @@ GET /api/tokens/dhan        header  x-token-access-key: <TOKEN_EXPOSURE_KEY>
 Zerodha (`Authorization: token <identity>:<access_token>`), the Dhan client id for
 Dhan (`client-id: <identity>`, `access-token: <access_token>`).
 
-A token is returned **only when currently usable** — Zerodha's `login_date` must be
-today's IST day, Dhan's stated expiry must not have passed. Otherwise `409` with a
-reason (`token_unavailable_no_session`, `…_session_expired`, `…_session_stale_day`) so
-a polling caller backs off instead of caching a dead credential.
+A token is returned **only when currently usable**:
+
+- Zerodha's `login_date` must be today's IST day (Kite sessions die at the day boundary);
+- Dhan's stated expiry must not have passed (a `null` expiry is UNKNOWN, and accepted);
+- the `identity` must be non-empty — Zerodha authenticates with the PAIR
+  `api_key:access_token`, so a token with no api key to pair it with is unusable and is
+  reported as such rather than served. The configured `KITE_API_KEY` is used as a fallback
+  before giving up.
+
+Otherwise `409` with a reason (`token_unavailable_no_session`, `…_session_expired`,
+`…_session_stale_day`, `…_no_identity`) so a polling caller backs off instead of caching a
+dead credential.
+
+**Signing out here does not revoke at the broker.** It stops this deployment serving the
+token; a sibling service that already fetched it keeps a working credential until the broker
+itself expires it. Rotate at the broker if a token must be treated as compromised.
 
 **These are the only two routes in this backend that return a plaintext access
 token.** That is a deliberate, bounded exception to the invariant stated below, and it
@@ -311,3 +323,30 @@ is unavailable but Dhan is valid and the system is flat, Dhan is reported
 local mock HTTP server on `127.0.0.1` (never contacting calspread.online), against
 PostgreSQL at `DATABASE_URL`. They **fail loudly** without PostgreSQL rather than
 skipping.
+
+## Signing out
+
+`POST /api/broker/{broker}/logout` drops ONE broker's session: the in-memory token, the
+durable row, and — when that broker is the ACTIVE one — both of its market-data lanes and its
+books. The other broker's session, feed and subscriptions are untouched.
+
+It is **refused with `409 logout_refused`** when the broker being signed out is active and
+still owns exposure or in-flight work, using the same blocker list as
+`POST /api/broker/select`. See `docs/SAFETY_INVARIANTS.md`.
+
+A failed durable clear is reported as a per-broker login problem rather than swallowed: the
+row would still be `active`, so the token-exposure endpoint would keep serving a credential the
+operator believes they have dropped.
+
+## Re-authenticating replaces the sockets, not just the token
+
+Both `completeZerodhaLogin` and `completeDhanLogin` **stop and drop that broker's market-data
+lanes** before replaying the subscription tables, and only when that broker is the active one.
+
+This is load-bearing rather than tidy-up. Neither transport re-authenticates a connection it
+already holds — `TickerHub.ensureSocket` reads credentials only when it has no handle, and both
+feed classes subscribe only tokens they are not already subscribed to — so without dropping the
+sockets first, a re-authentication would leave them bound to the **superseded** token while the
+runtime reported the feed healthy. When the broker later retired that token, the box lane's
+auth-death path tears down without scheduling a reconnect, so the lane would stay dead until the
+next strike-window diff.

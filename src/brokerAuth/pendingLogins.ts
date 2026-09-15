@@ -147,19 +147,38 @@ export class PendingLoginStore {
     const pending = this.entries.get(broker);
     if (!pending) return { ok: false, reason: "no_pending_login" };
 
-    // Remove FIRST, unconditionally: every outcome below consumes the initiation, so a
-    // failed attempt can never be retried against the same entry either.
-    this.entries.delete(broker);
-
-    if (this.now() > pending.expiresAtMs) return { ok: false, reason: "login_expired" };
+    if (this.now() > pending.expiresAtMs) {
+      // Lapsed: remove it. It could never be claimed again anyway, and keeping it would
+      // only let a later caller receive `login_expired` instead of the truthful
+      // `no_pending_login`.
+      this.entries.delete(broker);
+      return { ok: false, reason: "login_expired" };
+    }
 
     if (opts.requireNonce) {
+      /**
+       * A FAILED PROOF MUST NOT CONSUME THE INITIATION.
+       *
+       * This originally deleted the entry before validating anything, on the reasoning that
+       * a single-use claim should be spent whatever the outcome. That was a denial-of-service:
+       * the callback is necessarily unauthenticated, so ANYONE who could reach it could send
+       * one request with a wrong (or absent) `state` and destroy the operator's in-flight
+       * sign-in — repeatably, and with an error message that blamed the operator's own
+       * browser ("could not be matched to a request from this app").
+       *
+       * A caller that cannot present the nonce has proved nothing and therefore consumes
+       * nothing; the entry stays claimable by the real redirect and otherwise lapses on its
+       * TTL. Single-use still holds where it matters, because a MATCHED claim is spent below.
+       */
       if (!presentedNonce) return { ok: false, reason: "state_missing" };
       if (!nonceMatches(presentedNonce, pending.nonce)) {
         return { ok: false, reason: "state_mismatch" };
       }
     }
 
+    // Proof accepted (or not required for this broker): spend the initiation now, so a
+    // replayed callback — Back, a broker retry, a captured URL — finds nothing.
+    this.entries.delete(broker);
     return { ok: true, pending };
   }
 

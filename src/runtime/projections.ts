@@ -79,10 +79,24 @@ export function projectBrokerSession(
   return {
     broker,
     connected: s.authenticated && !s.token_expired,
-    state: !s.authenticated
-      ? "waiting"
-      : s.token_expired
-        ? "expired"
+    /**
+     * EXPIRY IS TESTED FIRST, AND THAT ORDER IS THE POINT.
+     *
+     * This used to test `!authenticated` first, which made `"expired"` unreachable in
+     * practice: both brokers report `authenticated: false` once their token is past its
+     * expiry (Dhan by its stated instant, Zerodha by the IST day boundary), so an expired
+     * session projected as `"waiting"`. The operator was shown "token waiting" — wait for
+     * something — next to a `problems` entry saying the session had expired — go and act.
+     * Two answers to one question, and the less useful one won.
+     *
+     * `"waiting"` now means only what it says: no session has ever been established. If a
+     * token exists and is dead, that is `"expired"`, which is what tells the operator to
+     * sign in AGAIN rather than to sign in.
+     */
+    state: s.token_expired
+      ? "expired"
+      : !s.authenticated
+        ? "waiting"
         : activeBroker === broker
           ? "ready"
           : "standby",

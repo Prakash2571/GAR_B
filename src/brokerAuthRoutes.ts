@@ -50,6 +50,22 @@ import type { Express, Request, RequestHandler, Response } from "express";
 import { getOperatorRole, sendApiError } from "./access/middleware.js";
 import { parseBrokerId, type BrokerId } from "./brokerRoutes.js";
 import type { PendingLoginRejection, PendingLoginStore } from "./brokerAuth/pendingLogins.js";
+import { rateLimit } from "./ratelimit.js";
+
+/**
+ * Window and cap for the UNAUTHENTICATED callback.
+ *
+ * A real operator hits this at most a couple of times per broker per day, so a low ceiling
+ * costs nothing legitimate. It exists because the route cannot require a session (see the
+ * file header) and is therefore the one broker surface an anonymous caller can reach at all.
+ *
+ * This bounds ATTEMPT VOLUME. It is not what makes the route safe — the single-use nonce and
+ * the "cheap refusals never consume" ordering are. Note also that the shared limiter keys on
+ * the first `X-Forwarded-For` value, which a direct caller controls, so a determined attacker
+ * can rotate it; it raises the cost of noise, and nothing more is claimed for it.
+ */
+export const CALLBACK_WINDOW_MS = 60_000;
+export const CALLBACK_MAX_REQUESTS = 20;
 
 /**
  * Why a login attempt ended without a session. Every value is a fixed identifier from
@@ -78,6 +94,13 @@ export interface BrokerLoginProvider {
   logoutDhan(): Promise<void>;
   /** Whether the broker's app credentials are present. Never returns a secret. */
   credentialsFor(broker: BrokerId): { ok: true } | { ok: false; reason: string };
+  /**
+   * Why signing out of `broker` would be unsafe right now. Empty means it is allowed.
+   *
+   * Always empty for the STANDBY broker (it owns nothing); for the ACTIVE broker it is the
+   * same exposure list `POST /api/broker/select` refuses on.
+   */
+  logoutBlockers(broker: BrokerId): Promise<string[]> | string[];
 }
 
 export interface BrokerAuthRouteDeps {
@@ -97,6 +120,8 @@ export interface BrokerAuthRouteDeps {
   mutationsAllowed: () => boolean;
   /** Optional hook so index.ts can push a fresh SSE snapshot after a session changes. */
   onSessionChanged?: (broker: BrokerId) => void;
+  /** Injectable so tests can mount without the shared limiter's timers. */
+  callbackRateLimiter?: RequestHandler;
 }
 
 /**
@@ -215,7 +240,15 @@ export function registerBrokerAuthRoutes(app: Express, deps: BrokerAuthRouteDeps
    * Every exit is a redirect to the frontend, never a JSON body: the browser is a
    * top-level navigation here, so an API error shape would render as raw text.
    */
-  app.get("/api/broker/:broker/callback", async (req: Request, res: Response) => {
+  const callbackLimiter =
+    deps.callbackRateLimiter ??
+    rateLimit({
+      windowMs: CALLBACK_WINDOW_MS,
+      max: CALLBACK_MAX_REQUESTS,
+      message: "Too many broker sign-in callbacks. Please wait a moment and try again.",
+    });
+
+  app.get("/api/broker/:broker/callback", callbackLimiter, async (req: Request, res: Response) => {
     const broker = parseBrokerId(req.params.broker);
     if (!broker) {
       // Nothing to correlate and no broker to name; send the operator back to the
@@ -227,25 +260,27 @@ export function registerBrokerAuthRoutes(app: Express, deps: BrokerAuthRouteDeps
       return;
     }
 
-    // Refuse before consuming the pending entry: a login that cannot be safely completed
-    // must remain claimable once the process is ready, not be burned by a mid-boot hit.
+    /**
+     * EVERY CHEAP REFUSAL HAPPENS BEFORE THE PENDING ENTRY IS TOUCHED.
+     *
+     * This route is unauthenticated by necessity, so anything it consumes, anyone can
+     * consume. The ordering below is the defence: a request that is not even shaped like a
+     * real broker redirect is rejected WITHOUT spending the operator's in-flight login, so
+     * it cannot be used to deny them a sign-in. Only a request that carries a credential
+     * AND (for Zerodha) the matching nonce gets to claim the entry.
+     *
+     * The readiness check is first for a different reason: a login completing mid-boot could
+     * be silently discarded by `restore()` adopting the stored session moments later, so it
+     * must stay claimable until the process is ready rather than be burned now.
+     */
     if (!deps.mutationsAllowed()) {
       fail(res, broker, "not_ready");
       return;
     }
 
-    // ZERODHA round-trips our nonce as `state`; DHAN round-trips nothing of ours. The
-    // requirement is decided HERE by broker, never by whether a `state` happened to be
-    // present — otherwise omitting it would silently downgrade the check.
-    const requireNonce = broker === "zerodha";
-    const claimed = pending.consume(broker, queryString(req, "state") || null, { requireNonce });
-    if (!claimed.ok) {
-      // eslint-disable-next-line no-console
-      console.warn(`[BrokerLogin] ${broker} callback refused: ${claimed.reason}`);
-      fail(res, broker, claimed.reason);
-      return;
-    }
-
+    // The broker itself said no (cancelled/declined). Deliberately does NOT consume: a
+    // forged `?status=error` must not be able to destroy a real login that is still in
+    // flight. The genuine abandoned entry lapses on its TTL.
     if (brokerReportedDenial(req)) {
       fail(res, broker, "broker_denied");
       return;
@@ -254,6 +289,21 @@ export function registerBrokerAuthRoutes(app: Express, deps: BrokerAuthRouteDeps
     const credential = broker === "zerodha" ? queryString(req, "request_token") : queryString(req, "tokenId");
     if (!credential) {
       fail(res, broker, "missing_credential");
+      return;
+    }
+
+    // ZERODHA round-trips our nonce as `state`; DHAN round-trips nothing of ours. The
+    // requirement is decided HERE by broker, never by whether a `state` happened to be
+    // present — otherwise omitting it would silently downgrade the check.
+    //
+    // `consume` spends the entry only on a MATCHED claim, so a wrong nonce leaves it
+    // claimable by the real redirect.
+    const requireNonce = broker === "zerodha";
+    const claimed = pending.consume(broker, queryString(req, "state") || null, { requireNonce });
+    if (!claimed.ok) {
+      // eslint-disable-next-line no-console
+      console.warn(`[BrokerLogin] ${broker} callback refused: ${claimed.reason}`);
+      fail(res, broker, claimed.reason);
       return;
     }
 
@@ -273,7 +323,18 @@ export function registerBrokerAuthRoutes(app: Express, deps: BrokerAuthRouteDeps
       return;
     }
 
-    deps.onSessionChanged?.(broker);
+    // GUARDED: the session is already installed and the entry already spent, so a throw
+    // from a downstream publish hook must not turn a SUCCESSFUL sign-in into a bare 500
+    // with no feedback. The operator would be signed in and told nothing.
+    try {
+      deps.onSessionChanged?.(broker);
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[BrokerLogin] ${broker} signed in, but publishing the change failed:`,
+        err instanceof Error ? err.message : err,
+      );
+    }
     // eslint-disable-next-line no-console
     console.log(`[BrokerLogin] ${broker} session established by ${claimed.pending.startedBy}.`);
     res.redirect(303, loginResultRedirect(deps.frontendUrl, broker, { ok: true }));
@@ -294,12 +355,46 @@ export function registerBrokerAuthRoutes(app: Express, deps: BrokerAuthRouteDeps
       return;
     }
     try {
+      /**
+       * REFUSE WHILE THE SESSION IS STILL LOAD-BEARING.
+       *
+       * Signing out drops the credential that exits, protective cancellation and
+       * reconciliation all depend on. Doing that while a Box is open, an order is working or
+       * an execution is in flight strands real exposure with no way to reduce it —
+       * `POST /api/broker/select` has always refused in exactly those conditions, and a
+       * sign-out reaches the same end state, so it is held to the same standard.
+       *
+       * The frontend also confirms before calling this, but a browser dialog is not a
+       * control: anything holding an operator session can call the API directly, so the
+       * refusal has to live here. Signing out of the STANDBY broker is never blocked.
+       */
+      const blockers = await login.logoutBlockers(broker);
+      if (blockers.length > 0) {
+        res.status(409).json({
+          error: `Cannot sign out of ${broker} while it owns exposure or in-flight work.`,
+          code: "logout_refused",
+          blockers,
+          broker,
+        });
+        return;
+      }
+
       // Drop any in-flight login for this broker too: after an explicit sign-out, a
       // callback from the abandoned round-trip must not silently sign the operator in.
       pending.clear(broker);
       if (broker === "zerodha") await login.logoutZerodha();
       else await login.logoutDhan();
-      deps.onSessionChanged?.(broker);
+      try {
+        deps.onSessionChanged?.(broker);
+      } catch (err) {
+        // The sign-out already happened; a failing publish hook must not report it as a
+        // failure the operator should retry.
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[BrokerLogin] ${broker} signed out, but publishing the change failed:`,
+          err instanceof Error ? err.message : err,
+        );
+      }
       res.status(200).json({ ok: true, broker });
     } catch {
       sendApiError(res, 503, "broker_logout_unavailable", `Could not sign out of ${broker}.`);

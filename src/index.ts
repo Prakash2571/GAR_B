@@ -94,6 +94,7 @@ import {
   type TokenLookup,
 } from "./tokenExposureRoutes.js";
 import { isDhanTokenExpired } from "./brokers/dhan/auth.js";
+import { readZerodhaCredentials } from "./brokers/zerodha/auth.js";
 
 import { MongoExportClient, exportConfigFromEnv } from "./outbox/mongo.js";
 import { Projector } from "./outbox/projector.js";
@@ -171,12 +172,25 @@ const kite = new KiteClient({ apiKey: process.env.KITE_API_KEY_EXPECTED ?? "" })
  */
 let onFeedSessionLost: (() => void) | null = null;
 
+/**
+ * Set once the broker manager exists. Lets the TickerHub's auth-death callback clear the
+ * Zerodha session metadata without this line having to be declared after the manager (the
+ * hub is a constructor argument to it, so the dependency runs the other way).
+ */
+let forgetZerodhaSessionOnFeedDeath: (() => void) | null = null;
+
 const tickerHub = new TickerHub(
   () => ({ apiKey: kite.getApiKey(), accessToken: kite.getAccessToken() }),
   () => {
     // Zerodha rejected the token. Clear memory AND the encrypted stored copy so a
     // restart does not restore a dead token, then let the engine invalidate books.
     kite.clearSession();
+    // Also forget the session METADATA. Without this the manager keeps projecting an
+    // account label and a login day for a session the broker has just rejected, and
+    // `inAppTokenState` reports `waiting` ("sign in") instead of `invalid` ("sign in
+    // AGAIN") — collapsing the one distinction that vocabulary exists to preserve.
+    // Declared after the hub, so it is reached lazily inside this callback.
+    forgetZerodhaSessionOnFeedDeath?.();
     void brokerSessionInternals
       .invalidateSession("zerodha", "feed_auth_failure")
       .catch(() => undefined);
@@ -381,6 +395,8 @@ const boxModule: BoxModule = registerBoxModule(app, {
 });
 
 onFeedSessionLost = () => boxModule.engine.onSessionLost();
+forgetZerodhaSessionOnFeedDeath = () =>
+  brokerManager.forgetZerodhaSession("Zerodha rejected the session — sign in to Zerodha again");
 
 /**
  * Give the broker manager its view of live exposure and the teardown hooks a switch
@@ -580,8 +596,33 @@ const tokenService = new BrokerTokenAcquisitionService({
       brokerManager.activeBroker === broker ? brokerManager.laneStats("box").reconnects : 0,
   },
   callbacks: {
-    installZerodhaToken: (apiKey, accessToken) => {
-      kite.installProvidedToken(apiKey, accessToken);
+    installZerodhaToken: async () => {
+      /**
+       * ROUTED THROUGH THE MANAGER, NOT STRAIGHT INTO THE KITE CLIENT.
+       *
+       * This used to be `kite.installProvidedToken(apiKey, accessToken)`. That installed the
+       * token but left `ActiveBrokerManager.zerodhaSessionMeta` untouched — and that metadata
+       * is now load-bearing, because `sessionFor("zerodha")` derives liveness from the IST
+       * login day recorded in it.
+       *
+       * The failure that caused: a process that boots on day D adopts the stored session and
+       * records `loginDay: D`. It stays up overnight. At 09:00 on D+1 the poller fetches a
+       * perfectly good token and installs it here — but the metadata still says D, so the
+       * day comparison judges the FRESH token stale, `authenticated` goes false, and
+       * `startActiveRuntime()` returns at its `!session.authenticated` guard. No universe
+       * load, no feed, for the rest of the trading day.
+       *
+       * `adoptStoredKiteSession()` re-reads the row `persist.saveZerodha` has just written
+       * and derives the token AND the metadata from it together, so there is exactly one
+       * source of truth. This is precisely what `installDhanToken` below already does, and
+       * why it never had this bug.
+       */
+      const adopted = await brokerManager.adoptStoredKiteSession();
+      console.log(
+        adopted
+          ? "[Token] zerodha session installed into the running broker manager."
+          : "[Token] zerodha session persisted but not adoptable (absent, stale or foreign) — Zerodha stays unauthenticated.",
+      );
     },
     installDhanToken: async () => {
       /**
@@ -890,6 +931,9 @@ registerBrokerAuthRoutes(app, {
         broker === "zerodha" ? brokerManager.zerodhaCredentials() : brokerManager.dhanCredentials();
       return creds.ok ? { ok: true } : { ok: false, reason: creds.reason };
     },
+    // Mapped to bare reason codes, exactly as `switchBlockers` is for POST /api/broker/select,
+    // so the two refusal surfaces speak the same vocabulary.
+    logoutBlockers: async (broker) => (await brokerManager.logoutBlockers(broker)).map((b) => b.reason),
   },
   // A session change alters what the workspace may do, so push a snapshot rather than
   // waiting for the next 5s poll.
@@ -920,12 +964,29 @@ async function currentExposedToken(broker: BrokerId): Promise<TokenLookup> {
     const session = await loadKiteSession();
     if (!session) return { ok: false, reason: "no_session" };
     if (session.login_date !== istDayKey()) return { ok: false, reason: "session_stale_day" };
+    /**
+     * THE IDENTITY MUST BE PRESENT, OR THE TOKEN IS USELESS.
+     *
+     * Zerodha authenticates with the PAIR `api_key:access_token`, so a caller that receives
+     * an empty identity builds `Authorization: token :<token>` and gets a 403. Returning 200
+     * with a blank identity would hand out a dead credential while this surface documents
+     * that it never does — the worst kind of failure, because the caller has no reason to
+     * doubt it.
+     *
+     * The stored column can be empty (a legacy or imported row, or a persist that ran
+     * without one), which is exactly why `adoptStoredKiteSession` carries the same fallback.
+     * Fall back to the configured api key; if there is still nothing to pair the token with,
+     * report it unavailable rather than serve it.
+     */
+    const configured = readZerodhaCredentials();
+    const identity = session.api_key || (configured.ok ? configured.creds.apiKey : "");
+    if (!identity) return { ok: false, reason: "no_identity" };
     return {
       ok: true,
       token: {
         accessToken: session.access_token,
         // The api key is what the token must be paired with in the Authorization header.
-        identity: session.api_key,
+        identity,
         loginDate: session.login_date,
         expiresAtMs: null,
       },
