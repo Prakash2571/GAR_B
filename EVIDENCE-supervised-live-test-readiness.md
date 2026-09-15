@@ -202,20 +202,26 @@ reason:
 
 | Suite | Result |
 |---|---|
-| `test:unit` (`tests/box`) | **2191 pass / 0 fail** |
-| `test:invariants` | **9 / 9** |
-| `test:shutdown` | **11 / 11** |
-| `test:tokens` | 59 pass / 32 fail — *environment* |
-| `test:access` | 7 pass / 2 fail — *environment* |
-| `test:switch` | 0 pass / 32 fail — *environment* |
-| `test:readiness` | 0 pass / 2 fail — *environment* |
-| `test:contract` | 28 pass / 3 fail — *environment* |
-| `test:pg`, `test:projector` | **NOT RUN** — see [§6](#6-what-is-not-proven-here) |
+Local numbers, and the authoritative CI numbers from the merge commit:
+
+| Suite | Local | CI (real PostgreSQL + MongoDB) |
+|---|---|---|
+| `test:unit` (`tests/box`) | 2191 pass / 0 fail | **2191 pass / 0 fail / 0 skipped** |
+| `test:invariants` | 9 / 9 | **9 / 9 / 0 skipped** |
+| `test:pg` | **NOT RUN** — no PostgreSQL | **75 pass / 0 fail / 0 skipped** |
+| `test:projector` | **NOT RUN** — no MongoDB | **17 pass / 0 fail / 0 skipped** |
+| `test:tokens` | 59 pass / 32 fail — *environment* | **90 pass / 0 fail / 0 skipped** |
+| `test:switch` | 0 pass / 32 fail — *environment* | **32 pass / 0 fail / 0 skipped** |
+| `test:access` | 7 pass / 2 fail — *environment* | **31 pass / 0 fail / 0 skipped** |
+| `test:shutdown` | 11 / 11 | **11 pass / 0 fail / 0 skipped** |
+| `test:readiness` | 0 pass / 2 fail — *environment* | **24 pass / 0 fail / 0 skipped** |
+| `test:contract` | 28 pass / 3 fail — *environment* | **59 pass / 0 fail / 0 skipped** |
 
 Every failure marked *environment* is the sandbox, not the code: the npm registry returns **403**, so
-`node_modules` is hollow. `switch`/`tokens` failures are the suites' own guards reporting no reachable
-PostgreSQL; `access`/`readiness`/`contract` failures are a missing `express`. These counts match the
-pre-change baseline exactly. **CI is the authority for all of them.**
+`node_modules` is hollow. `switch`/`tokens` failures were the suites' own guards reporting no reachable
+PostgreSQL; `access`/`readiness`/`contract` failures were a missing `express`. All of them pass in CI.
+**2,539 tests, zero failures, zero skips**, with the workflow's own *"Fail if any database suite
+skipped tests (no silent skips)"* step green — so the counts are not hiding an untested path.
 
 Typecheck: 58 errors both with and without these changes — identical normalised error sets, **0 new,
 0 masked**. All 58 are pre-existing artifacts of the local `pg`/`express`/`mongodb` shims.
@@ -292,26 +298,29 @@ before the window, not during it.
 
 ## 6. What is NOT proven here
 
-### The PostgreSQL gate is BLOCKED locally
+### The PostgreSQL gate: BLOCKED locally, DISCHARGED in CI
 
-`test:pg` and `test:projector` — the real-PostgreSQL and Mongo suites that exercise **crash recovery,
-restart reconciliation and durable session-budget behaviour** — **could not be run in this
-environment**. There is no reachable PostgreSQL and the npm registry is unavailable, so `pg` itself is
-not installed.
+`test:pg` and `test:projector` — the suites that exercise **crash recovery, restart reconciliation and
+durable session-budget behaviour** — **could not be run in this sandbox**: no reachable PostgreSQL, and
+the npm registry returns 403 so `pg` itself is not installed. Nothing in this document's local numbers
+should be read as covering them.
 
-Accordingly, and explicitly: **crash recovery is NOT marked verified, and this work is NOT called
-live-ready on the strength of local testing.** The reasoning about durability in this document is
-*source-level verification* — the write ordering, the fail-closed rollback, the serialized critical
-section, the boot reload — and source reading is not a substitute for executing the suites.
+They **did** run in CI on the merge commit, against real PostgreSQL and MongoDB: **75 and 17 tests,
+zero failures, zero skips**, with the no-silent-skips step green. That is what discharges the gate —
+and it earned its keep: the first push failed it with 16 real failures ([§8](#8-review-round)).
 
-CI **does** run both against real PostgreSQL and MongoDB, and job 3 includes a *"Fail if any database
-suite skipped tests (no silent skips)"* step. **CI passing is a precondition of the verdict below.**
+So crash recovery is verified **by CI**, not by local testing, and the distinction is worth keeping:
+the durability reasoning written into this document is source-level verification (write ordering,
+fail-closed rollback, the serialized critical section, the boot reload), and source reading did not
+catch the null/undefined comparison that CI did.
 
-### Verified by source reading only, not by execution here
+### Still verified by source reading only
 
-* Session attempt budget durability, serialization, fail-closed rollback and boot reload.
-* Restart classification of a durable non-terminal intent unknown to the broker (breaker trip +
-  `recoveryActive`).
+The following were traced through the code but have no dedicated executing test in this change; the
+PostgreSQL suites exercise the surrounding machinery rather than these specific claims:
+
+* The session attempt budget's fail-closed rollback on a failed durable write.
+* Boot reload refusing entry when the session row is unreadable.
 * Crash-recovery quarantine set/clear behaviour.
 
 ### Runtime evidence only the deployment can produce
@@ -428,14 +437,16 @@ client order id under a global unique index, no blind retry of an ambiguous subm
 hedge-first ordering with positive proof of hedge coverage before any dependent SELL) were verified
 to hold as claimed.
 
-**It is not an unconditional GO, for one reason above all:** the real-PostgreSQL crash-recovery and
-restart-reconciliation suites **could not be executed here**. Their behaviour is argued from source,
-and that is not the same as having run them.
+**It is not an unconditional GO** because the remaining conditions are runtime evidence that no test
+suite can produce — whether this deployment, on the day, can name its account, has the migration
+applied, and can actually satisfy the funding gates against the live broker. Those are observations,
+not proofs, and they have to be made before the window rather than inferred from this document.
 
 Proceed only when **all** of the following hold:
 
-1. **CI is green on the merge commit** — all six checks, including *"3. Tests (real PostgreSQL +
-   MongoDB)"* and its no-silent-skips step. This is what discharges the blocked gate in §6.
+1. **CI green on the merge commit** — ✅ **satisfied**: all six checks, 2,539 tests, zero failures,
+   zero skips, including *"3. Tests (real PostgreSQL + MongoDB)"* and its no-silent-skips step. This
+   discharges the gate that was blocked locally (§6).
 2. **Migration 011 is applied** before the new build serves live traffic.
 3. All six items of runtime evidence in §6 are observed on the deployment — in particular a **present,
    masked account identity**, which is now load-bearing rather than cosmetic.
