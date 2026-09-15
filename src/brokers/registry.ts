@@ -2257,11 +2257,55 @@ export class ActiveBrokerManager {
     return this.dhanCharges;
   }
 
-  /** Instruments for the active broker, in the internal shape. */
+  /**
+   * Instruments for the ACTIVE broker, in the internal shape.
+   *
+   * THIS USED TO RETURN `[]` FOR ZERODHA, AND THAT STARVED THE ENTIRE BOX ENGINE.
+   *
+   * ```ts
+   * if (this.active === "zerodha") return [];        // ← the defect
+   * const rows = await this.dhanInstruments.load();
+   * ```
+   *
+   * `src/index.ts` feeds BOTH of the box engine's universe dependencies from this one method:
+   *
+   * ```ts
+   * getAllInstruments: () => brokerManager.instruments(),
+   * getBoard: async () => deriveFnoBoard(await brokerManager.instruments()),
+   * ```
+   *
+   * So with Zerodha active — the production configuration — the engine received an empty dump, and
+   * every stage downstream collapsed silently and in order:
+   *
+   *   `deriveFnoBoard([])` ⇒ no board rows       (it iterates NFO FUT rows grouped by `name`)
+   *   `indexOptionChains([])` ⇒ no chains        (it needs NFO CE/PE rows)
+   *   `board.filter(chains.has(...))` ⇒ empty    (nothing to join)
+   *   no ATM windows, no candidates              (`refreshUniverse`'s loop body never runs)
+   *   `applySubscriptions(∅, ∅)` ⇒ no tokens     (nothing to want)
+   *   `setBoxTokens([])` ⇒ no 0→1 refcount edge  (so `subscribeUpstream("box", …)` is never called)
+   *   ⇒ THE BOX LANE SOCKET IS NEVER CONSTRUCTED — it is created lazily, only on a subscription
+   *
+   * That is the whole reported picture: "box lane disconnected, 0 desired subscriptions, 0 frames,
+   * 0 underlyings" while the broker panel correctly showed an authenticated session. No amount of
+   * market-data health work could fix it, because there was nothing to subscribe to and therefore
+   * no socket to be healthy about.
+   *
+   * THE PROVIDER IS THE ANSWER, NOT A NEW CACHE. `InstrumentProvider` already does exactly what is
+   * needed and is already used correctly by `QuoteProvider` (see the constructor above):
+   *   - ONE CACHE PER BROKER, asserted on read, so a switch cannot serve the other broker's dump;
+   *   - concurrent loads deduplicated through `inFlight`, which matters because `refreshUniverse`
+   *     calls `getAllInstruments()` and `getBoard()` in one `Promise.all` — two calls, one download
+   *     of a multi-megabyte CSV;
+   *   - generation-stamped, so a cache from a previous broker generation is discarded;
+   *   - broker-dispatched INSIDE `fetchFor`, so Dhan still loads `dhanInstruments` and no
+   *     unconditional Kite call is introduced.
+   *
+   * Errors are deliberately NOT swallowed here. A failed instrument load must reach the caller so
+   * it can be reported as a real blocker; returning `[]` on failure is what made this invisible in
+   * the first place.
+   */
   async instruments(): Promise<Instrument[]> {
-    if (this.active === "zerodha") return [];
-    const rows = await this.dhanInstruments.load();
-    return rows;
+    return this.instrumentProvider.load();
   }
 
   get dhanInstrumentStore(): DhanInstrumentStore {

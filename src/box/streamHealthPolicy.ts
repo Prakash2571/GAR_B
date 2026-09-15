@@ -668,11 +668,18 @@ export class MarketDataStateMachine {
   private lastDepthWallAt: number | null = null;
   /** True while the application ingestion pipeline is backed up. */
   private backlog = false;
-  /** Count of heartbeats observed — evidence of transport liveness, never of depth. */
+  /*
+   * EVIDENCE COUNTERS, ALL SCOPED TO THE CURRENT GENERATION.
+   *
+   * Reset together in `onAuthenticated` and `onSessionRestored`. They are published as
+   * current-generation figures, so carrying any of them across a reconnect would let a superseded
+   * socket's traffic vouch for a new one.
+   */
+  /** Heartbeats observed this generation — transport liveness, never depth. */
   private heartbeats = 0;
-  /** Count of inbound frames observed (ticks and heartbeats). */
+  /** Inbound frames observed this generation (ticks and heartbeats). */
   private frames = 0;
-  /** Count of usable-depth observations across all instruments, this generation. */
+  /** Usable-depth observations across all instruments, this generation. */
   private depthObservations = 0;
 
   constructor(opts: MarketDataStateMachineOptions) {
@@ -776,6 +783,18 @@ export class MarketDataStateMachine {
     // so isInstrumentFresh treats them as absent until re-observed under the new generation.
     this.lastDepthAt = null;
     this.lastDepthWallAt = null;
+    /*
+     * ALL THREE EVIDENCE COUNTERS RESET, NOT JUST DEPTH.
+     *
+     * These are published (and documented in the schema) as CURRENT-GENERATION evidence, and only
+     * `depthObservations` used to be reset here. So after a reconnect `frames` still carried the
+     * previous socket's total, which had two consequences: `awaiting_first_tick` became unreachable
+     * for the life of the process, and the diagnosis asserted "Frames are arriving (12)" about a
+     * brand-new socket that had delivered nothing. Evidence from a superseded socket is not evidence
+     * for this one — the same rule the per-instrument readiness map already followed.
+     */
+    this.frames = 0;
+    this.heartbeats = 0;
     this.depthObservations = 0;
     this.backlog = false;
     this.current = "SYNCHRONIZING";
@@ -809,6 +828,8 @@ export class MarketDataStateMachine {
     this.lastFrameWallAt = null;
     this.lastHeartbeatAt = null;
     this.lastHeartbeatWallAt = null;
+    this.frames = 0;
+    this.heartbeats = 0;
     this.depthObservations = 0;
     this.backlog = false;
     this.current = "DISCONNECTED";
@@ -1102,6 +1123,7 @@ export interface MarketDataDiagnostics {
   readonly lastHeartbeatWallAt: number | null;
   readonly lastFrameWallAt: number | null;
   readonly lastDepthWallAt: number | null;
+  /** Evidence counters for the CURRENT generation. Reset on every (re)authentication. */
   readonly heartbeats: number;
   readonly frames: number;
   readonly depthObservations: number;

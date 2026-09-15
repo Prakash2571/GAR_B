@@ -1006,10 +1006,30 @@ export class KiteClient {
     if (!res.ok) {
       const text = await res.text();
       if (res.status === 401 || res.status === 403) {
-        this.clearSession(); // token rejected → log out so state stays clean
+        /*
+         * DO NOT CLEAR THE SESSION FROM THIS ENDPOINT.
+         *
+         * This used to call `clearSession()`, which was defensible while the only caller was a
+         * browser-initiated `/api/quotes`. It is no longer: the box engine's universe pass now reads
+         * this endpoint on a timer, and `marketData().isAuthenticated()` for Zerodha is exactly
+         * `getAccessToken() !== null`. So one 403 here would drop the in-memory token, every
+         * subsequent universe pass would return early at its authentication guard, and the deployment
+         * would sit unauthenticated until a human signed in again — an unattended PM2 process
+         * logged out by a transient broker response.
+         *
+         * The instruments dump is also the WEAKEST possible evidence about a token: attempt 1 is
+         * deliberately unauthenticated because the dump is public, so a 403 here frequently says
+         * something about the endpoint or an edge/WAF rather than about the credential. Genuine token
+         * rejection is detected where it is unambiguous — an authenticated trading/quote call, and the
+         * market-data socket's policy close codes — both of which still clear the session.
+         *
+         * The error is still thrown, and now carries the response body so the real cause is visible.
+         */
         throw new KiteError(
-          "Zerodha would not serve the instruments list without a session. " +
-            "A one-time login is required (click “Connect to Zerodha”).",
+          `Zerodha refused the instruments list (HTTP ${res.status}). The instruments dump is ` +
+            `normally public, so this is more often an endpoint or gateway refusal than an expired ` +
+            `token — the session is deliberately NOT cleared here. If it persists, verify the ` +
+            `session and re-authenticate. Response: ${text.slice(0, 200)}`,
           res.status,
         );
       }
