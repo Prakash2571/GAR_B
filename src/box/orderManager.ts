@@ -342,6 +342,13 @@ export interface OrderManagerStatus {
   unknownOrders: number;
   recoveryActive: boolean;
   safeAttributedReductionReady: boolean;
+  /**
+   * Working broker orders from an interrupted attempt that no waiter in this process owns. Non-zero
+   * blocks NEW ENTRY (their final quantities are unsettled) but never blocks reduction.
+   */
+  unattendedWorkingOrders: number;
+  /** Reconcile passes that discarded an obsolete absolute rebuild because a fill landed mid-pass. */
+  staleReconcilePasses: number;
   /** Matching crash-only exposure exists but its unique durable recovery boundary is unavailable. */
   crashRecoveryEntryQuarantined: boolean;
   tradingDay: string;
@@ -557,6 +564,30 @@ export class BoxOrderManager {
   private unknownOrders = 0;
   private recoveryActive = false;
   private safeAttributedReductionReady = false;
+  /**
+   * Non-terminal durable orders that reconciliation matched at the broker but which NO waiter in this
+   * process owns — i.e. an interrupted attempt's legs, still live and still able to fill.
+   *
+   * Deliberately NOT folded into `safeAttributedReductionReady`: blocking reduction here would strand
+   * exposure, which is the worse failure. The correct response is to CANCEL them and re-establish
+   * final quantities before planning a reduction — see `BoxEngine.flattenAttributedBoxExposure`.
+   */
+  private unattendedWorkingOrders = 0;
+  /**
+   * How many reconcile passes discarded an obsolete exposure rebuild.
+   *
+   * Reconciliation loads its journal snapshot, awaits two broker round trips, then rebuilds the
+   * attributed-position map ABSOLUTELY from that snapshot. A fill committed during those awaits — an
+   * exit that just closed the position, say — is applied incrementally to the same map, and the
+   * absolute rebuild would overwrite it with the PRE-EXIT value. The manager would then believe it
+   * still holds exposure it has already closed, and a further "reduction" against that phantom would
+   * sell through flat into a REVERSE position. The circuit breaker is no defence: reduction admission
+   * reads the same map and stays permitted while the breaker is open.
+   *
+   * A non-zero value here means that race was detected and the stale rebuild refused. Diagnostics
+   * only — a spike means contention worth investigating, not a fault in itself.
+   */
+  private staleReconcilePasses = 0;
   private tradingDay: string;
   private readonly attributedBoxPositions = new Map<string, number>();
   private feedHealthy = false;
@@ -669,6 +700,24 @@ export class BoxOrderManager {
         request: BrokerOrderRequest,
         stamp: CheckedFeedStamp | undefined,
       ) => string | null;
+      /**
+       * IS THIS ENTRY STILL AUTHORISED, at the last instant before its POST?
+       *
+       * ENTRY ONLY. Never consulted for a reduction — an exit, protective cancel or residual unwind
+       * must never be refused because an operator control changed.
+       *
+       * THE DEFECT THIS EXISTS FOR. Admission-time authorisation is not enough. An attempt admitted
+       * a moment ago has passed the session gate, taken its reservations and queued four orders; if
+       * the operator then DISARMS the session, nothing re-checked it and all four orders still went
+       * to the broker. "I pressed stop and it kept trading" is not an acceptable outcome, and the
+       * queue plus broker pacing make that window real rather than theoretical.
+       *
+       * It must NOT merely re-check the remaining attempt budget: an admitted attempt has
+       * legitimately consumed its allowance and would otherwise reject itself.
+       *
+       * Fails CLOSED: a throwing validator blocks the POST.
+       */
+      entryAuthorizationBlockReason?: (request: BrokerOrderRequest) => string | null;
       /**
        * Which broker these samples belong to. Required for timing to be recorded at all,
        * because a sample that cannot be attributed to a broker must never be filed — pooling
@@ -955,6 +1004,14 @@ export class BoxOrderManager {
     if (this.health.broker_positions_api !== "healthy") return "The broker positions API is not healthy.";
     if (this.unknownOrders > 0) {
       return `${this.unknownOrders} order(s) are in an UNKNOWN state; entry waits until they are resolved.`;
+    }
+    // An interrupted attempt's legs are still live at the broker and can still fill. Taking NEW
+    // exposure on top of exposure whose final size is not yet settled is exactly what must not happen.
+    if (this.unattendedWorkingOrders > 0) {
+      return (
+        `${this.unattendedWorkingOrders} working order(s) from an interrupted attempt are still live at ` +
+        `the broker; entry waits until their final quantities are settled.`
+      );
     }
     if (this.recoveryActive) return "Recovery is active; entry waits until exposure is resolved.";
     if (this.isCrashRecoveryEntryQuarantined()) {
@@ -1475,6 +1532,8 @@ export class BoxOrderManager {
       reservedEntryQuantity: this.reservedEntryQuantity,
       reservedReductionQuantity: this.reservedReductionQuantity,
       unknownOrders: this.unknownOrders,
+      unattendedWorkingOrders: this.unattendedWorkingOrders,
+      staleReconcilePasses: this.staleReconcilePasses,
       recoveryActive: this.recoveryActive,
       safeAttributedReductionReady: this.safeAttributedReductionReady,
       crashRecoveryEntryQuarantined: this.isCrashRecoveryEntryQuarantined(),
@@ -2451,6 +2510,7 @@ export class BoxOrderManager {
           // Adapter pacing is done; the next instruction after this callback returns is the HTTP
           // POST. Throwing here PROVES no broker mutation was attempted.
           const reason = this.checkedFeedBlockReason(request, action.checkedFeed) ??
+            this.entryAuthorizationBlockReason(request) ??
             (entryGuard ? this.entryGuardBlockReason(action.request, entryGuard, "pre_post") : null);
           if (reason) {
             hedgeFailureReason = reason;
@@ -2587,6 +2647,23 @@ export class BoxOrderManager {
     }
   }
 
+  /**
+   * Is this ENTRY still authorised by the trading session, at the POST boundary? Null if yes.
+   *
+   * ENTRY only, and fail-closed. See the `entryAuthorizationBlockReason` dependency for why an
+   * admission-time check alone let a disarmed session keep sending orders.
+   */
+  private entryAuthorizationBlockReason(request: BrokerOrderRequest): string | null {
+    if (request.purpose !== "ENTRY") return null;
+    const check = this.deps.entryAuthorizationBlockReason;
+    if (!check) return null;
+    try {
+      return check(request);
+    } catch {
+      return "entry authorisation could not be verified before the broker POST (failed closed)";
+    }
+  }
+
   /** Current-feed authority for one queued request. A validator fault fails closed. */
   private checkedFeedBlockReason(
     request: BrokerOrderRequest,
@@ -2654,6 +2731,7 @@ export class BoxOrderManager {
     try {
       let loadedNonterminalIntents: IBoxOrderIntent[];
       let loadedOwnedIntents: IBoxOrderIntent[];
+
       try {
         loadedNonterminalIntents = await this.deps.persistence.loadNonterminal();
         loadedOwnedIntents = this.deps.persistence.loadOwned
@@ -2819,49 +2897,143 @@ export class BoxOrderManager {
         roles[intent.role] = Math.abs(tradeRoleNet.get(`${intent.trade_id}:${intent.role}`) ?? 0);
         remainingByTrade[intent.trade_id] = roles;
       }
-      // The complete live-intent journal is authoritative for every symbol it has
-      // ever owned, including an exact zero. Open trade docs remain the authority
-      // only for legacy/projected symbols with no live intent history.
-      for (const symbol of ownedSymbols) {
-        this.attributedBoxPositions.set(symbol, intentNetBySymbol.get(symbol) ?? 0);
+      /*
+       * ══════════════════════════════════════════════════════════════════════════════════════════
+       * IS THIS SNAPSHOT STILL CURRENT? An obsolete absolute rebuild is REFUSED, not applied.
+       *
+       * Everything above was derived from a journal snapshot read before two broker round trips. If a
+       * fill was committed during those awaits, the rebuild below would overwrite the newer, correct
+       * exposure with the older value — and the classic sequence is the dangerous one:
+       *
+       *    actual long 75  →  reconcile starts  →  an EXIT sells 75 (actual now 0)
+       *                    →  reconcile restores internal exposure to long 75
+       *                    →  another "reduction" sells 75  →  actual is now SHORT 75.
+       *
+       * The breaker is no defence: reduction admission reads this same map and stays permitted while
+       * the breaker is open, so a corrupted map authorises the over-reduction directly.
+       *
+       * The incremental value is the more recent of the two, so the safe action is to KEEP it and
+       * discard this pass's rebuild. Reconciliation is then reported INCOMPLETE — entry stays blocked,
+       * reduction remains available (it must: refusing to reduce strands exposure), and the next pass
+       * reconciles against a fresh snapshot.
+       *
+       * The position-mismatch comparison is skipped for the same reason: `expected` would be the stale
+       * figure, so it would manufacture a spurious mismatch and trip the breaker on our own staleness.
+       * ══════════════════════════════════════════════════════════════════════════════════════════
+       */
+      /*
+       * DETECTED PER INTENT, not by a global counter. A reconcile pass legitimately commits fills of
+       * its OWN — that is what adopting broker truth means — and a global "did anything change" flag
+       * cannot tell those apart from a concurrent exit's write, so it would discard every adopting
+       * pass. `knownIntents` is updated by `persistOrder` on every committed write, so an entry there
+       * with a HIGHER cumulative fill than this pass's copy is proof that someone else advanced it
+       * after the snapshot was taken.
+       */
+      const snapshotByClient = new Map(reconciledOwnedIntents.map((i) => [i.client_order_id, i]));
+      const staleIntents: IBoxOrderIntent[] = [];
+      for (const known of this.knownIntents.values()) {
+        if (known.filled_quantity <= 0) continue;
+        // Only symbols this pass is about to rebuild can be corrupted by it.
+        if (!ownedSymbols.has(`${known.exchange}:${known.tradingsymbol}`)) continue;
+        const snapshot = snapshotByClient.get(known.client_order_id);
+        // ABSENT is as stale as BEHIND: the dangerous case is a whole new EXIT that closed the
+        // position after the snapshot was read, which the snapshot cannot represent at all.
+        if (!snapshot || known.filled_quantity > snapshot.filled_quantity) staleIntents.push(known);
       }
-      this.recalculateGrossAttributedQuantity();
+      const snapshotIsStale = staleIntents.length > 0;
       const positionMismatches: Array<{ symbol: string; expected: number; actual: number }> = [];
-      for (const symbol of identityMismatchSymbols) {
-        positionMismatches.push({
-          symbol,
-          expected: this.attributedBoxPositions.get(symbol) ?? 0,
-          actual: Number.NaN,
-        });
-      }
-      const brokerBySymbol = new Map(
-        positions.map((position) => [`${position.exchange}:${position.tradingsymbol}`, position.net_quantity]),
-      );
-      const allSymbols = new Set([...this.attributedBoxPositions.keys(), ...brokerBySymbol.keys()]);
-      for (const symbol of allSymbols) {
-        const expected = this.attributedBoxPositions.get(symbol) ?? 0;
-        const actual = brokerBySymbol.get(symbol) ?? 0;
-        if (expected !== actual && (expected !== 0 || ownedSymbols.has(symbol))) {
-          positionMismatches.push({ symbol, expected, actual });
-          for (const intent of reconciledOwnedIntents) {
-            if (`${intent.exchange}:${intent.tradingsymbol}` === symbol && intent.trade_id) affectedTradeIds.add(intent.trade_id);
-          }
-          this.recoveryActive = true;
-          this.trip(`broker-position mismatch for attributed Box symbol ${symbol}: expected ${expected}, actual ${actual}`);
+
+      if (!snapshotIsStale) {
+        // The complete live-intent journal is authoritative for every symbol it has
+        // ever owned, including an exact zero. Open trade docs remain the authority
+        // only for legacy/projected symbols with no live intent history.
+        for (const symbol of ownedSymbols) {
+          this.attributedBoxPositions.set(symbol, intentNetBySymbol.get(symbol) ?? 0);
         }
+        this.recalculateGrossAttributedQuantity();
+        for (const symbol of identityMismatchSymbols) {
+          positionMismatches.push({
+            symbol,
+            expected: this.attributedBoxPositions.get(symbol) ?? 0,
+            actual: Number.NaN,
+          });
+        }
+        const brokerBySymbol = new Map(
+          positions.map((position) => [`${position.exchange}:${position.tradingsymbol}`, position.net_quantity]),
+        );
+        const allSymbols = new Set([...this.attributedBoxPositions.keys(), ...brokerBySymbol.keys()]);
+        for (const symbol of allSymbols) {
+          const expected = this.attributedBoxPositions.get(symbol) ?? 0;
+          const actual = brokerBySymbol.get(symbol) ?? 0;
+          if (expected !== actual && (expected !== 0 || ownedSymbols.has(symbol))) {
+            positionMismatches.push({ symbol, expected, actual });
+            for (const intent of reconciledOwnedIntents) {
+              if (`${intent.exchange}:${intent.tradingsymbol}` === symbol && intent.trade_id) affectedTradeIds.add(intent.trade_id);
+            }
+            this.recoveryActive = true;
+            this.trip(`broker-position mismatch for attributed Box symbol ${symbol}: expected ${expected}, actual ${actual}`);
+          }
+        }
+      } else {
+        /*
+         * DELIBERATELY NOT `invariantViolation`. This is a race that was DETECTED AND HANDLED
+         * correctly, not a broken invariant: the newer incremental value was kept and the obsolete
+         * rebuild discarded. `invariantViolation` would trip the circuit breaker — which needs an
+         * operator to clear — and would re-enter `reconcile()` from inside `reconcile()`.
+         *
+         * Reporting reconciliation INCOMPLETE is the right response: entry stays blocked, reduction
+         * stays available, and the next pass reconciles a fresh snapshot, so it SELF-HEALS. The
+         * counter makes a persistent problem visible without halting a healthy one.
+         */
+        this.staleReconcilePasses += 1;
+        console.warn(
+          `[Box] reconciliation discarded an obsolete exposure rebuild: ${staleIntents.length} intent(s) ` +
+          `were advanced durably after this pass loaded its snapshot ` +
+          `[${staleIntents.map((i) => i.client_order_id).join(", ")}]. ` +
+          `The newer exposure was kept; the next pass will reconcile a fresh snapshot.`,
+        );
       }
       this.unknownOrders = reconciledNonterminalIntents.filter((intent) => RECONCILE_STATES.has(intent.state)).length;
+      /*
+       * UNATTENDED WORKING ORDERS — an interrupted attempt's legs, still live at the broker.
+       *
+       * THE DEFECT THIS CLOSES. Readiness was scored from `unknownOrders`, which counts only UNKNOWN
+       * and RECONCILIATION_REQUIRED. A durable intent that reconciliation MATCHED against a real
+       * broker order in OPEN / ACKNOWLEDGED / PARTIALLY_FILLED / CANCEL_REQUESTED was therefore
+       * counted as nothing at all — so after a restart mid-attempt, `reconciliation_complete`,
+       * `safe_reduction_ready` and `can_enter` all read TRUE while an order that could still fill was
+       * sitting at the exchange.
+       *
+       * The concrete failure: the process dies after a hedge BUY fills and its short SELL is
+       * submitted. On restart the short is still working. Recovery sees the long, sells it — and the
+       * short then fills, leaving a naked short.
+       *
+       * `!activeClientIds.has(...)` is the discriminator that makes this safe to act on. An order this
+       * process is actively working IS in that set, so a live four-leg attempt does not block its own
+       * remaining legs. An order recovered from a PREVIOUS process life is not, because no waiter in
+       * this process owns it — which is exactly what "unattended" means and exactly what is dangerous.
+       */
+      this.unattendedWorkingOrders = reconciledNonterminalIntents.filter((intent) =>
+        !RECONCILE_STATES.has(intent.state) &&
+        intent.state !== "CREATED" &&
+        !this.activeClientIds.has(intent.client_order_id)
+      ).length;
       for (const intent of reconciledNonterminalIntents) {
         if (RECONCILE_STATES.has(intent.state) && intent.trade_id) affectedTradeIds.add(intent.trade_id);
       }
       this.orphanOrders = orphans.map(cloneOrder);
-      this.safeAttributedReductionReady = missingAtBroker.length === 0 &&
+      // A stale pass proves nothing about broker equality, so it may not certify safe reduction.
+      // Reduction itself stays AVAILABLE (see exposureReductionBlockReason); this flag only withholds
+      // the stronger "the full durable quantity is provably reducible" claim.
+      this.safeAttributedReductionReady = !snapshotIsStale &&
+        missingAtBroker.length === 0 &&
         ownedLookingOrphans.length === 0 && this.unknownOrders === 0 &&
         positionMismatches.every((item) => Number.isFinite(item.actual) && item.expected !== 0 &&
           Math.sign(item.expected) === Math.sign(item.actual) && Math.abs(item.actual) >= Math.abs(item.expected));
       this.lastReconciledAt = this.now();
       this.health.reconciliation = "idle";
-      this.health.reconciliation_complete = this.health.daily_risk_seed === "healthy" &&
+      this.health.reconciliation_complete = !snapshotIsStale &&
+        this.health.daily_risk_seed === "healthy" &&
         missingAtBroker.length === 0 && positionMismatches.length === 0 &&
         ownedLookingOrphans.length === 0 && this.unknownOrders === 0;
       const report = {

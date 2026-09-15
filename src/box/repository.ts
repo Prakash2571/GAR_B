@@ -813,6 +813,61 @@ export async function closeBoxTrade(
  * their column; nested fields set their JSONB column. Parameters start at $2 because
  * $1 is always the id.
  */
+/**
+ * A dotted per-leg patch key, e.g. `legs.0.exit_price`.
+ *
+ * The engine's close path writes individual leg fields this way (a Mongo-era shape kept because it
+ * expresses "touch only this leg's exit evidence" precisely). The index is captured as digits only and
+ * the field must appear in {@link PATCHABLE_LEG_FIELDS}, which is what makes it safe to build a
+ * `jsonb_set` path literal from them.
+ */
+const LEG_PATCH_KEY = /^legs\.(\d+)\.([a-z][a-z0-9_]*)$/;
+
+/**
+ * Leg fields a dotted patch may write. WHITELIST, not a filter — an unlisted field is a bug in the
+ * caller, and silently writing it into the document would let a typo create a phantom leg property
+ * that no reader ever checks.
+ */
+const PATCHABLE_LEG_FIELDS: ReadonlySet<string> = new Set([
+  "exit_price", "exit_bid", "exit_bid_qty", "exit_ask", "exit_ask_qty",
+  "exit_quote_at", "exit_depth", "exit_detected_price", "exit_slippage",
+]);
+
+/**
+ * A value for `jsonb_set`, where SQL NULL is NOT an option.
+ *
+ * `jsonb_set(doc, path, NULL)` returns NULL for the WHOLE DOCUMENT — it would erase all four legs
+ * rather than clear one field. An absent observation must therefore be the JSON literal `null`.
+ */
+function jsonbSetValue(value: unknown): string {
+  if (value === null || value === undefined) return "null";
+  return JSON.stringify(value instanceof Date ? value.toISOString() : value);
+}
+
+/**
+ * Build a partial UPDATE fragment for arbitrary IBoxTrade fields.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────────────────────────
+ * THE DEFECT THIS FIXES — a fully executed exit could not be persisted, deterministically.
+ *
+ * The engine's close payload contains dotted per-leg keys (`legs.0.exit_price`, …). This function
+ * used to interpolate EVERY key straight into the SET list:
+ *
+ * ```ts
+ * sets.push(`${key} = $${values.length + 1}`);      // → "legs.0.exit_price = $2"
+ * ```
+ *
+ * PostgreSQL rejects that with `syntax error at or near ".0"`. So a live box whose four entry legs and
+ * four exit legs had all executed at the broker could not be marked closed: the durable trade stayed
+ * `open`, the in-memory position went to RECOVERY, and the retry re-issued the identical invalid SQL
+ * forever. The operator is then flat at the broker while the backend insists it is not — which is the
+ * worst possible disagreement to carry into a restart, because recovery reconciles an open projection
+ * against exposure that no longer exists.
+ *
+ * Dotted keys are now folded into ONE `jsonb_set` chain on the `legs` column. The path literal is
+ * assembled from a digits-only index and a whitelisted field name, so it carries no caller-controlled
+ * text; the value always travels as a bound parameter.
+ */
 function buildTradePatch(fields: Partial<IBoxTrade>): { sets: string[]; values: unknown[] } {
   const sets: string[] = [];
   const values: unknown[] = [];
@@ -823,9 +878,30 @@ function buildTradePatch(fields: Partial<IBoxTrade>): { sets: string[]; values: 
     "remaining_qty_by_role", "exit_attempts", "scanner_config_snapshot",
   ]);
   const DATE_FIELDS = new Set(["opened_at", "closed_at"]);
+  const legPatches: Array<{ index: string; field: string; value: unknown }> = [];
+
   for (const [key, raw] of Object.entries(fields)) {
     if (raw === undefined) continue;
     if (key === "_id") continue;
+
+    const legMatch = LEG_PATCH_KEY.exec(key);
+    if (legMatch) {
+      const [, index, field] = legMatch;
+      if (!PATCHABLE_LEG_FIELDS.has(field!)) {
+        throw new Error(
+          `Refusing to patch box trade leg field "${field}" (from "${key}"): not in the patchable set. ` +
+          `Add it to PATCHABLE_LEG_FIELDS deliberately, or correct the caller.`,
+        );
+      }
+      legPatches.push({ index: index!, field: field!, value: raw });
+      continue;
+    }
+    if (key.includes(".")) {
+      // Any other dotted path would have produced invalid SQL. Fail loudly at the boundary rather
+      // than at the database, where it reads as a mysterious syntax error mid-close.
+      throw new Error(`Unsupported dotted patch key "${key}" for box_trades.`);
+    }
+
     let value: unknown = raw;
     if (key === "broker") value = brokerValue(raw as BrokerId);
     if (DATE_FIELDS.has(key)) value = asDate(raw as never);
@@ -837,6 +913,25 @@ function buildTradePatch(fields: Partial<IBoxTrade>): { sets: string[]; values: 
       sets.push(`${key} = $${values.length + 1}`);
     }
   }
+
+  if (legPatches.length > 0) {
+    // A whole-array `legs` replacement in the same patch becomes the BASE the per-leg writes apply
+    // on top of. Emitting both as separate assignments would be "multiple assignments to same
+    // column", and picking one arbitrarily would silently discard the other.
+    const existing = sets.findIndex((s) => s.startsWith("legs = "));
+    let expr = "legs";
+    if (existing >= 0) {
+      expr = sets[existing]!.slice("legs = ".length);
+      sets.splice(existing, 1);
+    }
+    for (const patch of legPatches) {
+      values.push(jsonbSetValue(patch.value));
+      // Path text is digits + a whitelisted identifier; the VALUE is always a bound parameter.
+      expr = `jsonb_set(${expr}, '{${patch.index},${patch.field}}', $${values.length + 1}::jsonb, true)`;
+    }
+    sets.push(`legs = ${expr}`);
+  }
+
   return { sets, values };
 }
 
@@ -1397,17 +1492,36 @@ const INTENT_STATE_PREDECESSORS: Readonly<Record<BoxOrderIntentState, readonly B
   SUBMITTING: ["CREATED", "SUBMITTING"],
   ACKNOWLEDGED: ["SUBMITTING", "ACKNOWLEDGED", "UNKNOWN", "RECONCILIATION_REQUIRED"],
   OPEN: ["SUBMITTING", "ACKNOWLEDGED", "OPEN", "UNKNOWN", "RECONCILIATION_REQUIRED"],
-  PARTIALLY_FILLED: ["ACKNOWLEDGED", "OPEN", "PARTIALLY_FILLED", "UNKNOWN", "RECONCILIATION_REQUIRED"],
+  /*
+   * SUBMITTING IS A LEGITIMATE PREDECESSOR OF EVERY OBSERVED OUTCOME.
+   *
+   * The manager writes SUBMITTING, then awaits the adapter's whole lifecycle (place, poll, possibly
+   * protective-cancel), then persists the snapshot it gets back. That snapshot can legitimately be
+   * PARTIALLY_FILLED, CANCEL_REQUESTED or CANCELLED without any intermediate state ever having been
+   * written — nothing is obliged to persist an interim label, and the periodic reconciler may not have
+   * run in between.
+   *
+   * Omitting SUBMITTING here did not make anything safer; it made the durable record WRONG. The guard
+   * refused the write, the intent stayed at SUBMITTING with a possibly-null broker order id, and a
+   * cancelled leg carrying a PARTIAL FILL had its attribution withheld — which is what blocks the
+   * unwind of exactly the exposure that most needs unwinding. A refused transition is not a safe
+   * no-op when the broker has already acted.
+   */
+  PARTIALLY_FILLED: [
+    "SUBMITTING", "ACKNOWLEDGED", "OPEN", "PARTIALLY_FILLED", "UNKNOWN", "RECONCILIATION_REQUIRED",
+  ],
   COMPLETE: [
     "SUBMITTING", "ACKNOWLEDGED", "OPEN", "PARTIALLY_FILLED", "CANCEL_REQUESTED",
     "CANCELLED", "UNKNOWN", "RECONCILIATION_REQUIRED", "COMPLETE",
   ],
+  // SUBMITTING included for the same reason as PARTIALLY_FILLED above: a protective cancel can be
+  // requested inside the adapter call, before any interim state was ever persisted.
   CANCEL_REQUESTED: [
-    "ACKNOWLEDGED", "OPEN", "PARTIALLY_FILLED", "CANCEL_REQUESTED", "UNKNOWN",
+    "SUBMITTING", "ACKNOWLEDGED", "OPEN", "PARTIALLY_FILLED", "CANCEL_REQUESTED", "UNKNOWN",
     "RECONCILIATION_REQUIRED",
   ],
   CANCELLED: [
-    "ACKNOWLEDGED", "OPEN", "PARTIALLY_FILLED", "CANCEL_REQUESTED", "UNKNOWN",
+    "SUBMITTING", "ACKNOWLEDGED", "OPEN", "PARTIALLY_FILLED", "CANCEL_REQUESTED", "UNKNOWN",
     "RECONCILIATION_REQUIRED", "CANCELLED",
   ],
   REJECTED: ["CREATED", "SUBMITTING", "ACKNOWLEDGED", "OPEN", "REJECTED"],

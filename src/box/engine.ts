@@ -751,6 +751,11 @@ export class BoxEngine {
   private pendingResidualPersists = new Map<string, BoxExecutionAttemptProjectionCommand>();
   /** Attempt ids whose residual is being flattened right now (concurrency guard). */
   private residualFlattenInFlight = new Set<string>();
+  /**
+   * The armed session id that authorised the most recent admitted entry attempt, re-checked at the
+   * POST boundary. Null when no attempt has been admitted, or when sessions are not enforcing.
+   */
+  private entryAuthorizedSessionId: string | null = null;
   /** Bounded watchdog that works outstanding residuals; runs only while any exist. */
   private residualFlattenTimer: NodeJS.Timeout | null = null;
   private static readonly RESIDUAL_FLATTEN_MS = 2_000;
@@ -1119,6 +1124,34 @@ export class BoxEngine {
           queueModel: this.cfg.queueModel,
           queueLiquidityHaircutPct: this.cfg.queueLiquidityHaircutPct,
         }),
+        /*
+         * THE SESSION MUST STILL AUTHORISE THIS ENTRY AT THE POST BOUNDARY.
+         *
+         * Admission-time authorisation is not enough. Between admission and transmit an attempt sits
+         * in the priority queue and behind broker pacing — a real window in which an operator can
+         * disarm the session. Nothing re-checked it, so a disarmed one-attempt session still sent all
+         * four orders. This closes that window.
+         *
+         * Deliberately NOT a budget re-check: an admitted attempt has legitimately spent its
+         * allowance and must not reject itself for that.
+         */
+        entryAuthorizationBlockReason: () => {
+          // Sessions not enforcing (no durable session layer, or no ceilings armed): unchanged
+          // behaviour — there is no authorisation to withdraw.
+          if (!this.session.enforcing()) return null;
+          const record = this.session.snapshot();
+          const armed = record.session_id !== "" && record.armed_at !== null;
+          if (!armed) {
+            return "the trading session was DISARMED after this entry was admitted; no further entry order may be sent";
+          }
+          if (this.entryAuthorizedSessionId !== null && record.session_id !== this.entryAuthorizedSessionId) {
+            return (
+              "the trading session was re-armed under a new session id after this entry was admitted; " +
+              "its authorisation is void"
+            );
+          }
+          return null;
+        },
       });
     }
     const centralGateway = this.centralGateway = new CentralBoxExecutionGateway({
@@ -1320,7 +1353,14 @@ export class BoxEngine {
       // spent its budget — which is the entire point of bounding attempts rather than completions.
       // Returning ok:false refuses the entry, because an attempt that could not be durably counted
       // would be an unbounded one.
-      sessionConsumeAttempt: () => this.session.recordAttemptStarted(),
+      sessionConsumeAttempt: async () => {
+        const consumed = await this.session.recordAttemptStarted();
+        // REMEMBER WHICH ARMED SESSION AUTHORISED THIS ATTEMPT. Read back at the POST boundary so a
+        // disarm (or a re-arm under a new id) between admission and transmit voids the authorisation
+        // instead of being noticed only after four orders have gone to the broker.
+        if (consumed.ok) this.entryAuthorizedSessionId = this.session.snapshot().session_id || null;
+        return consumed;
+      },
     });
     this.execution = this.coordinator;
 
@@ -2148,14 +2188,76 @@ export class BoxEngine {
     return this.orderManager.cancelWorkingBoxOrders();
   }
 
-  async flattenAttributedBoxExposure(): Promise<{ attempted: number; results: unknown[] }> {
+  async flattenAttributedBoxExposure(): Promise<{
+    attempted: number;
+    results: unknown[];
+    settlement: { cancelled: number; failures: string[]; blocked: string | null; reconciled: boolean };
+  }> {
     if (!this.orderManager) throw new Error("Live order manager is unavailable.");
     const managerStatus = this.orderManager.status();
     if (!managerStatus.controls.emergencyFlatten) {
       throw new Error("box_emergency_flatten is disabled.");
     }
-    if (!managerStatus.health.reconciliation_complete && !this.orderManager.canSafelyReduceAttributedExposure()) {
-      throw new Error("Cannot flatten until broker state proves the full durable Box quantity can be reduced safely.");
+
+    /*
+     * ══════════════════════════════════════════════════════════════════════════════════════════════
+     * SETTLE BEFORE YOU PLAN: latch entry off, cancel working orders, then re-establish quantities.
+     *
+     * THE DEFECT THIS CLOSES. Flatten used to go straight from its readiness gate to planning
+     * reductions against the CURRENT attributed-position snapshot. But a working broker order — an
+     * interrupted attempt's leg, recovered on restart and matched by reconciliation — can still fill.
+     * Reconciliation reported `complete` anyway, because readiness counted only UNKNOWN /
+     * RECONCILIATION_REQUIRED intents and a matched OPEN order counted as nothing.
+     *
+     * So the sequence that loses money was: crash after a hedge BUY fills and its short SELL is
+     * submitted; restart; flatten sees the long, sells it; the still-working short then fills. The
+     * flatten created the naked short it was invoked to prevent.
+     *
+     * Planning a reduction against a quantity that another order is still changing is the whole
+     * problem, so the fix is ORDERING, not refusal — refusing here would strand the exposure, which is
+     * strictly worse. Three steps, in this order:
+     *
+     *   1. LATCH ENTRY OFF, so nothing new is added while we work. Reduction is deliberately
+     *      untouched: `box_entry_enabled` never gates getting flat.
+     *   2. CANCEL WORKING ORDERS, which removes the "can still fill" hazard at its source. A refusal
+     *      or partial sweep is reported and does NOT abort the flatten — cancellation failing is
+     *      precisely when flattening matters most — but it is surfaced so the operator sees it.
+     *   3. RE-RECONCILE, so the reduction is planned against post-cancellation broker truth rather
+     *      than the snapshot that was current before we cancelled anything.
+     * ══════════════════════════════════════════════════════════════════════════════════════════════
+     */
+    this.orderManager.setControls({ entryEnabled: false });
+    const settlement: { cancelled: number; failures: string[]; blocked: string | null; reconciled: boolean } = {
+      cancelled: 0, failures: [], blocked: null, reconciled: false,
+    };
+    try {
+      const sweep = await this.orderManager.cancelWorkingBoxOrders();
+      settlement.cancelled = sweep.cancelled.length;
+      settlement.failures = sweep.failures;
+      settlement.blocked = sweep.blocked_reason;
+    } catch (error) {
+      // Never let a cancellation fault stop the flatten; record it and continue.
+      settlement.failures = [error instanceof Error ? error.message : String(error)];
+    }
+    try {
+      await this.orderManager.reconcile();
+      settlement.reconciled = true;
+    } catch (error) {
+      settlement.failures = [
+        ...settlement.failures,
+        `post-cancel reconcile failed: ${error instanceof Error ? error.message : String(error)}`,
+      ];
+    }
+
+    // Re-read AFTER settling: the gate below must judge post-cancellation state, not the snapshot
+    // captured before the sweep.
+    const settledStatus = this.orderManager.status();
+    if (!settledStatus.health.reconciliation_complete && !this.orderManager.canSafelyReduceAttributedExposure()) {
+      throw new Error(
+        "Cannot flatten until broker state proves the full durable Box quantity can be reduced safely" +
+        (settlement.blocked ? ` (cancellation was refused: ${settlement.blocked})` : "") +
+        (settlement.failures.length > 0 ? ` [settlement issues: ${settlement.failures.join("; ")}]` : ""),
+      );
     }
     const positions = this.positions.list();
     const projectedSymbols = new Set<string>();
@@ -2261,7 +2363,10 @@ export class BoxEngine {
       });
       results.push(bootFlatten);
     }
-    return { attempted: positions.length + crashOnly.length, results };
+    // `settlement` is published so the operator can see what the flatten did BEFORE it planned:
+    // whether working orders were cancelled, whether any refused, and whether quantities were
+    // re-established. A flatten that proceeded on an unreconciled snapshot must be visible as such.
+    return { attempted: positions.length + crashOnly.length, results, settlement };
   }
 
   /**

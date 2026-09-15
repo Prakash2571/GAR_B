@@ -1101,8 +1101,71 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
   async flattenResidual(args: Parameters<BoxExecutionSimulator["flattenResidual"]>[0]): ReturnType<BoxExecutionSimulator["flattenResidual"]> {
     if (this.mode !== "live") return this.deps.simulator.flattenResidual(args);
     const manager = this.requireManager();
+    /*
+     * ══════════════════════════════════════════════════════════════════════════════════════════════
+     * SHORTS FIRST, AND LONGS ONLY ONCE THE SHORTS ARE PROVEN GONE.
+     *
+     * THE DEFECT THIS REPLACES. This loop used to be:
+     *
+     *     for (const residual of args.residual) {
+     *       passes.push(await this.flattenOneResidual(manager, args.keyPrefix, residual));
+     *     }
+     *
+     * — every residual reversed independently, in whatever order the array happened to arrive.
+     * Normal exits and the immediate protective unwind both understand hedge dependencies; this
+     * separate periodic path did not.
+     *
+     * The failure is concrete. An incomplete or recovered box holds long option hedges and short
+     * options. The loop sells both longs successfully, then its short-closing BUYs fail to fill. What
+     * remains is a NAKED SHORT OPTION — unlimited-risk exposure manufactured by the very routine whose
+     * job was to remove risk. Merely sorting shorts first does not fix it either: a short-close that
+     * fails must still prevent the subsequent sale of its cover, and ordering alone cannot express that.
+     *
+     * THE RULE NOW: no long residual is released while ANY short residual remains unproven.
+     *
+     * "Proven" means the disposition is `flattened` — the broker's own terminal outcome accounted for
+     * the full requested quantity. Working, rejected, ambiguous, partially filled and not-sent all
+     * count as NOT closed, which is the whole point: those are exactly the states in which a hedge is
+     * still doing its job.
+     *
+     * The gate is deliberately whole-position rather than per-contract. A box's protection is not a
+     * neat one-to-one pairing, and holding a long option one extra cycle costs time value, whereas
+     * releasing it one cycle early can cost without bound. Retained longs are returned as remaining
+     * residuals with their identity untouched, so the next pass reconsiders them — and once the shorts
+     * are closed they flatten normally.
+     * ══════════════════════════════════════════════════════════════════════════════════════════════
+     */
+    const isShort = (r: ResidualLegExposure): boolean => r.side === "SELL";
+    const shortResiduals = args.residual.filter(isShort);
+    const longResiduals = args.residual.filter((r) => !isShort(r));
+
     const passes: ResidualFlattenPass[] = [];
-    for (const residual of args.residual) {
+    for (const residual of shortResiduals) {
+      passes.push(await this.flattenOneResidual(manager, args.keyPrefix, residual));
+    }
+
+    // Every short must be PROVEN gone before any cover is released.
+    const unresolvedShorts = passes.filter((p) => p.disposition !== "flattened");
+    const coverMustBeHeld = unresolvedShorts.length > 0;
+
+    for (const residual of longResiduals) {
+      if (coverMustBeHeld) {
+        const blocking = unresolvedShorts
+          .map((p) => `${p.residual.role}(${p.disposition}${p.failure ? `:${p.failure}` : ""})`)
+          .join(", ");
+        passes.push({
+          residual,
+          // The identity is NOT advanced: nothing was sent under it.
+          attempt: residualFlattenAttempt(residual),
+          order: null,
+          disposition: dispositionForFailure("hedge_cover_retained"),
+          failure: "hedge_cover_retained",
+          detail:
+            `held as cover while ${unresolvedShorts.length} short residual(s) remain unproven ` +
+            `[${blocking}]; selling it now would create naked short exposure`,
+        });
+        continue;
+      }
       passes.push(await this.flattenOneResidual(manager, args.keyPrefix, residual));
     }
 

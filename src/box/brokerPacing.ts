@@ -727,7 +727,19 @@ export class RateBudgetLedger {
    * checked against `perWorkerLimit` (published − share, NO reserve subtracted), so the reserve
    * is exactly the headroom recovery gets that placement does not.
    */
-  check(klass: BrokerEndpointClass, now: number): BudgetDecision {
+  /**
+   * @param opts.protective  This mutation REDUCES risk (an exit, an emergency residual unwind, a
+   *   protective cancel), so it may draw on the recovery reserve even though the broker meters it as
+   *   a placement.
+   *
+   *   WHY THIS PARAMETER EXISTS. Eligibility for the reserve used to be inferred purely from the
+   *   BROKER'S endpoint class: `order_cancel` and `order_modify` got the reserve, everything else did
+   *   not. But "which endpoint the broker meters" and "does this order add or remove risk" are
+   *   different questions, and only the second one should decide who may spend the reserve. An
+   *   emergency buyback that closes a naked short is a `POST /orders` like any other, so it was
+   *   refused with reserved capacity sitting unused — at exactly the moment the reserve existed for.
+   */
+  check(klass: BrokerEndpointClass, now: number, opts?: { protective?: boolean }): BudgetDecision {
     if (!isOrderEndpoint(klass)) {
       return { allowed: true, bindingWindow: null, reason: "data read: not order-budget metered", retryAtMs: null };
     }
@@ -740,7 +752,9 @@ export class RateBudgetLedger {
       };
     }
     this.prune(now);
-    const isRecovery = klass === "order_cancel" || klass === "order_modify";
+    // RISK PURPOSE, not endpoint class, decides reserve eligibility. Cancel/modify are protective by
+    // nature; a placement is protective only when the caller proves it reduces exposure.
+    const isRecovery = klass === "order_cancel" || klass === "order_modify" || opts?.protective === true;
     const budgets = placementBudgets(this.limits, this.policy);
     for (const b of budgets) {
       if (b.accountLimit === null) continue;
@@ -753,7 +767,9 @@ export class RateBudgetLedger {
           bindingWindow: b.window,
           reason:
             `${klass} would breach the ${b.window} budget: ${used}/${ceiling} used` +
-            (isRecovery ? " (recovery ceiling, reserve included)" : " (placement ceiling, reserve withheld)"),
+            (isRecovery
+              ? ` (recovery ceiling, reserve included${opts?.protective ? "; protective placement" : ""})`
+              : " (placement ceiling, reserve withheld)"),
           // Earliest the oldest in-window request ages out.
           retryAtMs: this.oldestInWindow(b.spanMs, now) + b.spanMs,
         };
