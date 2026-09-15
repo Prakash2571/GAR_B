@@ -27,6 +27,44 @@ function num(name: string, fallback: number): number {
   return Number.isFinite(v) ? v : fallback;
 }
 
+/**
+ * A TIMER PERIOD in milliseconds. A non-positive value is NOT honoured.
+ *
+ * WHY THIS EXISTS — A ZERO PERIOD IS A HOT LOOP, NEVER A CONFIGURATION
+ * These values are passed straight to `setInterval`. `setInterval(fn, 0)` does not mean
+ * "disabled" and does not mean "use the default" — it means *run as fast as the event loop
+ * allows*, forever. Four of these periods drive the universe refresh, the indicative refresh,
+ * the SSE publish and the position monitor, so a zero turns each into a spin loop. Together
+ * they saturate the event loop, which starves the market-data drain (so depth never arrives
+ * and the feed reports down while the socket is open), and makes HTTP requests time out at
+ * the reverse proxy as intermittent 502s. The system looks broken in four unrelated places
+ * and none of them names the cause.
+ *
+ * That was not hypothetical: `.env.example` shipped `BOX_UNIVERSE_REFRESH_MS=0` and friends
+ * under a header saying "the defaults ARE the shipped specification", while `num()` treats an
+ * explicit `0` as a finite value and returns it. Copying the example file verbatim — the
+ * documented way to start — produced exactly that failure.
+ *
+ * So a non-finite, zero or negative period falls back to the code default, and a positive one
+ * is floored at `minMs` so a typo like `1` cannot approximate the same spin loop. Values that
+ * legitimately use 0 to mean "unbounded" or "disabled" (`BOX_MAX_UNDERLYINGS`,
+ * `BOX_MAX_CROSS_LEG_EXCHANGE_DISPERSION_MS`, …) keep using `num` and are unaffected — this is
+ * only for periods that become a timer.
+ */
+function periodMs(name: string, fallback: number, minMs = 10): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const v = Number(raw);
+  if (!Number.isFinite(v) || v <= 0) {
+    console.warn(
+      `[BoxConfig] ${name}="${raw.trim()}" is not a usable timer period; using the default ${fallback}ms. ` +
+        `A period of 0 would spin the event loop rather than disable the timer. Leave it unset to use the default.`,
+    );
+    return fallback;
+  }
+  return Math.max(minMs, v);
+}
+
 function bool(name: string, fallback: boolean): boolean {
   const raw = process.env[name];
   if (raw === undefined || raw.trim() === "") return fallback;
@@ -1271,11 +1309,11 @@ export function loadBoxConfig(): BoxConfig {
 
     expirySafetyMinutesBeforeClose: num("BOX_EXPIRY_SAFETY_MINUTES", 45),
 
-    monitorIntervalMs: num("BOX_MONITOR_INTERVAL_MS", 1000),
-    persistIntervalMs: num("BOX_PERSIST_INTERVAL_MS", 30_000),
-    publishIntervalMs: num("BOX_PUBLISH_INTERVAL_MS", 500),
-    universeRefreshMs: num("BOX_UNIVERSE_REFRESH_MS", 60_000),
-    indicativeRefreshMs: num("BOX_INDICATIVE_REFRESH_MS", 60_000),
+    monitorIntervalMs: periodMs("BOX_MONITOR_INTERVAL_MS", 1000),
+    persistIntervalMs: periodMs("BOX_PERSIST_INTERVAL_MS", 30_000),
+    publishIntervalMs: periodMs("BOX_PUBLISH_INTERVAL_MS", 500),
+    universeRefreshMs: periodMs("BOX_UNIVERSE_REFRESH_MS", 60_000),
+    indicativeRefreshMs: periodMs("BOX_INDICATIVE_REFRESH_MS", 60_000),
     indicativeDiscovery: bool("BOX_INDICATIVE_DISCOVERY", true),
     // ~150 underlyings × 14 legs ≈ 2,100 tokens ≈ 5 chunked /quote requests a
     // minute, comparable to what a running scanner already costs.
