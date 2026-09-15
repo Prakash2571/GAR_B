@@ -1175,6 +1175,9 @@ const NONTERMINAL_ORDER_STATES: readonly BoxOrderIntentState[] = [
 
 const INTENT_COLUMNS = [
   "id", "client_order_id", "broker_order_id", "broker_mode", "broker", "broker_correlation_id",
+  // The account that placed the order. Nullable: a pre-migration row genuinely does not know, and
+  // is never backfilled — see migration 011.
+  "broker_account",
   "trade_id", "attempt_id", "role", "purpose", "phase", "exchange", "tradingsymbol", "token",
   "side", "quantity", "reference_price", "tick_size", "max_chase_ticks", "limit_price", "state",
   "filled_quantity", "previous_filled_quantity", "average_price", "broker_tag", "reject_family",
@@ -1189,6 +1192,7 @@ function intentInsertValues(id: string, intent: IBoxOrderIntent): unknown[] {
     intent.broker_mode,
     brokerValue(intent.broker),
     intent.broker_correlation_id ?? null,
+    intent.broker_account ?? null,
     intent.trade_id ?? null,
     intent.attempt_id,
     intent.role,
@@ -1225,6 +1229,7 @@ function rowToIntent(row: Record<string, unknown>): BoxOrderIntentRecord {
     broker_mode: row.broker_mode as "paper" | "live",
     broker: brokerValue(row.broker as BrokerId),
     broker_correlation_id: (row.broker_correlation_id as string | null) ?? null,
+    broker_account: (row.broker_account as string | null) ?? null,
     trade_id: (row.trade_id as string | null) ?? null,
     attempt_id: row.attempt_id as string,
     role: row.role as IBoxOrderIntent["role"],
@@ -1540,6 +1545,15 @@ const IMMUTABLE_INTENT_FIELDS = [
   "broker_mode", "trade_id", "attempt_id", "role", "purpose", "phase", "exchange",
   "tradingsymbol", "token", "side", "quantity", "reference_price", "tick_size",
   "max_chase_ticks", "limit_price",
+  /*
+   * THE OWNING ACCOUNT IS IMMUTABLE.
+   *
+   * Reusing a client order id under a DIFFERENT account is exactly the confusion account binding
+   * exists to prevent, so it is refused here alongside the contract and quantity fields. Note this
+   * compares strictly, so `null` (a pre-binding row) and a real account are also a mismatch — which
+   * is the safe direction: it forces explicit resolution rather than silently adopting the row.
+   */
+  "broker_account",
 ] as const;
 
 function assertIntentImmutableMatch(existing: IBoxOrderIntent, proposed: IBoxOrderIntent): void {

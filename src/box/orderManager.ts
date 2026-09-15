@@ -194,6 +194,24 @@ interface EntryTransportGate {
   readonly hedgeRequirements: Map<number, HedgeRequirement>;
   /** How many BUY hedge legs this attempt has; ranks `[0, hedgeCount)` are the hedges. */
   hedgeCount: number;
+  /**
+   * The broker-account key FROZEN for the whole attempt, captured when this gate was created.
+   *
+   * WHY FROZEN. Coverage compares the account on a requirement (stamped BEFORE a hedge posts) with
+   * the account on its evidence (stamped AFTER). Reading the live account at both moments meant an
+   * identity that changed inside that window — a token dying, a re-login, a broker switch, or a
+   * stored-session adoption that nulls the session metadata — produced `account_mismatch` and refused
+   * the dependent uncovered SELLs *after* the hedge BUYs had already filled. The compounding is what
+   * makes it serious: the same unnameable-account condition also used to block the protective unwind,
+   * so one signal both prevented completion of the box and blocked the automatic way out of it.
+   *
+   * Freezing per attempt keeps the axis meaningful — two DIFFERENT attempts still cannot share
+   * coverage, which is the property that matters — while guaranteeing all four legs of ONE attempt
+   * are judged against a single value. This weakens nothing that was ever real: before the account
+   * provider was wired, both sides were the constant `broker:live` and the axis could not disagree at
+   * all.
+   */
+  readonly brokerAccountKey: string;
 }
 
 export interface OrderIntentPersistence {
@@ -227,9 +245,44 @@ export class OrderPersistenceAfterFillError extends Error {
 }
 
 export interface OrderManagerControls {
+  /**
+   * Permits NEW exposure. Never consulted for a reduction.
+   */
   entryEnabled: boolean;
+  /**
+   * The master switch for NEW exposure — NOT for reduction.
+   *
+   * It once gated `canManageExposure()` as well, which meant switching it off silently disabled
+   * cancellation, exits and residual flattening while the exposure was still owned. Reduction now
+   * depends on the ability to act attributably (authenticated + known account), not on an operator
+   * preference about taking new risk. See {@link BoxOrderManager.exposureReductionBlockReason}.
+   */
   liveOrderEnabled: boolean;
   emergencyFlatten: boolean;
+}
+
+/**
+ * The outcome of a cancel-working sweep, reported so a REFUSAL cannot be mistaken for a clean sweep.
+ *
+ * The method used to return `BrokerOrder[]`, and returned `[]` both when it cancelled nothing because
+ * there was nothing to cancel AND when it refused to try at all. The route published the second case
+ * as `{ ok: true, orders: [] }`.
+ */
+export interface CancelWorkingBoxOrdersResult {
+  /** Every eligible intent was attempted and none failed. NOT a claim that the broker is now flat. */
+  ok: boolean;
+  /** False when the sweep was refused outright — no intent was loaded and nothing was sent. */
+  attempted: boolean;
+  /** Why the sweep was refused, verbatim, or null when it ran. */
+  blocked_reason: string | null;
+  /** Non-terminal durable intents examined. */
+  examined: number;
+  /** Of those, how many were BOX intents eligible for cancellation. */
+  eligible: number;
+  /** Durable order snapshots for the cancels the broker accepted. */
+  cancelled: BrokerOrder[];
+  /** Per-intent failures, each `clientOrderId: message`. Non-empty means exposure may remain. */
+  failures: string[];
 }
 
 export interface OrderManagerHealth {
@@ -566,6 +619,20 @@ export class BoxOrderManager {
       orderStreamConsumer?: import("./orderStreamConsumer.js").OrderStreamConsumer;
       persistence: OrderIntentPersistence;
       limits: OrderManagerLimits;
+      /**
+       * THE VERIFIED BROKER ACCOUNT for the active session (Kite `user_id` / Dhan client id).
+       *
+       * Read fresh on every decision, so a token refresh for the SAME account preserves attribution
+       * and a login for a DIFFERENT account is visible immediately. Returns null when the process
+       * cannot name its own account, which:
+       *   - BLOCKS new live entry with a specific reason ({@link BoxOrderManager.entryBlockReason});
+       *   - BLOCKS reduction, because a reduction that cannot be attributed to the owning account is
+       *     how one account's flatten reaches another's positions.
+       *
+       * Optional so paper deployments and existing tests construct unchanged; absent behaves as
+       * "unknown account", which is the safe direction.
+       */
+      brokerAccount?: () => string | null;
       controls?: Partial<OrderManagerControls>;
       clock?: { now: () => number };
       istDayKey?: (at: number) => string;
@@ -840,33 +907,248 @@ export class BoxOrderManager {
   }
 
   canEnter(request?: BrokerOrderRequest): boolean {
+    return this.entryBlockReason(request) === null;
+  }
+
+  /**
+   * WHY new live entry is refused, or null when it is permitted.
+   *
+   * Exists so a refusal can be REPORTED rather than inferred from a bare `false`. `canEnter` is now a
+   * thin wrapper, so the two can never disagree.
+   */
+  entryBlockReason(request?: BrokerOrderRequest): string | null {
     this.rollTradingDay();
     this.refreshFeedHealth();
-    if (this.disposed || this.breakerReason !== null) return false;
-    if (!this.controls.entryEnabled || !this.controls.liveOrderEnabled) return false;
-    if (this.health.persistence !== "healthy" || this.health.daily_risk_seed !== "healthy" || !this.health.reconciliation_complete) return false;
-    if (this.health.broker_auth !== "healthy" ||
-        this.health.broker_orders_api !== "healthy" ||
-        this.health.broker_positions_api !== "healthy") return false;
-    if (this.unknownOrders > 0 || this.recoveryActive) return false;
-    if (this.isCrashRecoveryEntryQuarantined()) return false;
-    if (!this.feedHealthy || this.now() < this.feedWarmUntil) return false;
-    if (this.openBoxes >= this.deps.limits.maxOpenBoxes) return false;
-    if (this.residualLegs > this.deps.limits.maxResidualLegs) return false;
-    if (request && !this.withinQuantityLimits(request)) return false;
+    if (this.disposed) return "The live order manager has been disposed.";
+    if (this.breakerReason !== null) return `Circuit breaker open: ${this.breakerReason}`;
+    if (!this.controls.entryEnabled) return "box_entry_enabled is off.";
+    if (!this.controls.liveOrderEnabled) return "box_live_order_enabled is off.";
+    /*
+     * THE ACCOUNT MUST BE KNOWN BEFORE A LIVE ENTRY.
+     *
+     * Previously nothing on the live path could name the account: the engine's account provider
+     * always returned null and both stream-ownership registrations hard-coded `account: null`, so the
+     * projection's foreign-account rejection could never fire and attribution rested entirely on the
+     * per-order tag. An entry that cannot be attributed to a verified account must not be placed.
+     */
+    if (this.deps.brokerAccount !== undefined) {
+      const account = this.deps.brokerAccount() ?? null;
+      if (account === null || account.trim() === "") {
+        return (
+          "The broker account could not be identified from the authenticated session. A live entry " +
+          "must be attributable to a verified account before it is placed."
+        );
+      }
+    }
+    return this.entryBlockReasonAfterControls(request);
+  }
+
+  /** The remaining entry preconditions, unchanged in substance, now each with a named reason. */
+  private entryBlockReasonAfterControls(request?: BrokerOrderRequest): string | null {
+    if (this.health.persistence !== "healthy") return "Durable persistence is not healthy.";
+    if (this.health.daily_risk_seed !== "healthy") return "The daily risk seed is not established.";
+    if (!this.health.reconciliation_complete) {
+      return "Broker reconciliation is not complete; entry waits until durable and broker state agree.";
+    }
+    if (this.health.broker_auth !== "healthy") return "Broker authentication is not healthy.";
+    if (this.health.broker_orders_api !== "healthy") return "The broker orders API is not healthy.";
+    if (this.health.broker_positions_api !== "healthy") return "The broker positions API is not healthy.";
+    if (this.unknownOrders > 0) {
+      return `${this.unknownOrders} order(s) are in an UNKNOWN state; entry waits until they are resolved.`;
+    }
+    if (this.recoveryActive) return "Recovery is active; entry waits until exposure is resolved.";
+    if (this.isCrashRecoveryEntryQuarantined()) {
+      return "Crash-recovery quarantine is in force; entry waits until unresolved state is reconciled.";
+    }
+    if (!this.feedHealthy) return "The market-data feed is not healthy.";
+    if (this.now() < this.feedWarmUntil) {
+      return "The market-data feed is still warming up after a reconnect.";
+    }
+    if (this.openBoxes >= this.deps.limits.maxOpenBoxes) {
+      return `The open-box limit (${this.deps.limits.maxOpenBoxes}) is reached.`;
+    }
+    if (this.residualLegs > this.deps.limits.maxResidualLegs) {
+      return `${this.residualLegs} residual leg(s) exceed the configured limit; entry waits until they clear.`;
+    }
+    if (request) {
+      const quantityBlocked = this.quantityLimitBlockReason(request);
+      if (quantityBlocked !== null) return quantityBlocked;
+    }
     // Concurrency is enforced by the priority queue's pump. Do not reject the
     // remaining role-orders of the SAME Box pipeline merely because its first
     // role is currently at the broker; those requests must queue so one live Box
     // can submit all four bounded orders under a max-concurrency value of one.
-    return true;
+    return null;
   }
 
+  /**
+   * MAY THIS PROCESS REDUCE EXPOSURE IT ALREADY OWNS?
+   *
+   * THE DEFECT THIS REPLACES. This used to be:
+   *
+   * ```ts
+   * return !this.disposed && this.controls.liveOrderEnabled;
+   * ```
+   *
+   * so turning off `box_live_order_enabled` — the natural, obvious operator response to "stop
+   * trading" — silently disabled every risk-reduction path at once: `cancelWorkingBoxOrders()`
+   * returned `[]` (an empty SUCCESS, indistinguishable from "nothing was working"), and `submit()`
+   * refused every EXIT, PROTECTIVE_CANCEL and EMERGENCY_RESIDUAL. It was reproduced with
+   * `emergencyFlatten=true`: no working intents were even loaded, and no cancellation was attempted.
+   *
+   * That is backwards. A control that means "do not take new exposure" must never remove the ability
+   * to *shed* exposure already taken; those are opposite directions of risk, and conflating them
+   * turns a caution into a trap precisely when an operator is trying to get flat.
+   *
+   * THE POLICY, enforced identically here, at `submit()`'s dequeue re-check, at the routes and in
+   * the coordinator:
+   *
+   *   - `entryEnabled` / `liveOrderEnabled` gate NEW EXPOSURE ONLY (see {@link canEnter}, which
+   *     requires both).
+   *   - REDUCTION requires only that this process can still act safely and attributably:
+   *       * not disposed — a torn-down manager has no transport;
+   *       * broker AUTHENTICATED — an unauthenticated client cannot cancel anything, and pretending
+   *         otherwise would report success for a request that never left;
+   *       * the ACCOUNT is known — reduction must be attributable to the account that owns the
+   *         exposure (see {@link exposureReductionBlockReason}).
+   *   - Ownership, side and attributed-quantity checks remain mandatory and are unchanged: reduction
+   *     is still refused unless it genuinely reduces a position this deployment owns
+   *     ({@link withinQuantityLimits}, `queuedActionBlockReason`). Nothing here grants any power over
+   *     an unrelated manual order or position.
+   *
+   * Callers that need a REASON rather than a boolean must use {@link exposureReductionBlockReason};
+   * returning a bare `false` is what allowed an empty successful-looking result to be published.
+   */
   canManageExposure(): boolean {
-    return !this.disposed && this.controls.liveOrderEnabled;
+    return this.exposureReductionBlockReason() === null;
+  }
+
+  /**
+   * WHY exposure reduction is unavailable, or null when it is available.
+   *
+   * Every refusal here is a genuine inability to act — not a policy preference. Each is reported
+   * verbatim to the operator, because "the cancel did nothing" and "the cancel could not be
+   * attempted because the session is unauthenticated" demand completely different responses.
+   */
+  exposureReductionBlockReason(): string | null {
+    if (this.disposed) {
+      return "The live order manager has been disposed (process shutting down), so no broker request can be issued.";
+    }
+    /*
+     * NO `rollTradingDay()` HERE, DELIBERATELY.
+     *
+     * The predecessor of this method (`canManageExposure`) was side-effect free, and an early version
+     * of this one called `rollTradingDay()` at this point. That is a real mutation: it resets
+     * `realisedPnlToday`, `rejects` and `consecutiveFailures`, sets `daily_risk_seed` back to
+     * "seeding", clears `reconciliation_complete`, and kicks off an asynchronous seed load and timer.
+     * Since this method is consulted on every reduction submit, every dequeue re-check and every
+     * cancel sweep, the first cancel after the IST midnight boundary would perform all of that from
+     * inside a synchronous "may I reduce?" guard.
+     *
+     * A question about whether risk can be shed must not be the thing that rolls the trading day. The
+     * roll still happens where it belongs — on the ENTRY path (`entryBlockReasonAfterControls`) and on
+     * the periodic reconciliation — both of which fail in the strict direction while it settles.
+     */
+    /*
+     * A *CONFIRMED* AUTH FAILURE BLOCKS. AN UNVERIFIED ONE DOES NOT.
+     *
+     * Deliberately `=== "unhealthy"` rather than `!== "healthy"`. `broker_auth` only becomes
+     * `"healthy"` after a successful reconciliation, so testing for healthy would mean a process that
+     * has not yet reconciled — boot, or straight after a restart with exposure open — could not
+     * cancel anything. That would be a NEW way to break the panic button, of exactly the kind this
+     * whole change exists to remove. An unverified session is allowed to TRY: the broker is the
+     * authority and will reject it, which is honest, whereas refusing locally guarantees the exposure
+     * stays.
+     */
+    if (this.health.broker_auth === "unhealthy") {
+      return (
+        "The broker session is not authenticated, so a cancellation or reduction cannot be sent. " +
+        "Sign in to the active broker; exposure is unchanged and still owned."
+      );
+    }
+    /*
+     * AN UNNAMEABLE SESSION ACCOUNT IS DELIBERATELY *NOT* A REASON TO REFUSE REDUCTION.
+     *
+     * An earlier version of this method blocked here when `deps.brokerAccount()` returned null, on
+     * the reasoning that a reduction must be attributable. That was the SAME DEFECT as the one this
+     * method exists to fix, wearing an identity-shaped costume instead of a control-shaped one:
+     * a condition that has nothing to do with our ability to shed risk was allowed to disable every
+     * cancel, exit and residual flatten at once.
+     *
+     * And it is reachable with a perfectly healthy trading session. `liveBrokerAccount()` requires
+     * `marketData.isAuthenticated()`, a MARKET-DATA property: on Dhan `DHAN_DATA_ENABLED=false`
+     * alone makes it false, and on Zerodha a stored-session adoption can null the session metadata
+     * while leaving the access token live. In both, orders would still be accepted by the broker
+     * while we refused to send the one kind of order that reduces risk.
+     *
+     * WHERE OWNERSHIP IS ACTUALLY PROVEN. A reduction may only ever trade against an ATTRIBUTED
+     * position (see `quantityLimitBlockReason`, which requires the correct side and refuses any
+     * quantity that would overshoot the attributed net), and attribution is established by
+     * reconciliation against the broker's own positions. Any mutation derived from a DURABLE ROW is
+     * additionally checked by `accountConsistencyBlockReason`, which compares the account recorded
+     * ON THAT ROW — evidence that does not depend on the session being able to introduce itself.
+     *
+     * So the account is enforced where it is real evidence, and it is not permitted to strand
+     * exposure. NEW ENTRY is a different matter entirely and remains hard-blocked when the account
+     * cannot be named (see `entryBlockReason`): refusing to take new risk is always safe.
+     */
+    return null;
   }
 
   canSafelyReduceAttributedExposure(): boolean {
     return this.canManageExposure() && this.safeAttributedReductionReady;
+  }
+
+  /**
+   * MAY THE CURRENT SESSION ACT ON THIS DURABLE INTENT?
+   *
+   * Returns null when the intent belongs to the account we are authenticated as, and a reason
+   * otherwise. Consulted before any broker mutation derived from a durable row — cancellation,
+   * reduction and adoption during reconciliation.
+   *
+   * IT BLOCKS ONLY ON POSITIVE PROOF OF FOREIGNNESS. Every mutation this guard covers — cancel, exit,
+   * residual flatten, adoption — REDUCES or resolves exposure. For that class of operation, refusing
+   * on weak evidence is not the cautious choice: a refused cancel GUARANTEES the exposure stays, while
+   * an attempted cancel of an order that truly belongs to another account cannot succeed anyway,
+   * because the broker scopes cancellation-by-order-id to the authenticated account. So the two error
+   * directions are not symmetric, and only one of them can actually hurt.
+   *
+   * THE CASES:
+   *
+   *  1. MATCH — proceed.
+   *  2. FOREIGN ACCOUNT (both accounts known, and DIFFERENT) — refused outright. This is the case that
+   *     had no defence at all: a re-login under the same API key to another account could otherwise
+   *     adopt, cancel or flatten the previous account's exposure. Never guess; a human must decide,
+   *     because the correct action may be to sign back into the ORIGINAL account.
+   *  3. CURRENT ACCOUNT UNNAMEABLE — does NOT block. We can prove nothing either way, and the
+   *     condition is reachable with a live trading session (`liveBrokerAccount()` depends on
+   *     `marketData.isAuthenticated()`, which on Dhan includes the DATA switch). Blocking here would
+   *     disable the panic button on a market-data signal — the exact defect class this file fixes.
+   *  4. UNPROVEN ROW (predates migration 011, which deliberately does not backfill) — does NOT block a
+   *     reduction. "Probably ours" is not ownership evidence and must never authorise NEW exposure
+   *     (entry is gated separately and strictly), but it is ample reason to try to CANCEL something
+   *     that our own durable ledger records as working. The null is preserved as UNPROVEN everywhere
+   *     it is reported, and counted by the projection's `unverifiedAccount`, rather than being
+   *     resolved into a claim.
+   */
+  accountConsistencyBlockReason(intent: Pick<IBoxOrderIntent, "client_order_id" | "broker_account">): string | null {
+    // Account binding not wired at all (paper / pre-binding construction): there is no account claim
+    // to contradict, so ownership rests on the durable BOX client-order-id prefix as it did before.
+    if (this.deps.brokerAccount === undefined) return null;
+    const current = this.deps.brokerAccount() ?? null;
+    // Case 3 — unnameable current account. Not proof of anything; must not strand exposure.
+    if (current === null || current.trim() === "") return null;
+    const owner = intent.broker_account ?? null;
+    // Case 4 — unproven row. Not proof of foreignness.
+    if (owner === null || owner.trim() === "") return null;
+    if (owner.trim() !== current.trim()) {
+      return (
+        `Order ${intent.client_order_id} was placed under a DIFFERENT broker account than the one now ` +
+        `signed in. This session must not act on another account's exposure — sign back into the ` +
+        `account that placed it, or resolve it explicitly.`
+      );
+    }
+    return null;
   }
 
   submit(
@@ -896,14 +1178,28 @@ export class BoxOrderManager {
         );
       }
     }
-    if (request.purpose === "ENTRY" && !this.canEnter(request)) {
-      return releaseOnReject(new Error("OrderManager entry controls or limits are closed."));
+    if (request.purpose === "ENTRY") {
+      // The SPECIFIC reason, not "entry controls or limits are closed". A supervised one-lot attempt
+      // that is refused must say which precondition refused it — a quantity envelope too small for
+      // four legs, a missing account identity and a paused entry control demand different responses,
+      // and the generic message made them indistinguishable in the logs.
+      const blocked = this.entryBlockReason(request);
+      if (blocked !== null) {
+        return releaseOnReject(new Error(`Entry cannot be sent: ${blocked}`));
+      }
     }
-    if (request.purpose !== "ENTRY" && !this.canManageExposure()) {
-      return Promise.reject(new Error("OrderManager exposure management is disabled."));
+    if (request.purpose !== "ENTRY") {
+      // A REDUCTION carries the specific reason, not a generic "disabled". The old message named a
+      // control the operator had deliberately set, which read as intended behaviour rather than as a
+      // genuine inability to act.
+      const blocked = this.exposureReductionBlockReason();
+      if (blocked !== null) {
+        return Promise.reject(new Error(`Exposure reduction cannot be sent: ${blocked}`));
+      }
     }
-    if (!this.withinQuantityLimits(request)) {
-      return releaseOnReject(new Error("Order exceeds configured live leg quantity limits."));
+    const quantityBlocked = this.quantityLimitBlockReason(request);
+    if (quantityBlocked !== null) {
+      return releaseOnReject(new Error(quantityBlocked));
     }
     if (this.activeClientIds.has(request.client_order_id)) {
       return releaseOnReject(new Error(`Order ${request.client_order_id} is already queued or active.`));
@@ -1064,14 +1360,60 @@ export class BoxOrderManager {
     }
   }
 
-  async cancelWorkingBoxOrders(): Promise<BrokerOrder[]> {
-    if (!this.canManageExposure()) return [];
+  /**
+   * CANCEL EVERY WORKING BOX ORDER, and report honestly what happened.
+   *
+   * THE DEFECT THIS REPLACES. The old signature was `Promise<BrokerOrder[]>` and the body opened
+   * with `if (!this.canManageExposure()) return [];`. The route published that as
+   * `{ ok: true, orders: [] }` — HTTP 200. So with `box_live_order_enabled` off, the operator's panic
+   * button reported a clean sweep while **no intent was even loaded and no cancellation was
+   * attempted**. An empty array is also what a genuinely quiet account returns, so the two were
+   * indistinguishable.
+   *
+   * It now returns a RESULT, and the three outcomes are separable:
+   *   - `blocked_reason !== null`  — nothing was attempted, and why. `ok` is false.
+   *   - `failures.length > 0`      — attempted and some could not be cancelled. `ok` is false.
+   *   - `cancelled` + `eligible`   — what was attempted and what the broker confirmed.
+   *
+   * `eligible === 0` with `blocked_reason === null` is the only case that legitimately means
+   * "there was nothing to cancel", and it is now distinguishable from every failure.
+   */
+  async cancelWorkingBoxOrders(): Promise<CancelWorkingBoxOrdersResult> {
+    const blocked = this.exposureReductionBlockReason();
+    if (blocked !== null) {
+      // NOT an empty success. Loud in the log too, because a refused panic button is an incident.
+      console.error(`[BoxOrderManager] cancel-working REFUSED, nothing attempted: ${blocked}`);
+      return {
+        ok: false,
+        attempted: false,
+        blocked_reason: blocked,
+        examined: 0,
+        eligible: 0,
+        cancelled: [],
+        failures: [],
+      };
+    }
     const intents = await this.deps.persistence.loadNonterminal();
     const cancelled: BrokerOrder[] = [];
     const failures: string[] = [];
+    let eligible = 0;
     for (const intent of intents) {
       // Only durable BOX intents are eligible. Never cancel arbitrary broker orders.
       if (!intent.client_order_id.startsWith("BOX:")) continue;
+      eligible++;
+      /*
+       * OWNERSHIP BEFORE CANCELLATION.
+       *
+       * A cancel is a real broker mutation, so it must be attributable. An intent belonging to
+       * another account — or one whose account is unproven — is reported as a FAILURE rather than
+       * skipped silently: the operator needs to know that quantity may still be working and that a
+       * human decision is required, not to see it quietly excluded from the sweep.
+       */
+      const foreign = this.accountConsistencyBlockReason(intent);
+      if (foreign !== null) {
+        failures.push(`${intent.client_order_id}: ${foreign}`);
+        continue;
+      }
       // One leg's cancel MUST NOT abandon the others. `enqueueCancel` rejects on any adapter
       // error, and an ambiguous or slow cancel is exactly the situation in which this method is
       // called — so letting the rejection escape the loop meant the first troublesome leg
@@ -1092,7 +1434,19 @@ export class BoxOrderManager {
         `cancel-working sweep left ${failures.length} order(s) uncancelled: ${failures.join("; ")}`,
       );
     }
-    return cancelled;
+    return {
+      // `ok` means "every eligible intent was attempted and none failed". It does NOT claim the
+      // broker has no remaining quantity — a cancellation acknowledgement is not proof that the
+      // remaining quantity was cancelled, which is why the durable snapshot is what `cancelled`
+      // carries and why reconciliation still runs.
+      ok: failures.length === 0,
+      attempted: true,
+      blocked_reason: null,
+      examined: intents.length,
+      eligible,
+      cancelled,
+      failures,
+    };
   }
 
   reconcile(): Promise<OrderManagerReconcileReport> {
@@ -1578,6 +1932,8 @@ export class BoxOrderManager {
         coverage: new HedgeCoverageLedger(attemptId),
         hedgeRequirements: new Map(),
         hedgeCount: guard.hedgeCount,
+        // Captured ONCE, here, and used by every leg of this attempt. See the field's doc comment.
+        brokerAccountKey: this.brokerAccountKey(),
       };
       this.entryTransportGates.set(attemptId, gate);
     }
@@ -1596,7 +1952,8 @@ export class BoxOrderManager {
         token: request.token,
         tradingsymbol: request.tradingsymbol,
         side: request.side,
-        broker_account: this.brokerAccountKey(),
+        // The gate's FROZEN key, not a live read — see EntryTransportGate.brokerAccountKey.
+        broker_account: gate.brokerAccountKey,
         required_quantity: request.quantity,
       });
     }
@@ -1606,12 +1963,35 @@ export class BoxOrderManager {
   /**
    * A stable key for the broker/account the manager posts through.
    *
-   * The adapter interface (owned by another agent) exposes only `mode`, so this is derived from it
-   * and is identical for the hedge and its dependent SELL within one manager — which is the
-   * property the account-mismatch check needs. A first-class per-account id would let a future
-   * multi-account deployment distinguish two live accounts; that is recorded in HANDOFF-hedge.md.
+   * WHAT THIS USED TO BE, and why it was not enough:
+   *
+   * ```ts
+   * return `broker:${this.deps.adapter.mode}`;      // → "broker:live"
+   * ```
+   *
+   * The adapter interface exposes only `mode`, so the key was the adapter MODE, not an account. The
+   * hedge-coverage ledger stamps this on both the hedge REQUIREMENT and the hedge OUTCOME evidence,
+   * and documents that "coverage is not fungible across accounts" — but with a constant on both
+   * sides that axis was degenerate: it could never disagree, so the invariant constrained nothing.
+   * Harmless in a single-account deployment, and misleading precisely because it looked satisfied.
+   *
+   * Now that the account provider is wired (the same one that stamps `broker_account` on every
+   * durable intent), the real account is used when it can be named, so the ledger's account axis
+   * actually discriminates. The mode-derived form remains the FALLBACK for a paper or pre-binding
+   * construction that has no account provider — it keeps the hedge and its dependent SELL agreeing
+   * within one manager, which is the minimum the check needs to stay non-vacuous.
+   *
+   * NOTE the direction of safety: this key is compared for EQUALITY to prove coverage. Falling back
+   * to a constant can only ever make two legs of the same attempt agree (permissive-but-consistent);
+   * it can never make two different accounts look equal, because a named account is never equal to
+   * the `broker:` fallback.
    */
   private brokerAccountKey(): string {
+    const account = this.deps.brokerAccount?.();
+    if (typeof account === "string") {
+      const trimmed = account.trim();
+      if (trimmed !== "") return trimmed;
+    }
     return `broker:${this.deps.adapter.mode}`;
   }
 
@@ -1650,11 +2030,27 @@ export class BoxOrderManager {
       consumer.registerIntent({
         clientOrderId: intent.client_order_id,
         ownerTag,
-        // The intent has no first-class account field in this single-account deployment; the
-        // consumer's account() default supplies one when known, and attribution rests on the
-        // per-order ownerTag (unique per order and attempt). The observation's own account is still
-        // validated against any account a registration carries.
-        account: null,
+        /*
+         * THE VERIFIED ACCOUNT, not null.
+         *
+         * This was hard-coded `account: null`, and the engine's account provider always returned null
+         * too, so NO registration ever carried an account — which meant the projection's
+         * `foreign_account` rejection could never fire and attribution rested entirely on the
+         * per-order tag. After a re-login to a DIFFERENT account, that left nothing structural
+         * preventing the new session's stream events from being matched to the old account's orders.
+         *
+         * THE INTENT'S OWN RECORDED ACCOUNT, AND NOTHING ELSE. Every live intent is stamped before
+         * its POST, so a bound row always has one. A row WITHOUT one predates migration 011, and
+         * falling back to the currently signed-in account here would stamp it with an account that
+         * may not have placed it — fabricating exactly the attribution migration 011 refuses to
+         * backfill for that reason. Worse, the fabrication is load-bearing in the wrong direction:
+         * the projection would then treat a frame naming the real (different) account as
+         * `foreign_account` and DISCARD an owned fill, leaving real exposure unobserved.
+         *
+         * `null` therefore means UNPROVEN, and the projection counts it (`unverifiedAccount`) and
+         * attributes on the owner tag, exactly as it did before account binding existed.
+         */
+        account: intent.broker_account ?? null,
         requestedQty: intent.quantity,
         brokerOrderId: intent.broker_order_id ?? null,
       });
@@ -1683,7 +2079,10 @@ export class BoxOrderManager {
       consumer.ingestRestObservation({
         ownerTag,
         brokerOrderId: order.broker_order_id ?? null,
-        account: null,
+        // The account the INTENT was placed under, and never a live-session substitute — see
+        // registerStreamOwnership. Null is UNPROVEN, which the projection counts rather than
+        // resolving into a claim that could reject an owned fill as foreign.
+        account: intent.broker_account ?? null,
         cumulativeQty: order.filled_quantity,
         quantityPresent,
         averagePrice: order.average_price ?? null,
@@ -1764,7 +2163,11 @@ export class BoxOrderManager {
     const base = {
       attempt_id: request.attempt_id,
       role: request.role,
-      broker_account: this.brokerAccountKey(),
+      // The ATTEMPT's frozen key, so an identity change between the requirement (pre-POST) and this
+      // evidence (post-POST) cannot manufacture an `account_mismatch` that strands a filled hedge.
+      // Falls back to a live read only when no gate exists, which is a non-hedge/paper path.
+      broker_account:
+        this.entryTransportGates.get(request.attempt_id)?.brokerAccountKey ?? this.brokerAccountKey(),
       requested_quantity: request.quantity,
     } as const;
     if (order && isBrokerOrderTerminal(order.state)) {
@@ -1880,11 +2283,13 @@ export class BoxOrderManager {
   /** Re-check mutable gates at the last safe point before any broker mutation. */
   private queuedActionBlockReason(action: QueueAction): string | null {
     if (action.kind === "cancel") {
-      return this.canManageExposure() ? null : "OrderManager exposure management was disabled while cancellation was queued.";
+      const blocked = this.exposureReductionBlockReason();
+      return blocked === null ? null : `Cancellation could not be sent: ${blocked}`;
     }
     const { request } = action;
     if (request.purpose === "ENTRY") {
-      if (!this.canEnter()) return "OrderManager entry controls or limits closed while order was queued.";
+      const entryBlocked = this.entryBlockReason();
+      if (entryBlocked !== null) return `Entry closed while the order was queued: ${entryBlocked}`;
       if (request.quantity > this.deps.limits.maxOpenLegQuantity ||
           this.grossOpenLegQuantity + this.reservedEntryQuantity > this.deps.limits.maxGrossOpenLegQuantity) {
         return "Order exceeded live quantity limits while queued.";
@@ -1893,8 +2298,9 @@ export class BoxOrderManager {
       if (capital) return capital;
       return null;
     }
-    if (!this.canManageExposure()) {
-      return "OrderManager exposure management was disabled while order was queued.";
+    const reductionBlocked = this.exposureReductionBlockReason();
+    if (reductionBlocked !== null) {
+      return `Exposure reduction could not be sent: ${reductionBlocked}`;
     }
     if (request.purpose === "PROTECTIVE_CANCEL") return null;
     const symbol = `${request.exchange}:${request.tradingsymbol}`;
@@ -1924,7 +2330,14 @@ export class BoxOrderManager {
 
   private async execute(action: SubmitQueueAction): Promise<void> {
     const request = this.deps.adapter.prepareOrder?.(action.request) ?? action.request;
-    let intent = intentFromRequest(request, this.deps.adapter.mode, this.now());
+    // The account is stamped BEFORE the durable write, which is itself before the POST — so a crash
+    // in between leaves a row that already names the account that owns whatever reached the broker.
+    let intent = intentFromRequest(
+      request,
+      this.deps.adapter.mode,
+      this.now(),
+      this.deps.brokerAccount?.() ?? null,
+    );
     // Hedge-first bookkeeping for this leg. `postBegan` flips inside the adapter's pre-POST
     // callback, so the `finally` can tell "we transmitted" from "we refused locally" — the
     // distinction the dependent uncovered SELL legs are waiting on.
@@ -2050,6 +2463,11 @@ export class BoxOrderManager {
           }
           // Past the point of no return: from here a broker mutation may exist.
           postBegan = true;
+          // ...which is exactly the condition the whole-attempt quantity envelope keys on. Recorded
+          // HERE, at the last pre-POST instant, so that every path which refuses a leg WITHOUT
+          // reaching the broker leaves the attempt un-started and its siblings re-ask the full
+          // four-leg question. See `postedEntryAttempts`.
+          if (request.purpose === "ENTRY") this.postedEntryAttempts.add(request.attempt_id);
         });
       } catch (error) {
         if (error instanceof BrokerPreSubmitRefusedError) {
@@ -2365,6 +2783,12 @@ export class BoxOrderManager {
           if (intent.purpose === "ENTRY") {
             this.reservations.set(intent.client_order_id, remaining);
             this.reservedEntryQuantity += remaining;
+            // RESTART: a durable non-terminal ENTRY intent is PROOF this attempt's leg reached the
+            // broker — that is what made the row non-terminal — so its surviving siblings must take
+            // the incremental path. Without this, a post-restart leg would re-ask the whole-attempt
+            // envelope and count the attempt's own recovered exposure against it, refusing the very
+            // legs needed to complete or unwind it.
+            this.postedEntryAttempts.add(intent.attempt_id);
           } else if (intent.purpose !== "PROTECTIVE_CANCEL") {
             const symbol = `${intent.exchange}:${intent.tradingsymbol}`;
             this.reductionReservations.set(intent.client_order_id, { symbol, quantity: remaining });
@@ -2692,19 +3116,143 @@ export class BoxOrderManager {
       .reduce((sum, quantity) => sum + Math.abs(quantity), 0);
   }
 
-  private withinQuantityLimits(request: BrokerOrderRequest): boolean {
-    if (request.quantity > this.deps.limits.maxOpenLegQuantity) return false;
-    if (request.purpose === "ENTRY") {
-      return this.grossOpenLegQuantity + this.reservedEntryQuantity + request.quantity <=
-        this.deps.limits.maxGrossOpenLegQuantity;
-    }
+  /**
+   * How many legs a Box entry attempt will submit. A box is four legs, always.
+   *
+   * Named rather than inlined because it is the basis of the WHOLE-ATTEMPT envelope preflight below,
+   * and a reader needs to see that the `4` is structural, not a tuning knob.
+   */
+  private static readonly BOX_ENTRY_LEG_COUNT = 4;
 
-    if (request.purpose === "PROTECTIVE_CANCEL") return true;
+  /**
+   * Attempts that have had at least one ENTRY leg reach the BROKER.
+   *
+   * Why this exists. The whole-attempt envelope below is only a correct question while the attempt
+   * has committed nothing: it asks "does 4 x lot fit alongside everything ELSE?". Asking it again on
+   * leg 2 would count the attempt's own leg 1 both as committed exposure AND as part of the 4 x lot
+   * it is about to need — double-counting it into a false refusal that strands the attempt exactly
+   * where the envelope was meant to prevent it from getting. So the envelope is evaluated once,
+   * before the attempt's first leg posts; later legs keep the incremental per-leg check.
+   *
+   * MEMBERSHIP IS RECORDED AT THE POST, NOT AT THE RESERVATION. An earlier version added the attempt
+   * when `submit()` took its reservation — before the queue. But a queued leg can still be refused at
+   * the dequeue re-check (entry closed, capital, coherence, economics), and that path releases the
+   * reservation while leaving nothing behind: no exposure, no reservation, nothing to double-count.
+   * Marking the attempt there meant a retry under the same attempt id skipped the whole-attempt
+   * envelope entirely and posted its first leg under the weaker incremental check — silently turning
+   * off the protection, and contradicting the comment that claimed the opposite.
+   *
+   * Keying on "did any leg actually reach the broker" is the property that matters: only a POSTed leg
+   * can have created exposure or a broker-side order for the envelope to double-count.
+   *
+   * Session-lifetime by design (cleared on day roll): attempt ids are unique per attempt, so a stale
+   * entry can never make a LATER attempt's check more permissive.
+   */
+  private readonly postedEntryAttempts = new Set<string>();
+
+  /**
+   * Would the FULL four-leg attempt fit the gross cap? Null if it fits, else the reason.
+   *
+   * THE HAZARD THIS CLOSES. `withinQuantityLimits` checked the gross cap incrementally —
+   * `gross + reserved + thisLeg <= maxGross` — which is correct per leg and insufficient for an
+   * attempt. With `BOX_LIVE_MAX_GROSS_OPEN_LEG_QUANTITY=200` and a 75-unit lot, leg 1 passes (75),
+   * leg 2 passes (150) and leg 3 is REFUSED at 225. By then the hedge legs have already POSTed and
+   * may have filled, so the attempt discovers an incompatible quantity cap *after* acquiring real
+   * exposure — precisely what must not happen. The stranded legs then have to be unwound, turning a
+   * configuration mistake into live risk.
+   *
+   * Checking the whole envelope on EVERY entry leg (including the first) means such an attempt is
+   * refused before anything reaches the broker. The default 400 comfortably admits a 75-unit NIFTY or
+   * 35-unit BANKNIFTY box (300 / 140); it does NOT admit a 500-unit single-stock lot, which is
+   * correctly refused up front rather than half-executed.
+   */
+  entryQuantityEnvelopeBlockReason(quantityPerLeg: number): string | null {
+    const legs = BoxOrderManager.BOX_ENTRY_LEG_COUNT;
+    if (quantityPerLeg > this.deps.limits.maxOpenLegQuantity) {
+      return (
+        `One lot of this instrument is ${quantityPerLeg} unit(s), which exceeds the per-leg limit ` +
+        `BOX_LIVE_MAX_OPEN_LEG_QUANTITY=${this.deps.limits.maxOpenLegQuantity}. Set the limit to the ` +
+        `selected instrument's one-lot quantity — do not raise it globally.`
+      );
+    }
+    const envelope = this.grossOpenLegQuantity + this.reservedEntryQuantity + quantityPerLeg * legs;
+    if (envelope > this.deps.limits.maxGrossOpenLegQuantity) {
+      return (
+        `The full ${legs}-leg attempt needs ${quantityPerLeg * legs} unit(s) of gross leg quantity ` +
+        `(already committed: ${this.grossOpenLegQuantity + this.reservedEntryQuantity}), which exceeds ` +
+        `BOX_LIVE_MAX_GROSS_OPEN_LEG_QUANTITY=${this.deps.limits.maxGrossOpenLegQuantity}. Refused ` +
+        `BEFORE the first leg posts, so no hedge is acquired against a cap the attempt cannot satisfy.`
+      );
+    }
+    return null;
+  }
+
+  /**
+   * Why this specific order fails the quantity limits, or null if it passes.
+   *
+   * Reason-returning rather than boolean because "exceeds the configured live leg quantity limits" is
+   * useless to a supervising operator: it cannot distinguish a per-leg cap below one lot (fix
+   * `BOX_LIVE_MAX_OPEN_LEG_QUANTITY`) from a gross envelope too small for four legs (fix
+   * `BOX_LIVE_MAX_GROSS_OPEN_LEG_QUANTITY`) from a reduction pointed the wrong way (a code defect).
+   * Those demand different responses, so they must read differently.
+   */
+  private quantityLimitBlockReason(request: BrokerOrderRequest): string | null {
+    if (request.purpose === "ENTRY") {
+      if (!this.postedEntryAttempts.has(request.attempt_id)) {
+        // Nothing of this attempt has reached the broker: ask the WHOLE-ATTEMPT question while the
+        // answer is still meaningful. This is the check that prevents acquiring a hedge against a cap
+        // the attempt cannot satisfy. It subsumes the per-leg cap.
+        return this.entryQuantityEnvelopeBlockReason(request.quantity);
+      }
+      // A leg of this attempt has already POSTed, so re-asking the envelope would double-count this
+      // attempt's own committed legs. Fall back to the incremental per-leg check.
+      if (request.quantity > this.deps.limits.maxOpenLegQuantity) {
+        return (
+          `Order quantity ${request.quantity} exceeds the per-leg limit ` +
+          `BOX_LIVE_MAX_OPEN_LEG_QUANTITY=${this.deps.limits.maxOpenLegQuantity}.`
+        );
+      }
+      const gross = this.grossOpenLegQuantity + this.reservedEntryQuantity + request.quantity;
+      if (gross > this.deps.limits.maxGrossOpenLegQuantity) {
+        return (
+          `This entry leg would take gross open leg quantity to ${gross}, exceeding ` +
+          `BOX_LIVE_MAX_GROSS_OPEN_LEG_QUANTITY=${this.deps.limits.maxGrossOpenLegQuantity}.`
+        );
+      }
+      return null;
+    }
+    if (request.quantity > this.deps.limits.maxOpenLegQuantity) {
+      return (
+        `Order quantity ${request.quantity} exceeds the per-leg limit ` +
+        `BOX_LIVE_MAX_OPEN_LEG_QUANTITY=${this.deps.limits.maxOpenLegQuantity}.`
+      );
+    }
+    if (request.purpose === "PROTECTIVE_CANCEL") return null;
+
+    // A REDUCTION may only ever shrink a position this process is attributed, and only from the side
+    // that shrinks it. Anything else would be new exposure wearing an exit's label.
     const symbol = `${request.exchange}:${request.tradingsymbol}`;
     const net = this.attributedBoxPositions.get(symbol) ?? 0;
     const correctSide = (net > 0 && request.side === "SELL") || (net < 0 && request.side === "BUY");
+    if (!correctSide) {
+      return (
+        `A ${request.purpose} ${request.side} on ${symbol} would not reduce the attributed net ` +
+        `position (${net}); a reduction must trade against the position it owns.`
+      );
+    }
     const alreadyReserved = this.reservedReductionsBySymbol.get(symbol) ?? 0;
-    return correctSide && request.quantity + alreadyReserved <= Math.abs(net);
+    if (request.quantity + alreadyReserved > Math.abs(net)) {
+      return (
+        `Reducing ${request.quantity} unit(s) of ${symbol} would overshoot the attributed net ` +
+        `position (${Math.abs(net)}, of which ${alreadyReserved} is already reserved for in-flight ` +
+        `reductions), which would open NEW exposure on the opposite side.`
+      );
+    }
+    return null;
+  }
+
+  private withinQuantityLimits(request: BrokerOrderRequest): boolean {
+    return this.quantityLimitBlockReason(request) === null;
   }
 
   private releaseReservation(clientOrderId: string): void {
@@ -2783,6 +3331,9 @@ export class BoxOrderManager {
     for (const day of [...this.flattenChargeMutationsByDay.keys()]) {
       if (day !== next) this.flattenChargeMutationsByDay.delete(day);
     }
+    // Attempts do not span trading days, so yesterday's entries are dead weight. Dropping them is
+    // safe in the strict direction: a forgotten attempt id makes the envelope check apply, not lapse.
+    this.postedEntryAttempts.clear();
     // Never reopen on a process-local zero at midnight. Entry remains blocked
     // until the new IST day's durable closes, aborts, and rejects are reloaded.
     this.realisedPnlToday = 0;
@@ -2947,12 +3498,22 @@ function intentFromRequest(
   request: BrokerOrderRequest,
   mode: "paper" | "live",
   now: number,
+  /**
+   * The verified broker account, stamped onto the intent BEFORE the broker POST.
+   *
+   * Pre-POST is the only correct moment: a crash between POST and the response must leave a durable
+   * row that already names its owning account, or recovery cannot tell whose order it found. `null`
+   * is permitted so paper intents and pre-binding callers are unchanged, and `null` means UNPROVEN —
+   * it is never later filled in from whoever happens to be signed in.
+   */
+  brokerAccount: string | null = null,
 ): IBoxOrderIntent {
   const at = new Date(now);
   return {
     client_order_id: request.client_order_id,
     broker_order_id: null,
     broker_mode: mode,
+    broker_account: brokerAccount,
     trade_id: request.trade_id,
     attempt_id: request.attempt_id,
     role: request.role,

@@ -174,7 +174,22 @@ export class HedgeCoverageLedger {
       );
     }
     if (evidence.broker_account !== req.broker_account) {
-      return gap("account_mismatch", `hedge ${req.role} filled on ${evidence.broker_account}, required ${req.broker_account}`);
+      /*
+       * The accounts are NOT interpolated. This reason string travels further than it looks: a
+       * `pre_post` refusal becomes a BrokerPreSubmitRefusedError whose reason is written into the
+       * intent's transition note and audit JSONB, which the outbox copies verbatim into the Mongo
+       * projection payload. Once the account provider became real, that meant the raw broker
+       * `user_id` twice over in a durable, replicated record — while every other surface in this
+       * codebase masks that identifier (`projectBrokerSession`, `buildOperationalReadiness`).
+       *
+       * The role is enough to act on: an operator who sees this needs to know WHICH hedge could not
+       * be proven and that the account differed, not what the two account ids were.
+       */
+      return gap(
+        "account_mismatch",
+        `hedge ${req.role} evidence was recorded under a DIFFERENT broker account than the ` +
+          `requirement declared before it posted; coverage cannot be proven across accounts`,
+      );
     }
     if (!evidence.terminal) {
       return gap("not_terminal", `hedge ${req.role} is not terminal; coverage cannot be counted while it can still change`);

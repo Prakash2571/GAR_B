@@ -625,11 +625,22 @@ test("reductions must use the exact reducing side/quantity and cannot cross flat
   h.manager.setAttributedBoxPositions([{ token: 99, exchange: "NFO", tradingsymbol: "HELD", net_quantity: 75, average_price: 100 }]);
   const base = { purpose: "EXIT", tradingsymbol: "HELD", token: 99, phase: "exit" };
 
-  await assert.rejects(() => h.manager.submit(request({ ...base, attempt_id: "wrong-side", side: "BUY", quantity: 75 })), /quantity limits/);
-  await assert.rejects(() => h.manager.submit(request({ ...base, attempt_id: "cross-flat", side: "SELL", quantity: 76 })), /quantity limits/);
+  // The refusal REASON is asserted, not just the refusal: an operator reading it must be able to tell
+  // "this reduction points the wrong way" from "this reduction overshoots into new exposure".
+  await assert.rejects(
+    () => h.manager.submit(request({ ...base, attempt_id: "wrong-side", side: "BUY", quantity: 75 })),
+    /would not reduce the attributed net position/,
+  );
+  await assert.rejects(
+    () => h.manager.submit(request({ ...base, attempt_id: "cross-flat", side: "SELL", quantity: 76 })),
+    /overshoot the attributed net position/,
+  );
   const exact = await h.manager.submit(request({ ...base, attempt_id: "exact", side: "SELL", quantity: 75 }));
   assert.equal(exact.filled_quantity, 75);
-  await assert.rejects(() => h.manager.submit(request({ ...base, attempt_id: "after-flat", side: "SELL", quantity: 1 })), /quantity limits/);
+  await assert.rejects(
+    () => h.manager.submit(request({ ...base, attempt_id: "after-flat", side: "SELL", quantity: 1 })),
+    /would not reduce the attributed net position \(0\)/,
+  );
   assert.equal(h.adapter.calls.filter(([name]) => name === "submit").length, 1);
 });
 
@@ -669,7 +680,11 @@ test("reconciliation missing intent or immutable mismatch trips recovery and blo
       assert.equal(h.manager.status().health.reconciliation_complete, false);
       if (scenario === "missing") assert.deepEqual(report.missingAtBroker, [req.client_order_id]);
       else assert.equal(report.affectedTradeIds.includes(req.trade_id), true);
-      await assert.rejects(() => h.manager.submit(request({ trade_id: "new", attempt_id: `blocked-${scenario}` })), /entry controls or limits are closed/);
+      // The reason names the breaker, not a generic "controls closed".
+      await assert.rejects(
+        () => h.manager.submit(request({ trade_id: "new", attempt_id: `blocked-${scenario}` })),
+        /Entry cannot be sent: .*(breaker|Recovery|recovery)/,
+      );
       assert.equal(adapter.calls.filter(([name]) => name === "submit").length, 0);
     });
   }
@@ -690,7 +705,7 @@ test("duplicate cumulative fill snapshots are idempotent", async () => {
 
   await assert.rejects(
     () => h.manager.submit(request({ purpose: "EXIT", phase: "exit", trade_id: "filled-trade", attempt_id: "too-much", tradingsymbol: req.tradingsymbol, token: req.token, side: "SELL", quantity: 76 })),
-    /quantity limits/,
+    /overshoot the attributed net position/,
   );
   const reduced = await h.manager.submit(request({ purpose: "EXIT", phase: "exit", trade_id: "filled-trade", attempt_id: "exact-reduce", tradingsymbol: req.tradingsymbol, token: req.token, side: "SELL", quantity: 75 }));
   assert.equal(reduced.filled_quantity, 75);

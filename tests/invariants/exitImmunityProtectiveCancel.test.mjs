@@ -147,30 +147,67 @@ test("cancelWorkingBoxOrders() cancels working legs while entry is disarmed and 
   stack.manager.invariantViolation("breaker open during cancel sweep");
   assert.equal(stack.manager.canEnter(), false, "entry really is closed");
 
-  const cancelled = await stack.manager.cancelWorkingBoxOrders();
-  assert.equal(cancelled.length, 1, "the working leg was cancelled despite entry being locked down");
+  const result = await stack.manager.cancelWorkingBoxOrders();
+  // `cancelWorkingBoxOrders` returns a RESULT, not an array: an empty array could not distinguish
+  // "nothing was working" from "the sweep refused to run", and the route published the latter as
+  // HTTP 200 `{ok:true, orders:[]}`.
+  assert.equal(result.attempted, true, "the sweep was attempted");
+  assert.equal(result.ok, true);
+  assert.equal(result.cancelled.length, 1, "the working leg was cancelled despite entry being locked down");
   assert.ok(
     stack.adapter.cancels.includes(clientOrderId),
     "the cancel reached the broker for the working BOX order",
   );
 });
 
-test("cancelWorkingBoxOrders() is refused ONLY when live-order authorization itself is withdrawn", async () => {
-  // The single legitimate way to stop a protective cancel is to disable exposure management
-  // entirely (box_live_order_enabled=false). This proves the gate is canManageExposure(), not an
-  // accidental dependency on entry state — and that the negative case is real, not vacuous.
+test("cancelWorkingBoxOrders() is refused ONLY by a genuine inability to act", async () => {
+  /*
+   * THIS INVARIANT WAS INVERTED, AND THE INVERSION WAS THE BUG.
+   *
+   * It used to assert: "The single legitimate way to stop a protective cancel is to disable exposure
+   * management entirely (box_live_order_enabled=false)." That encoded the defect as a guarantee. With
+   * `canManageExposure()` reading `!disposed && controls.liveOrderEnabled`, turning off
+   * `box_live_order_enabled` — the obvious operator response to "stop trading" — made the panic
+   * button return `[]` untried, and the route published it as HTTP 200 `{ok:true, orders:[]}`.
+   * Reproduced with `emergencyFlatten=true`: no intents loaded, no cancellation attempted.
+   *
+   * An operator preference about taking NEW risk must never remove the ability to SHED risk already
+   * taken. So the negative case is no longer a control at all — it is a genuine inability to act
+   * attributably:
+   *
+   *   - the broker session is confirmed unauthenticated (nothing can be sent), or
+   *   - the owning account cannot be identified (a mutation could not be attributed).
+   *
+   * The original test's real value is preserved: the positive case proves the sweep is not vacuous,
+   * and the negative case is a REAL refusal that reaches no broker.
+   */
   const stack = await liveStack();
   ownFourLegs(stack);
   seedWorkingEntryIntent(stack, "k1_ce");
 
-  // Entry closed but exposure management ON: a cancel still runs (guards against a vacuous test).
-  stack.manager.setControls({ entryEnabled: false, liveOrderEnabled: true });
-  assert.equal((await stack.manager.cancelWorkingBoxOrders()).length, 1);
+  // Entry closed AND live orders withdrawn: a cancel STILL runs. This is the corrected invariant.
+  stack.manager.setControls({ entryEnabled: false, liveOrderEnabled: false });
+  const stillRuns = await stack.manager.cancelWorkingBoxOrders();
+  assert.equal(stillRuns.attempted, true, "disarming new orders must NOT disable getting flat");
+  assert.equal(stillRuns.cancelled.length, 1);
 
-  // Now withdraw live-order authorization: the sweep is a no-op and nothing new reaches the broker.
+  // Now a GENUINE inability: the broker session is confirmed unauthenticated.
+  seedWorkingEntryIntent(stack, "k2_ce");
   const cancelsBefore = stack.adapter.cancels.length;
-  stack.manager.setControls({ liveOrderEnabled: false });
-  const cancelled = await stack.manager.cancelWorkingBoxOrders();
-  assert.equal(cancelled.length, 0, "disabling live-order authorization is the only thing that stops a cancel");
+  stack.adapter.health = async () => ({
+    ok: false, transport: "up", authenticated: false, message: "session rejected", checked_at: NOW,
+  });
+  await stack.manager.reconcile();
+
+  const refused = await stack.manager.cancelWorkingBoxOrders();
+  assert.equal(refused.attempted, false, "nothing was attempted");
+  assert.equal(refused.ok, false, "and it is NOT reported as a success");
+  assert.match(refused.blocked_reason, /not authenticated/);
+  assert.match(
+    refused.blocked_reason,
+    /exposure is unchanged and still owned/,
+    "the operator is told the exposure survives the refusal",
+  );
+  assert.equal(refused.cancelled.length, 0);
   assert.equal(stack.adapter.cancels.length, cancelsBefore, "no further broker cancel was issued");
 });

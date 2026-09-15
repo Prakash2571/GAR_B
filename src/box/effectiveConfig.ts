@@ -126,6 +126,12 @@ const KNOBS: readonly KnobSpec[] = [
   { key: "liveMaxResidualLegs", envVar: "BOX_LIVE_MAX_RESIDUAL_LEGS", kind: "int", default: 1, min: 0, max: 4 },
   { key: "oneActiveBoxPerUnderlying", envVar: "BOX_ONE_ACTIVE_BOX_PER_UNDERLYING", kind: "bool", default: false },
   { key: "sessionMaxCompletedTrades", envVar: "BOX_SESSION_MAX_COMPLETED_TRADES", kind: "int", default: 0, min: 0, max: 10_000 },
+  // The attempt ceiling was MISSING from this table while the trade ceiling beside it was present.
+  // This is the operator-facing "what is actually in force, and where did it come from" report, and
+  // the attempt ceiling is the only thing that bounds RISK-TAKING as opposed to success — a session
+  // configured for one trade can otherwise submit orders indefinitely so long as none completes.
+  // Its absence also meant the effective-config drift test could not cover it.
+  { key: "sessionMaxEntryAttempts", envVar: "BOX_SESSION_MAX_ENTRY_ATTEMPTS", kind: "int", default: 0, min: 0, max: 10_000 },
   { key: "maxConcurrentPerUnderlying", envVar: "BOX_MAX_CONCURRENT_PER_UNDERLYING", kind: "int", default: 2, min: 0, max: 16 },
 
   // ---- Quantity envelope ----
