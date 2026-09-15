@@ -52,13 +52,20 @@ const entryLegs = () =>
     exit_ask: null,
   }));
 
-/** The engine's real close payload shape, dotted per-leg keys included. */
-function enginePayload() {
+/**
+ * The engine's real close payload shape, dotted per-leg keys included.
+ *
+ * `close_idempotency_key` is part of the payload because the engine puts it there
+ * (`BoxEngine.closePaperTrade` sets it alongside `status`/`closed_at`), and `closeBoxTrade`'s retry
+ * fallback matches on that COLUMN. Omitting it here would test a payload production never sends.
+ */
+function enginePayload(idempotencyKey) {
   const setFields = {
     status: "closed",
     closed_at: new Date(),
     net_pnl: 1234.5,
     realised_net_pnl: 1234.5,
+    close_idempotency_key: idempotencyKey,
     exit_blocked_reason: null,
   };
   for (const [i] of ROLES.entries()) {
@@ -88,7 +95,7 @@ test("the engine's real close payload persists, and the trade actually reaches c
   assert.ok(open, "the box opened");
 
   // This is the call that used to throw `syntax error at or near ".0"`.
-  const closed = await repo.closeBoxTrade(open._id, enginePayload(), "close-key-1");
+  const closed = await repo.closeBoxTrade(open._id, enginePayload("close-key-1"), "close-key-1");
 
   assert.ok(closed, "closeBoxTrade returned a record rather than throwing or returning null");
   assert.equal(closed.status, "closed", "the trade is durably CLOSED, not left open");
@@ -99,7 +106,7 @@ test("every leg's exit evidence lands on the right leg, and entry fields survive
   const open = await repo.insertBoxTrade(
     baseTrade({ lower_strike: 31400, upper_strike: 31600, legs: entryLegs() }),
   );
-  const closed = await repo.closeBoxTrade(open._id, enginePayload(), "close-key-2");
+  const closed = await repo.closeBoxTrade(open._id, enginePayload("close-key-2"), "close-key-2");
   assert.ok(closed);
 
   assert.equal(closed.legs.length, 4, "still four legs — the array was patched, not replaced");
@@ -130,7 +137,7 @@ test("an ABSENT observation clears one field without destroying the legs documen
   const open = await repo.insertBoxTrade(
     baseTrade({ lower_strike: 31800, upper_strike: 32000, legs: entryLegs() }),
   );
-  const payload = enginePayload();
+  const payload = enginePayload("close-key-3");
   payload["legs.1.exit_price"] = null;
   payload["legs.1.exit_depth"] = null;
 
@@ -149,13 +156,18 @@ test("the close is idempotent under retry", async () => {
   const open = await repo.insertBoxTrade(
     baseTrade({ lower_strike: 32200, upper_strike: 32400, legs: entryLegs() }),
   );
-  const first = await repo.closeBoxTrade(open._id, enginePayload(), "retry-key");
+  const first = await repo.closeBoxTrade(open._id, enginePayload("retry-key"), "retry-key");
   assert.ok(first && first.status === "closed");
 
-  const again = await repo.closeBoxTrade(open._id, enginePayload(), "retry-key");
+  const again = await repo.closeBoxTrade(open._id, enginePayload("retry-key"), "retry-key");
   assert.ok(again, "the retry resolves through the idempotency key instead of returning null");
   assert.equal(again.status, "closed");
   assert.equal(again._id, first._id);
+
+  // ...and it is the KEY that resolves it, not merely "the row is closed". A different attempt's key
+  // must NOT be able to claim someone else's close.
+  const foreign = await repo.closeBoxTrade(open._id, enginePayload("other-key"), "other-key");
+  assert.equal(foreign, null, "a different idempotency key does not resolve this close");
 });
 
 test("a non-whitelisted leg field is refused at the boundary, not at the database", async () => {
