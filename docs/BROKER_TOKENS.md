@@ -81,7 +81,13 @@ consent-id spellings for the same reason.
   a single `AbortController`, and cap the response body at 64 KiB.
 - The callback is authenticated by the **pending-login store**, not the session
   cookie (which is `SameSite=Strict` and therefore absent on a cross-site redirect).
-  Entries are single-use, expire in 10 minutes, and there is at most one per broker.
+  Entries are single-use and expire in 10 minutes.
+- **Several operators may sign in at the same time.** Entries are keyed by nonce, not by
+  broker, so two people clicking "Connect Zerodha" within the TTL each complete on their own
+  nonce (bounded at 8 live entries per broker, oldest evicted). This is a shared console:
+  anyone with the passcode is a legitimate operator, and concurrent sign-ins are ordinary.
+- A sign-in is **not tied to the browser that started it**: the callback needs no cookie, so a
+  redirect can legitimately land in a different browser than the one that clicked Connect.
 - Failure reasons reflected into the redirect URL are **stable codes from our own
   code**, never broker prose.
 - The callback refuses while the process is not `ready`.

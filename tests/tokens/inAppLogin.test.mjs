@@ -553,17 +553,18 @@ test("isPending() sweeps a lapsed entry, so nothing can claim it afterwards", ()
   });
 });
 
-test("starting a second login for a broker supersedes the first", () => {
+test("a second login for a broker does NOT supersede the first", () => {
   const store = new PendingLoginStore();
   const first = store.start("zerodha", { startedBy: "full" });
   const second = store.start("zerodha", { startedBy: "full" });
   assert.notEqual(first.nonce, second.nonce);
-  // The stale nonce is refused; the current one works.
-  assert.equal(store.consume("zerodha", first.nonce, { requireNonce: true }).ok, false);
-  const store2 = new PendingLoginStore();
-  store2.start("zerodha", { startedBy: "full" });
-  const latest = store2.start("zerodha", { startedBy: "full" });
-  assert.equal(store2.consume("zerodha", latest.nonce, { requireNonce: true }).ok, true);
+
+  // This store USED to hold one entry per broker, so the second start silently destroyed the
+  // first and that operator's redirect came back `state_mismatch` — an error that reads like
+  // tampering and was really just a colleague clicking Connect. Both must now complete.
+  // Full concurrency coverage lives in tests/tokens/concurrentLogin.test.mjs.
+  assert.equal(store.consume("zerodha", first.nonce, { requireNonce: true }).ok, true);
+  assert.equal(store.consume("zerodha", second.nonce, { requireNonce: true }).ok, true);
 });
 
 test("THE ISOLATION PROPERTY: the two brokers' logins never interfere", () => {
