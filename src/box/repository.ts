@@ -1175,6 +1175,9 @@ const NONTERMINAL_ORDER_STATES: readonly BoxOrderIntentState[] = [
 
 const INTENT_COLUMNS = [
   "id", "client_order_id", "broker_order_id", "broker_mode", "broker", "broker_correlation_id",
+  // The account that placed the order. Nullable: a pre-migration row genuinely does not know, and
+  // is never backfilled — see migration 011.
+  "broker_account",
   "trade_id", "attempt_id", "role", "purpose", "phase", "exchange", "tradingsymbol", "token",
   "side", "quantity", "reference_price", "tick_size", "max_chase_ticks", "limit_price", "state",
   "filled_quantity", "previous_filled_quantity", "average_price", "broker_tag", "reject_family",
@@ -1189,6 +1192,7 @@ function intentInsertValues(id: string, intent: IBoxOrderIntent): unknown[] {
     intent.broker_mode,
     brokerValue(intent.broker),
     intent.broker_correlation_id ?? null,
+    intent.broker_account ?? null,
     intent.trade_id ?? null,
     intent.attempt_id,
     intent.role,
@@ -1225,6 +1229,7 @@ function rowToIntent(row: Record<string, unknown>): BoxOrderIntentRecord {
     broker_mode: row.broker_mode as "paper" | "live",
     broker: brokerValue(row.broker as BrokerId),
     broker_correlation_id: (row.broker_correlation_id as string | null) ?? null,
+    broker_account: (row.broker_account as string | null) ?? null,
     trade_id: (row.trade_id as string | null) ?? null,
     attempt_id: row.attempt_id as string,
     role: row.role as IBoxOrderIntent["role"],
@@ -1540,11 +1545,36 @@ const IMMUTABLE_INTENT_FIELDS = [
   "broker_mode", "trade_id", "attempt_id", "role", "purpose", "phase", "exchange",
   "tradingsymbol", "token", "side", "quantity", "reference_price", "tick_size",
   "max_chase_ticks", "limit_price",
+  /*
+   * THE OWNING ACCOUNT IS IMMUTABLE.
+   *
+   * Reusing a client order id under a DIFFERENT account is exactly the confusion account binding
+   * exists to prevent, so it is refused here alongside the contract and quantity fields. A row
+   * carrying no account and a proposal carrying a real one is also a mismatch, which is the safe
+   * direction: it forces explicit resolution rather than silently adopting the row.
+   */
+  "broker_account",
 ] as const;
+
+/**
+ * Fields where ABSENT and NULL mean the same thing and must therefore compare EQUAL.
+ *
+ * `broker_account` is nullable (migration 011 adds it without a backfill), so a row read back from
+ * PostgreSQL carries `null` while a freshly-built intent that never set the field carries `undefined`.
+ * A strict `!==` between those two is a false mismatch — and it surfaced as
+ * "client order id was reused with different immutable field broker_account", which points an operator
+ * at duplicate-order suspicion for what is really just an unset optional column.
+ *
+ * Normalising `undefined` to `null` keeps the real guard intact: a row with no account and a proposal
+ * with a REAL account still mismatch, because only the two "no account" spellings are unified.
+ */
+const NULLABLE_INTENT_FIELDS = new Set<string>(["broker_account"]);
 
 function assertIntentImmutableMatch(existing: IBoxOrderIntent, proposed: IBoxOrderIntent): void {
   for (const field of IMMUTABLE_INTENT_FIELDS) {
-    if (existing[field] !== proposed[field]) {
+    const a = NULLABLE_INTENT_FIELDS.has(field) ? existing[field] ?? null : existing[field];
+    const b = NULLABLE_INTENT_FIELDS.has(field) ? proposed[field] ?? null : proposed[field];
+    if (a !== b) {
       throw new Error(
         `Client order id ${proposed.client_order_id} was reused with different immutable field ${field}.`,
       );

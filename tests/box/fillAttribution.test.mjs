@@ -289,7 +289,7 @@ test("A6: a double-counted fill would authorise an over-reduction; the authorita
   assert.equal(attributedQuantity(manager), 40);
   await assert.rejects(
     manager.submit(request({ client_order_id: "BOX:trade-1:EMERGENCY_RESIDUAL:k1_ce:attempt-1", purpose: "EMERGENCY_RESIDUAL", phase: "unwind", side: "SELL", quantity: 80 })),
-    /quantity limits/,
+    /overshoot the attributed net position \(40/,
     "reducing 80 against a real 40 must be refused — this is the gate the double-count defeated",
   );
 });

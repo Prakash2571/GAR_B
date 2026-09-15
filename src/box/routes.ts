@@ -193,7 +193,16 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
         res.status(409).json({ error: result.error, status: engine.getStatus() });
         return;
       }
-      res.json({ ok: true, status: engine.getStatus() });
+      // FORWARD THE EXPOSURE REPORT. `setLiveControl` computes what this switch did NOT remove —
+      // open positions, residual legs, working orders, whether reduction is still available and why
+      // not if it is not. Dropping it and answering a bare `{ ok: true }` is what told an operator
+      // the switch worked without telling them exposure was still live, which is the whole reason
+      // the report exists.
+      res.json({
+        ok: true,
+        ...(result.exposure === undefined ? {} : { exposure: result.exposure }),
+        status: engine.getStatus(),
+      });
     });
   }
 
@@ -272,18 +281,39 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
    */
   app.post("/api/box/session/arm", requireOperator, async (req: Request, res: Response) => {
     if (!requireFull(req, res)) return;
-    const raw = (req.body as { max_completed_trades?: unknown } | undefined)?.max_completed_trades;
-    let max: number | undefined;
-    if (raw !== undefined && raw !== null) {
+    const body = req.body as
+      | { max_completed_trades?: unknown; max_entry_attempts?: unknown }
+      | undefined;
+    /*
+     * BOTH ceilings are accepted here. `max_entry_attempts` used to be dropped on the floor: the
+     * engine's `armTradingSession` has always accepted it, but this route parsed only
+     * `max_completed_trades`, so an operator arming a bounded one-shot session over the API could
+     * not set the attempt ceiling and got no error telling them the field was ignored.
+     *
+     * That gap matters more than it looks. The session record SNAPSHOTS both ceilings at arm time,
+     * so `BOX_SESSION_MAX_ENTRY_ATTEMPTS` in the environment does not retroactively bind a session
+     * that was already armed. Without this field, the only way to apply the attempt ceiling was to
+     * set the env var and arm a NEW session — and an operator who set the var, restarted, and saw
+     * the session still armed would reasonably believe the bound was in force while it was not.
+     */
+    const ceiling = (
+      raw: unknown,
+      field: string,
+    ): { ok: true; value: number | undefined } | { ok: false; error: string } => {
+      if (raw === undefined || raw === null) return { ok: true, value: undefined };
       if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 0 || raw > 10_000) {
-        res.status(400).json({ error: "max_completed_trades must be an integer between 0 and 10000 (0 = unlimited)." });
-        return;
+        return { ok: false, error: `${field} must be an integer between 0 and 10000 (0 = unlimited).` };
       }
-      max = raw;
-    }
+      return { ok: true, value: raw };
+    };
+    const trades = ceiling(body?.max_completed_trades, "max_completed_trades");
+    if (!trades.ok) { res.status(400).json({ error: trades.error }); return; }
+    const attempts = ceiling(body?.max_entry_attempts, "max_entry_attempts");
+    if (!attempts.ok) { res.status(400).json({ error: attempts.error }); return; }
     try {
       const result = await engine.armTradingSession({
-        ...(max === undefined ? {} : { maxCompletedTrades: max }),
+        ...(trades.value === undefined ? {} : { maxCompletedTrades: trades.value }),
+        ...(attempts.value === undefined ? {} : { maxEntryAttempts: attempts.value }),
         actor: deps.getOperatorRole(req),
       });
       if (!result.ok) {
@@ -317,10 +347,36 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
     } catch (err) { fail(res, err); }
   });
 
+  /**
+   * CANCEL EVERY WORKING BOX ORDER.
+   *
+   * `ok` comes from the SWEEP, not from the HTTP call. This route used to be
+   * `res.json({ ok: true, orders: await engine.cancelWorkingBoxOrders(), … })` — a hardcoded success
+   * wrapped around a method that returned `[]` whenever it refused to run. With
+   * `box_live_order_enabled` off, the operator's panic button therefore answered HTTP 200 `ok:true`
+   * `orders:[]` having loaded no intents and attempted no cancellation.
+   *
+   * A refused sweep is now **409**, and a partially-failed sweep is **207**, so a client cannot read
+   * either as a clean result. The full result object carries `blocked_reason`, `examined`, `eligible`
+   * and per-intent `failures`.
+   */
   app.post("/api/box/live/cancel-working", requireOperator, async (req: Request, res: Response) => {
     if (!requireFull(req, res)) return;
     try {
-      res.json({ ok: true, orders: await engine.cancelWorkingBoxOrders(), status: engine.getStatus() });
+      const result = await engine.cancelWorkingBoxOrders();
+      const status = engine.getStatus();
+      if (!result.attempted) {
+        // Nothing was even attempted. 409: the request conflicts with the deployment's current state.
+        res.status(409).json({ ...result, orders: result.cancelled, status });
+        return;
+      }
+      if (!result.ok) {
+        // 207 Multi-Status: some cancels were accepted and some were not. Exposure may remain.
+        res.status(207).json({ ...result, orders: result.cancelled, status });
+        return;
+      }
+      // `orders` is retained alongside `cancelled` so an older client keeps working.
+      res.json({ ...result, orders: result.cancelled, status });
     } catch (err) { fail(res, err); }
   });
 

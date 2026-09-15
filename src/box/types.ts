@@ -1203,6 +1203,22 @@ export interface IBoxOrderIntent {
    * handle stays recoverable.
    */
   broker_correlation_id?: string | null;
+  /**
+   * WHICH BROKER ACCOUNT this intent was submitted under (Kite `user_id` / Dhan client id).
+   *
+   * Immutable once set, and set BEFORE the broker POST so a crash cannot leave an order whose owning
+   * account is unknown. Migration `011_order_intent_broker_account.sql`.
+   *
+   * `null`/absent means UNPROVEN, not "the current account": a row written before account binding
+   * genuinely does not record who placed it, and it is deliberately never backfilled — stamping it
+   * with whoever is signed in now would fabricate the attribution this field exists to prove. Such a
+   * row must be reconciled against broker evidence or explicitly resolved before being acted upon.
+   *
+   * Why it matters: without it, a re-login to a DIFFERENT account under the same API key left nothing
+   * structural to prevent the new session from adopting, cancelling or flattening the previous
+   * account's exposure. Tag uniqueness is not the same guarantee as account ownership.
+   */
+  broker_account?: string | null;
   trade_id: string | null;
   attempt_id: string;
   role: BoxLegRole;

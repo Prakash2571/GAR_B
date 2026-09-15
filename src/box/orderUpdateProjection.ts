@@ -270,6 +270,20 @@ export class OrderUpdateProjection {
    * reconciliation, so it is counted and surfaced.
    */
   private absentQuantityCount = 0;
+  /**
+   * OWNED events accepted WITHOUT the account being verifiable, because the frame carried no account.
+   *
+   * The `foreign_account` guard below can only fire when the observation names an account. A Kite
+   * postback that omits `user_id` therefore skips it and is attributed on the order tag alone. That
+   * fail-OPEN direction is deliberate and is the safer of the two: dropping a fill we do own would
+   * leave real exposure unobserved, which is far worse than accepting a fill whose account we could
+   * not re-confirm on a tag we minted ourselves.
+   *
+   * But "deliberate" must not mean "invisible". This counts how much of the stream's attribution
+   * rests on the tag alone, so an operator can see that the account check is not actually exercising
+   * on this transport instead of assuming a zero `foreignAccount` count means it was enforced.
+   */
+  private unverifiedAccountCount = 0;
 
   /**
    * Register (or re-register) a box order so its events can be attributed and its fills
@@ -353,14 +367,16 @@ export class OrderUpdateProjection {
     }
 
     const expectedAccount = this.accountOf.get(clientOrderId) ?? null;
-    if (
-      expectedAccount !== null &&
-      obs.account != null &&
-      String(obs.account).trim() !== "" &&
-      String(obs.account).trim() !== expectedAccount
-    ) {
+    const observedAccount = obs.account == null ? "" : String(obs.account).trim();
+    if (expectedAccount !== null && observedAccount !== "" && observedAccount !== expectedAccount) {
       this.foreignAccountCount++;
       return { attributed: false, clientOrderId, apply: null, rejection: "foreign_account", quantityEvidence, source: obs.source };
+    }
+    // Owned, but the account could not be CHECKED: either we have no registered account for this
+    // order or the frame did not name one. Accepted (see `unverifiedAccountCount`) and counted, so a
+    // zero `foreignAccount` tally is never mistaken for "the account check passed on every event".
+    if (expectedAccount === null || observedAccount === "") {
+      this.unverifiedAccountCount++;
     }
 
     // Once the broker id is present on an owned event, remember it so a later broker-id-only
@@ -580,6 +596,7 @@ export class OrderUpdateProjection {
     orders: number;
     unowned: number;
     foreignAccount: number;
+    unverifiedAccount: number;
     absentQuantity: number;
     disconnects: number;
     reconcilePending: boolean;
@@ -588,6 +605,7 @@ export class OrderUpdateProjection {
       orders: this.ledgers.size,
       unowned: this.unownedCount,
       foreignAccount: this.foreignAccountCount,
+      unverifiedAccount: this.unverifiedAccountCount,
       absentQuantity: this.absentQuantityCount,
       disconnects: this.disconnectCount,
       reconcilePending: this.reconcileOwed,

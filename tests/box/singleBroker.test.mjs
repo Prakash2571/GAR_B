@@ -343,13 +343,100 @@ test("createLiveAdapter REFUSES a broker that is not the active one", () => {
 
 /* -------------------------------- readiness -------------------------------- */
 
-test("Zerodha health has no static-IP concept, reported as null not false", () => {
-  // null means "not applicable"; false would imply a missing configuration.
-  const { m } = manager();
-  const health = m.healthFor("zerodha");
-  assert.equal(health.static_ip_configured, null);
-  assert.equal(health.authenticated, true);
-  assert.equal(health.trading_ready, true);
+test("Zerodha static_ip_configured is null — 'not modelled', which is not 'not required'", () => {
+  // null distinguishes "this broker's static IP is not modelled here" from `false`, which would
+  // imply a configuration this code checks and found missing. docs/BROKER_ADAPTER_AUDIT.md gap 5.1
+  // records that a Zerodha static-IP gate does NOT exist and the SEBI mandate still applies, so this
+  // field must not be read as evidence either way.
+  const saved = process.env.ZERODHA_LIVE_TRADING_ENABLED;
+  process.env.ZERODHA_LIVE_TRADING_ENABLED = "true";
+  try {
+    const { m } = manager();
+    const health = m.healthFor("zerodha");
+    assert.equal(health.static_ip_configured, null);
+    assert.equal(health.authenticated, true);
+  } finally {
+    restore("ZERODHA_LIVE_TRADING_ENABLED", saved);
+  }
+});
+
+test("Zerodha trading_ready requires the arming switch, not just a token", () => {
+  /*
+   * THE DEFECT THIS PINS. `trading_ready` was a bare `session.authenticated`, so it read TRUE — and
+   * the dashboard rendered "ready to trade" — purely because a token was held, with
+   * ZERODHA_LIVE_TRADING_ENABLED unset (its default). Dhan's branch has always ANDed its equivalent
+   * switch in. `trading_ready` is contractually "live order placement is permitted AND possible",
+   * and permission is exactly what the switch expresses.
+   */
+  const saved = process.env.ZERODHA_LIVE_TRADING_ENABLED;
+  try {
+    const { m } = manager();
+
+    process.env.ZERODHA_LIVE_TRADING_ENABLED = "true";
+    const armed = m.healthFor("zerodha");
+    assert.equal(armed.trading_ready, true, "authenticated AND armed ⇒ ready");
+    assert.ok(
+      !armed.problems.some((p) => /ZERODHA_LIVE_TRADING_ENABLED/.test(p)),
+      "no complaint about a switch that is on",
+    );
+
+    process.env.ZERODHA_LIVE_TRADING_ENABLED = "false";
+    const unarmed = m.healthFor("zerodha");
+    assert.equal(unarmed.authenticated, true, "the session is still perfectly good");
+    assert.equal(unarmed.trading_ready, false, "but placement is NOT permitted");
+    assert.ok(
+      unarmed.problems.some((p) => /ZERODHA_LIVE_TRADING_ENABLED=false/.test(p)),
+      "and the operator is told which switch to flip",
+    );
+
+    delete process.env.ZERODHA_LIVE_TRADING_ENABLED;
+    assert.equal(
+      m.healthFor("zerodha").trading_ready,
+      false,
+      "UNSET must fail closed, exactly as Dhan's switch does",
+    );
+  } finally {
+    restore("ZERODHA_LIVE_TRADING_ENABLED", saved);
+  }
+});
+
+test("an unarmed ZERODHA_LIVE_TRADING_ENABLED actually BLOCKS the live adapter", () => {
+  /*
+   * The readiness blocker `zerodha_live_trading_disabled` has always claimed "Zerodha will take no
+   * new entry". Nothing enforced it: `createLiveAdapter` built a real Zerodha adapter regardless, so
+   * the promise was decorative while the Dhan twin was enforced. This is the enforcement.
+   */
+  const saved = process.env.ZERODHA_LIVE_TRADING_ENABLED;
+  const savedKey = process.env.KITE_API_KEY;
+  try {
+    const { m } = manager();
+    const cfg = { executionMode: "live" };
+    // The adapter separately requires credentials. Supplied so the ARMED case below exercises the
+    // real build path; note the two refusals below are reached with the key present, proving the
+    // arming gate fires on its own rather than being masked by a missing-credential error.
+    process.env.KITE_API_KEY = "test-key";
+
+    process.env.ZERODHA_LIVE_TRADING_ENABLED = "false";
+    assert.throws(
+      () => m.createLiveAdapter({ broker: "zerodha", cfg }),
+      /ZERODHA_LIVE_TRADING_ENABLED=true/,
+      "refuses to build the transport at all — no adapter, no possible order",
+    );
+
+    delete process.env.ZERODHA_LIVE_TRADING_ENABLED;
+    assert.throws(
+      () => m.createLiveAdapter({ broker: "zerodha", cfg }),
+      /Zerodha live execution blocked/,
+      "and UNSET fails closed",
+    );
+
+    process.env.ZERODHA_LIVE_TRADING_ENABLED = "true";
+    const adapter = m.createLiveAdapter({ broker: "zerodha", cfg });
+    assert.ok(adapter, "armed ⇒ the adapter is built, so this gate is not vacuous");
+  } finally {
+    restore("ZERODHA_LIVE_TRADING_ENABLED", saved);
+    restore("KITE_API_KEY", savedKey);
+  }
 });
 
 test("Dhan is not trading_ready without a session, even with a static IP", () => {

@@ -363,9 +363,19 @@ const boxModule: BoxModule = registerBoxModule(app, {
    * was computed for.
    *
    * `sessionFor().client_id` is an account IDENTIFIER, never a token, and it is masked again in
-   * `buildOperationalReadiness` before it reaches the wire. Zerodha does not track a client id here,
-   * so it is honestly null there and the decision reports `account_present: false` rather than
-   * inventing a placeholder. Read fresh on every call so a broker switch or re-login is reflected.
+   * `buildOperationalReadiness` before it reaches the wire. Read fresh on every call so a broker
+   * switch or re-login is reflected.
+   *
+   * FOR ZERODHA this resolves to the Kite login's `user_id`, recorded in `zerodhaSessionMeta` (see
+   * `ActiveBrokerManager.sessionFor`). An earlier version of this comment claimed Zerodha "does not
+   * track a client id here, so it is honestly null" — that is no longer true, and the value is now
+   * load-bearing: it is the account stamped on every durable order intent, the account the
+   * order-update projection rejects foreign fills against, and a precondition for live entry.
+   *
+   * It IS still null when a session was adopted by a path that leaves `zerodhaSessionMeta` unset. That
+   * is deliberately fail-closed — live entry is then refused with an account-identity reason rather
+   * than proceeding unattributed — but it surfaces as "the broker account could not be identified",
+   * NOT as a token problem, so do not diagnose it as an authentication fault.
    */
   brokerAccountRef: () => brokerManager.sessionFor(brokerManager.activeBroker).client_id ?? null,
   marketData: brokerManager.marketData(),

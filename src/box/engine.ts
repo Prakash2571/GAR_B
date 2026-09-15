@@ -106,7 +106,12 @@ import {
   isDeploymentIdExplicit,
   type ReservationStack,
 } from "./reservations/index.js";
-import { BoxOrderManager, orderManagerLimitsFromConfig, type OrderManagerReconcileReport } from "./orderManager.js";
+import {
+  BoxOrderManager,
+  orderManagerLimitsFromConfig,
+  type CancelWorkingBoxOrdersResult,
+  type OrderManagerReconcileReport,
+} from "./orderManager.js";
 import { BoxMetrics } from "./metrics.js";
 import {
   buildUnderlyingState,
@@ -1047,6 +1052,11 @@ export class BoxEngine {
         orderStreamConsumer: consumer,
         persistence: boxOrderIntentPersistence,
         limits: orderManagerLimitsFromConfig(this.cfg),
+        // THE VERIFIED ACCOUNT, read fresh on every decision. A token refresh for the SAME account
+        // preserves attribution; a login for a DIFFERENT account is visible immediately and blocks
+        // action on the previous account's intents. Null blocks new entry AND reduction, with a
+        // specific reason, rather than acting unattributed.
+        brokerAccount: () => this.liveBrokerAccount(),
         controls: { entryEnabled: false, liveOrderEnabled: false, emergencyFlatten: false },
         istDayKey: (at) => this.deps.istDayKey(at),
         onPersistenceLossAfterFill: (_order, error) => {
@@ -2051,7 +2061,27 @@ export class BoxEngine {
   setLiveControl(
     control: "box_entry_enabled" | "box_live_order_enabled" | "box_emergency_flatten",
     enabled: boolean,
-  ): { ok: boolean; error?: string } {
+  ): {
+    ok: boolean;
+    error?: string;
+    /**
+     * WHAT REMAINS OWNED after this control change, and what it means.
+     *
+     * A disarm request must report the exposure it does NOT remove. Previously
+     * `box_live_order_enabled=false` silently disabled every reduction path while positions stayed
+     * open, and the response was a bare `{ok:true}` — so the operator was told the switch worked
+     * without being told that the exposure was now unmanageable. Reduction is no longer coupled to
+     * this control, but the operator still needs to see what they still own.
+     */
+    exposure?: {
+      open_positions: number;
+      residual_legs: number;
+      working_orders: number;
+      consequence: string;
+      reduction_available: boolean;
+      reduction_blocked_reason: string | null;
+    };
+  } {
     if (!this.orderManager || this.cfg.executionMode !== "live") {
       return { ok: false, error: "Live controls are unavailable outside explicit live mode." };
     }
@@ -2061,7 +2091,41 @@ export class BoxEngine {
         ? { liveOrderEnabled: enabled }
         : { emergencyFlatten: enabled };
     this.orderManager.setControls(patch);
-    return { ok: true };
+
+    /*
+     * REPORT THE EXPOSURE THIS CHANGE DOES NOT REMOVE.
+     *
+     * Disarming a control never closes a position. An operator who turns entry (or live orders) off
+     * while four legs are open has stopped NEW risk and still owns the old risk, and the response must
+     * say so — with whether reduction is currently available, and why not if it is not.
+     */
+    const openPositions = this.positions.size;
+    const residualLegs = this.residualLegCount();
+    const workingOrders = this.orderStreamConsumer?.workingOrderCount() ?? 0;
+    const reductionBlocked = this.orderManager.exposureReductionBlockReason();
+    const owned = openPositions + residualLegs + workingOrders;
+    const disarming = !enabled && control !== "box_emergency_flatten";
+    const consequence = owned === 0
+      ? "No Box exposure is currently owned by this deployment."
+      : disarming
+        ? `This deployment still owns ${openPositions} open box(es), ${residualLegs} residual leg(s) ` +
+          `and ${workingOrders} working order(s). Disabling this control stops NEW exposure; it does ` +
+          `NOT close what is already owned. Exits, protective cancellation and residual flattening ` +
+          `remain available.`
+        : `This deployment owns ${openPositions} open box(es), ${residualLegs} residual leg(s) and ` +
+          `${workingOrders} working order(s).`;
+
+    return {
+      ok: true,
+      exposure: {
+        open_positions: openPositions,
+        residual_legs: residualLegs,
+        working_orders: workingOrders,
+        consequence,
+        reduction_available: reductionBlocked === null,
+        reduction_blocked_reason: reductionBlocked,
+      },
+    };
   }
 
   async reconcileLive(): Promise<unknown> {
@@ -2073,7 +2137,13 @@ export class BoxEngine {
     return this.orderManager.reconcile();
   }
 
-  async cancelWorkingBoxOrders(): Promise<unknown> {
+  /**
+   * Cancel every working Box order and return the sweep RESULT.
+   *
+   * Typed concretely (it was `Promise<unknown>`) so the route cannot accidentally publish a refusal
+   * as a success — the compiler now knows there is an `attempted`/`ok`/`blocked_reason` to inspect.
+   */
+  async cancelWorkingBoxOrders(): Promise<CancelWorkingBoxOrdersResult> {
     if (!this.orderManager) throw new Error("Live order manager is unavailable.");
     return this.orderManager.cancelWorkingBoxOrders();
   }
@@ -6558,7 +6628,29 @@ export class BoxEngine {
    * still checked against any account a registration DID carry.
    */
   private liveBrokerAccount(): string | null {
-    return this.deps.marketData.isAuthenticated() ? null : null;
+    /*
+     * THE VERIFIED ACCOUNT, from the authenticated session.
+     *
+     * This was `return this.deps.marketData.isAuthenticated() ? null : null;` — a ternary whose two
+     * branches are identical, so it returned null unconditionally. Combined with the hard-coded
+     * `account: null` at both order-stream ownership registrations, NO live order ever carried an
+     * account, the projection's `foreign_account` rejection could never fire, and attribution rested
+     * entirely on the per-order tag.
+     *
+     * The identity was already in the process the whole time: `ActiveBrokerManager.sessionFor(broker)`
+     * projects `client_id` from the Zerodha login's `user_id` (or the Dhan client id), and
+     * `deps.brokerAccountRef` was already wired to it in `src/index.ts` for margin-evidence
+     * attribution. It simply was never handed to the order path.
+     *
+     * Authentication is still required: an unauthenticated session must not name an account, because
+     * the token that proved it may already have been replaced. Returning null here BLOCKS new live
+     * entry and blocks reduction with a specific reason, rather than proceeding unattributed.
+     */
+    if (!this.deps.marketData.isAuthenticated()) return null;
+    const account = this.deps.brokerAccountRef?.() ?? null;
+    if (account === null) return null;
+    const trimmed = String(account).trim();
+    return trimmed === "" ? null : trimmed;
   }
 
   /**

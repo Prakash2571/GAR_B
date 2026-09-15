@@ -1297,6 +1297,12 @@ export class ActiveBrokerManager {
     }
     const loginError = this.loginErrors.zerodha;
     if (loginError) problems.push(loginError);
+    // Reported only once the session is otherwise usable, so it reads as "the last switch is off"
+    // rather than competing with "you are not signed in". Mirrors the Dhan problem string, which is
+    // how an operator learns the difference between a broken session and a deliberately closed one.
+    if (token !== null && !this.zerodhaTokenStale() && !this.zerodhaLiveTradingEnabled()) {
+      problems.push("Zerodha live trading is disabled (ZERODHA_LIVE_TRADING_ENABLED=false)");
+    }
     return problems;
   }
 
@@ -1670,6 +1676,32 @@ export class ActiveBrokerManager {
     return raw === "1" || raw === "true" || raw === "yes";
   }
 
+  /**
+   * Is Zerodha live order placement armed?
+   *
+   * THE DEFECT THIS CLOSES. `ZERODHA_LIVE_TRADING_ENABLED` was read in exactly two places in
+   * `src/index.ts`: a boot log line, and the readiness blocker `zerodha_live_trading_disabled`
+   * whose detail text reads
+   *
+   *     "ZERODHA_LIVE_TRADING_ENABLED is not armed, so Zerodha will take no new entry."
+   *
+   * Nothing enforced it. The sentence was not a description of a gate, it was a promise no code
+   * kept: with the flag false (its default), `createLiveAdapter` still built a real Zerodha adapter
+   * and a real order still reached the broker. Meanwhile the Dhan twin IS enforced — see the
+   * `dhanLiveTradingEnabled()` check in `createLiveAdapter` — so the two brokers' most important
+   * operator switch behaved in opposite ways under identical-looking configuration.
+   *
+   * An operator's per-broker kill switch is the last thing that may be decorative, and it is the
+   * exact control a supervised live test relies on to keep a second attempt from ever being sent.
+   *
+   * Default is FALSE (fail closed): Zerodha live placement must be armed EXPLICITLY, matching Dhan
+   * and matching the blocker's own long-standing claim.
+   */
+  private zerodhaLiveTradingEnabled(): boolean {
+    const raw = process.env.ZERODHA_LIVE_TRADING_ENABLED?.trim().toLowerCase() ?? "";
+    return raw === "1" || raw === "true" || raw === "yes";
+  }
+
   private computeDhanProblems(): string[] {
     const problems: string[] = [];
     const creds = readDhanCredentials();
@@ -1775,8 +1807,21 @@ export class ActiveBrokerManager {
         token_expires_at: null,
         token_expired: session.token_expired,
         data_ready: session.authenticated,
-        // Zerodha has no static-IP requirement; live gating is the Box config's job.
-        trading_ready: session.authenticated,
+        /*
+         * `trading_ready` means "live order placement is permitted AND possible" (see
+         * BrokerHealthState). It used to be a bare `session.authenticated`, which asserted that
+         * claim on the strength of holding a token — while the per-broker arming switch, the one
+         * control that decides whether placement is PERMITTED at all, was not consulted. Dhan's
+         * branch below has always ANDed its equivalent in. Now that
+         * ZERODHA_LIVE_TRADING_ENABLED is actually enforced in `createLiveAdapter`, this reports
+         * the same fact the enforcement uses, so the dashboard and the order path agree.
+         *
+         * STATIC IP: `null` still means "not modelled for this broker", NOT "not required".
+         * docs/BROKER_ADAPTER_AUDIT.md findings 1.1/1.2 record that the SEBI static-IP mandate
+         * covers Zerodha too and that gap 5.1 (no Zerodha static-IP readiness gate) is OPEN. It is
+         * a documented trial precondition verified out-of-band, not something this field proves.
+         */
+        trading_ready: session.authenticated && this.zerodhaLiveTradingEnabled(),
         static_ip_configured: null,
         feed_connected: connected,
         feed_age_ms: null,
@@ -2216,6 +2261,16 @@ export class ActiveBrokerManager {
       );
     }
     if (ctx.broker === "zerodha") {
+      // SYMMETRY WITH DHAN, which was missing. The readiness surface has always claimed that an
+      // unarmed ZERODHA_LIVE_TRADING_ENABLED means "Zerodha will take no new entry"; this is the
+      // line that makes that true. Refusing to BUILD the adapter (rather than refusing each order)
+      // is the same shape as the Dhan gate below and fails closed at the earliest point: with no
+      // adapter there is no transport, so no code path downstream can place an order by mistake.
+      if (!this.zerodhaLiveTradingEnabled()) {
+        throw new Error(
+          "[Box] Zerodha live execution blocked: set ZERODHA_LIVE_TRADING_ENABLED=true to permit real Zerodha orders.",
+        );
+      }
       return createZerodhaLiveAdapter(this.deps.kite, ctx.cfg, ctx.timing, this.rateBudgetFor("zerodha"));
     }
     if (!this.dhanLiveTradingEnabled()) {
