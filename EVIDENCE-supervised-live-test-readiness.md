@@ -390,6 +390,29 @@ value was not in the individual catches but in the pattern — the defect class 
 remove is easy to reintroduce while removing it, because "be strict about attribution" and "never
 strand exposure" pull in opposite directions and only one of them is safe to get wrong.
 
+### And then CI caught one that no amount of reading would have
+
+The first push failed job 3 — **16 failures in the real-PostgreSQL suite, all one root cause.** Adding
+`broker_account` to `IMMUTABLE_INTENT_FIELDS` compared it with a strict `!==`. The column is nullable,
+so a row read back from PostgreSQL carries `null` while a freshly-built intent that never set the
+field carries `undefined`. Those are not `!==`-equal, so re-creating an intent — which the write-ahead
+path does routinely — threw:
+
+```
+Client order id BOX:…:ENTRY:k1_ce:a1 was reused with different immutable field broker_account.
+```
+
+A false duplicate-order accusation on the ordinary path, pointing an operator at duplicate-order
+suspicion for an unset optional column. Fixed by normalising `undefined` to `null` for nullable
+immutable fields only, which leaves the real guard intact: a row with no account and a proposal with a
+**real** account still mismatch.
+
+This is the strongest available argument for treating the PostgreSQL gate as load-bearing rather than
+as a formality. The behavioural review did flag this exact edge as *possible* — and it was still only
+CI, running against a real database, that turned "possible" into 16 concrete failures. It is also the
+one defect in this whole change that the local suites **could not** have caught, because the local
+`pg` stub throws before any row is ever read back.
+
 ---
 
 ## 9. Verdict
