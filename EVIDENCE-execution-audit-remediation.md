@@ -215,7 +215,7 @@ it was wrapped.
 | `tests/box/residualFlattenHedgeCover.test.mjs` | **7** new | Drives the real `CentralBoxExecutionGateway` in live mode over the real `BoxOrderManager`; asserts on **what reached the adapter** |
 | `tests/box/restartWorkingOrderReadiness.test.mjs` | **10** new | W1×4 states, W2 reduction not blocked, W3 own-legs control, W4 `CREATED` excluded, W5 disarm at POST boundary, W6 reduction exempt, W7 mid-reconcile fill |
 | `tests/box/brokerRateBudget.test.mjs` | **+3** | Protective placement uses the reserve; `protective: false` still refused; still bounded by the account budget |
-| `tests/pg/tradeClosePersistence.test.mjs` | **6** new | **CI only** — needs real PostgreSQL. The engine's exact dotted close payload, per-leg targeting, null-safety, retry idempotency, whitelist refusal |
+| `tests/pg/tradeClosePersistence.test.mjs` | **5** new | **CI only** — needs real PostgreSQL. The engine's exact dotted close payload, per-leg targeting, null-safety, retry idempotency, whitelist refusal |
 
 ### Negative controls
 
@@ -231,20 +231,37 @@ reason rather than passing by construction:
 
 ### Suite state
 
-| Suite | Local | Note |
+| Suite | Local | CI (real PostgreSQL + MongoDB) |
 |---|---|---|
-| `test:unit` | **2211 pass / 0 fail** | |
-| `test:invariants` | **9 / 9** | |
-| `test:shutdown` | **11 / 11** | |
-| `test:tokens` | 59 / 32 fail | *environment* — no PostgreSQL |
-| `test:switch` | 0 / 32 fail | *environment* — no PostgreSQL |
-| `test:access` | 7 / 2 fail | *environment* — missing `express` |
-| `test:readiness` | 0 / 2 fail | *environment* — missing `express` |
-| `test:contract` | 28 / 3 fail | *environment* — missing `express` |
-| `test:pg`, `test:projector` | **NOT RUN** | no PostgreSQL/MongoDB locally |
+| `test:unit` | 2211 / 0 fail | **2211 pass / 0 fail / 0 skipped** |
+| `test:invariants` | 9 / 9 | **9 / 0 / 0** |
+| `test:pg` | **NOT RUN** — no PostgreSQL | **80 pass / 0 fail / 0 skipped** (was 75) |
+| `test:projector` | **NOT RUN** — no MongoDB | **17 / 0 / 0** |
+| `test:tokens` | 59 / 32 fail — *environment* | **90 / 0 / 0** |
+| `test:switch` | 0 / 32 fail — *environment* | **32 / 0 / 0** |
+| `test:access` | 7 / 2 fail — *environment* | **31 / 0 / 0** |
+| `test:shutdown` | 11 / 11 | **11 / 0 / 0** |
+| `test:readiness` | 0 / 2 fail — *environment* | **24 / 0 / 0** |
+| `test:contract` | 28 / 3 fail — *environment* | **59 / 0 / 0** |
 
 Every *environment* failure is the sandbox, not the code (npm registry returns 403, so `node_modules` is
-hollow); all match the pre-change baseline exactly and all pass in CI.
+hollow); all match the pre-change baseline exactly. In CI: **2,564 tests, zero failures, zero skips**,
+with the workflow's own *"Fail if any database suite skipped tests"* step green.
+
+### CI caught a bad test fixture
+
+The first push failed `test:pg` on **my own new test**: the retry-idempotency case asserted that a second
+`closeBoxTrade` with the same key resolves to the closed row, and it returned `null`.
+
+The cause was the **fixture, not the code**. `closeBoxTrade`'s retry fallback matches on the
+`close_idempotency_key` *column*, and the engine writes that key as part of the close payload
+(`engine.ts:3835`) — my payload omitted it, so I was testing a payload production never sends. Fixed by
+making the fixture carry it exactly as the engine does, and strengthened so that a *different* key does
+not resolve someone else's close (proving the key is what identifies the retry, not merely that the row
+is closed).
+
+Worth recording because it is the same lesson as C5 itself: a test that does not reproduce the real
+payload proves nothing about the real path.
 
 Typecheck: **zero new errors** (167 both with and without these changes, identical normalised sets). That
 check earned its keep twice — it caught `BoxTradingSessionManager.enforcing()` being `private` and a
