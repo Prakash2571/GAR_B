@@ -107,6 +107,15 @@ export type ResidualFlattenFailureKind =
    * outcome, so it is surfaced and the generation is retired to unblock the exposure.
    */
   | "identity_conflict"
+  /**
+   * DELIBERATELY NOT SENT: this residual is a LONG option still covering a SHORT residual that is
+   * not yet proven closed. Selling it now would convert a covered position into a naked short.
+   *
+   * This is a SAFE, CORRECT outcome, not a fault. Nothing reached the broker, so the identity is
+   * untouched and the next pass reuses it — by which time the short may be closed and the cover
+   * genuinely free to release.
+   */
+  | "hedge_cover_retained"
   /** Anything unclassified. Treated as "nothing proven sent", i.e. the identity is kept. */
   | "unexpected";
 
@@ -234,6 +243,7 @@ export function dispositionForFailure(kind: ResidualFlattenFailureKind): Residua
     case "no_executable_book":
     case "gate_refused":
     case "already_in_flight":
+    case "hedge_cover_retained":
       // Nothing reached the broker. The identity is untouched and must be reused.
       return "reuse_attempt";
     case "local_pre_submit_refused":
@@ -273,6 +283,8 @@ export function residualFailurePhrase(kind: ResidualFlattenFailureKind): string 
     case "persistence_after_fill": return "filled but its durable snapshot failed";
     case "broker_state_unknown": return "uncertain broker terminal quantity; quarantined for reconciliation";
     case "identity_conflict": return "a stale durable intent blocked this attempt; the generation was retired past it";
+    case "hedge_cover_retained":
+      return "held back as cover: it is long protection against a short residual that is not yet proven closed";
     case "unexpected": return "an unclassified internal fault";
   }
 }

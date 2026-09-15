@@ -409,8 +409,12 @@ test("the coordinator consumes the attempt before any reservation or POST", asyn
   assert.ok(block.includes("session_limit_reached"), "a failure to count must refuse the entry");
 
   const engine = strip(readFileSync(new URL("../../src/box/engine.ts", import.meta.url), "utf8"));
+  // Asserted as "the hook calls the durable counter", not as one exact source line: the hook also
+  // records which armed session authorised the attempt, so the POST boundary can detect a disarm.
+  const wireAt = engine.indexOf("sessionConsumeAttempt:");
+  assert.ok(wireAt > 0, "the engine must wire the consume hook");
   assert.ok(
-    engine.includes("sessionConsumeAttempt: () => this.session.recordAttemptStarted()"),
+    engine.slice(wireAt, wireAt + 600).includes("this.session.recordAttemptStarted()"),
     "and the engine must wire it to the durable session manager",
   );
   assert.ok(

@@ -36,7 +36,7 @@ import {
 import { cloneBrokerOrder, mergeBrokerOrderSnapshot, type BrokerOrderMergeOptions } from "./brokerOrderMerge.js";
 import type { ExternalOrderUpdate } from "./brokerAdapter.js";
 import type { ExecutionTimingRecorder } from "./executionTiming.js";
-import type { ExecutionMode, IBoxOrderIntent, OrderSide } from "./types.js";
+import type { BoxOrderPurpose, ExecutionMode, IBoxOrderIntent, OrderSide } from "./types.js";
 
 export interface KiteTransportOrder {
   order_id: string;
@@ -343,6 +343,38 @@ function pacingClassFor(klass: BrokerEndpointClass): BrokerPacingClass {
  * hint the body may carry. Returns null when absent — the ledger then applies its own
  * conservative default cooldown rather than treating a missing hint as "retry now".
  */
+/**
+ * Does this order REDUCE risk? Everything except a new ENTRY does.
+ *
+ * The recovery rate-limit reserve exists so that getting flat is still possible when the placement
+ * budget is spent. `EXIT`, `EMERGENCY_RESIDUAL` and `PROTECTIVE_CANCEL` all shrink exposure, so all
+ * three may draw on it; only `ENTRY` — the one purpose that ADDS exposure — may not.
+ *
+ * An unknown/absent purpose is treated as NOT protective. That is the conservative direction: it can
+ * only withhold the reserve, never hand it to something that increases risk.
+ */
+function isProtectivePurpose(purpose: BoxOrderPurpose | undefined): boolean {
+  return purpose === "EXIT" || purpose === "EMERGENCY_RESIDUAL" || purpose === "PROTECTIVE_CANCEL";
+}
+
+/**
+ * Find a {@link KiteHttpError} anywhere in an error's cause chain.
+ *
+ * Wrapping is not optional on the placement path — an ambiguous 429'd POST must be reported as
+ * ambiguous — so the HTTP status has to be recovered from inside the wrapper rather than assumed to
+ * be at the top. Depth-bounded so a self-referential `cause` cannot spin.
+ */
+function findKiteHttpError(error: unknown): KiteHttpError | null {
+  let current: unknown = error;
+  for (let depth = 0; depth < 8 && current; depth += 1) {
+    if (current instanceof KiteHttpError) return current;
+    const cause: unknown = current instanceof Error ? (current as { cause?: unknown }).cause : undefined;
+    if (cause === current) return null;
+    current = cause;
+  }
+  return null;
+}
+
 function readRetryAfterHeader(body: unknown): string | null {
   if (body && typeof body === "object") {
     const record = body as Record<string, unknown>;
@@ -419,7 +451,7 @@ export class KiteBrokerAdapter implements BrokerAdapter {
     this.mark(req.client_order_id, "transport_started");
     let placed: { order_id: string };
     // The order-budget placement guard, resolved once so the SAME closure runs at the boundary.
-    const placementGuard = this.placementBudgetGuard(req.client_order_id);
+    const placementGuard = this.placementBudgetGuard(req.client_order_id, req.purpose);
     // Fires at the FINAL SYNCHRONOUS instant before the wire (Defect 3): threaded THROUGH the
     // adapter pacer AND the transport's token-resolution await down to KiteHttpTransport.request,
     // where it runs immediately before `fetch` with no further await. Previously it ran inside
@@ -442,7 +474,7 @@ export class KiteBrokerAdapter implements BrokerAdapter {
       // `beforeSend` at the send boundary, so budget is consumed only for a request that leaves.
       // A throw here is caught below and cleans up the session projection like any pre-submit
       // refusal.
-      this.refusePlacementIfBudgetExhausted(req.client_order_id);
+      this.refusePlacementIfBudgetExhausted(req.client_order_id, req.purpose);
       placed = await this.call(() => {
         return this.transport.placeOrder({
           exchange: req.exchange,
@@ -1189,10 +1221,10 @@ export class KiteBrokerAdapter implements BrokerAdapter {
    * for a placement the budget will refuse anyway; the authoritative check+record still happens at
    * the send boundary in {@link placementBudgetGuard}. A no-op when no ledger is wired.
    */
-  private refusePlacementIfBudgetExhausted(clientOrderId: string): void {
+  private refusePlacementIfBudgetExhausted(clientOrderId: string, purpose?: BoxOrderPurpose): void {
     const ledger = this.config.rateBudget;
     if (!ledger) return;
-    const decision = ledger.check("order_place", this.clock.now());
+    const decision = ledger.check("order_place", this.clock.now(), { protective: isProtectivePurpose(purpose) });
     if (!decision.allowed) {
       ledger.noteRefusal("order_place");
       throw new BrokerPreSubmitRefusedError(
@@ -1213,12 +1245,13 @@ export class KiteBrokerAdapter implements BrokerAdapter {
    * durable intent terminalises as a free REJECTED no-POST (never a broker reject, never retried).
    * When allowed it RECORDS the placement against the budget. A no-op when no ledger is wired.
    */
-  private placementBudgetGuard(clientOrderId: string): () => void {
+  private placementBudgetGuard(clientOrderId: string, purpose?: BoxOrderPurpose): () => void {
     const ledger = this.config.rateBudget;
     if (!ledger) return () => undefined;
+    const protective = isProtectivePurpose(purpose);
     return () => {
       const now = this.clock.now();
-      const decision = ledger.check("order_place", now);
+      const decision = ledger.check("order_place", now, { protective });
       if (!decision.allowed) {
         ledger.noteRefusal("order_place");
         throw new BrokerPreSubmitRefusedError(
@@ -1260,15 +1293,24 @@ export class KiteBrokerAdapter implements BrokerAdapter {
    * then let the caller's EXISTING ambiguous/reconcile-by-tag path run — a 429 tells us nothing
    * about whether the exchange saw the order, so the order is NEVER replayed.
    */
+  /**
+   * Apply the broker's own cooldown when a request was rate limited.
+   *
+   * THE DEFECT THIS FIXES. This used to test only `error instanceof KiteHttpError`. But a PLACEMENT
+   * that is rate limited does not surface as a bare `KiteHttpError`: the submit path wraps it in a
+   * {@link BrokerAmbiguousSubmitError} (correctly — a 429'd POST may or may not exist at the broker).
+   * The `instanceof` check therefore missed exactly the case that matters most, so an HTTP 429 with
+   * `Retry-After: 30` produced NO penalty and NO cooldown, and the next request went straight back
+   * into a budget the broker had just told us to back off from — deepening the throttle.
+   *
+   * Now the cause chain is walked, so a 429 is honoured wherever it was wrapped.
+   */
   private penalizeIfRateLimited(error: unknown): void {
     const ledger = this.config.rateBudget;
     if (!ledger) return;
-    const status = error instanceof KiteHttpError ? error.status : null;
-    if (!isRateLimited(status)) return;
-    const retryAfterMs = error instanceof KiteHttpError
-      ? parseRetryAfterMs(readRetryAfterHeader(error.body), this.clock.now())
-      : null;
-    ledger.penalize(this.clock.now(), retryAfterMs);
+    const http = findKiteHttpError(error);
+    if (!http || !isRateLimited(http.status)) return;
+    ledger.penalize(this.clock.now(), parseRetryAfterMs(readRetryAfterHeader(http.body), this.clock.now()));
   }
 }
 
@@ -1380,14 +1422,77 @@ function normalizeKiteOrder(raw: KiteTransportOrder, known: BrokerOrder | undefi
   };
 }
 
+/**
+ * Kite order statuses that are TERMINAL — the order can never change again.
+ *
+ * EXACT matches only, and that is the entire point. See {@link kiteState}.
+ */
+const KITE_TERMINAL_STATUS: ReadonlyMap<string, BrokerOrderState> = new Map([
+  ["COMPLETE", "COMPLETE"],
+  ["CANCELLED", "CANCELLED"],
+  // Kite reports a cancelled after-market order under its own label. Still terminal.
+  ["CANCELLED AMO", "CANCELLED"],
+  ["REJECTED", "REJECTED"],
+]);
+
+/**
+ * Translate a Kite order status into our lifecycle state.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────────────────────────
+ * THE DEFECT THIS REPLACES — a substring test that called a PENDING cancellation a FINISHED one:
+ *
+ * ```ts
+ * if (value === "COMPLETE") return "COMPLETE";
+ * if (value.includes("CANCEL")) return "CANCELLED";      // ← the defect
+ * if (value.includes("REJECT")) return "REJECTED";
+ * ```
+ *
+ * Kite publishes `CANCEL PENDING` (and `CANCEL VALIDATION PENDING`) while a cancellation request is
+ * still being worked. Both contain "CANCEL", so both were mapped to `CANCELLED` — which
+ * {@link isBrokerOrderTerminal} treats as TERMINAL. `waitForResolution` therefore stopped waiting and
+ * reported `state: CANCELLED, filled: 0, pending: 75` for an order that was still live at the
+ * exchange and could still fill in full.
+ *
+ * WHY THAT IS A NAKED-EXPOSURE BUG, not a cosmetic one. The hedge-coverage ledger releases a BUY
+ * hedge once its dependent SELL is deemed dead. A short entry sitting in CANCEL PENDING was deemed
+ * dead, so its long hedge was released and sold — and then the short filled. The result is a naked
+ * short option, created by believing a cancellation that had not happened. `includes("REJECT")` had
+ * the same shape and would misread a hypothetical "REJECT PENDING" identically.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────────────────────────
+ * THE RULE NOW. Terminal is an EXACT match against {@link KITE_TERMINAL_STATUS}. Everything else is
+ * non-terminal, and anything containing "PENDING" is non-terminal *by definition* — the word is
+ * Kite's own statement that the outcome is not settled. An unrecognised status is `UNKNOWN`, which is
+ * also non-terminal, so a status Kite adds in future fails CLOSED (we keep polling and, on deadline
+ * expiry, quarantine) rather than being guessed into a terminal state.
+ *
+ * The direction of every error here is deliberate: over-waiting on an order that is really finished
+ * costs latency and ends in an honest quarantine; under-waiting on an order that is really live
+ * destroys a hedge. Only one of those is recoverable.
+ */
 function kiteState(status: string, filled: number, quantity: number): BrokerOrderState {
   const value = status.trim().toUpperCase();
-  if (value === "COMPLETE") return "COMPLETE";
-  if (value.includes("CANCEL")) return "CANCELLED";
-  if (value.includes("REJECT")) return "REJECTED";
+
+  const terminal = KITE_TERMINAL_STATUS.get(value);
+  if (terminal) return terminal;
+
+  // NON-TERMINAL FROM HERE ON. Nothing below may return COMPLETE, CANCELLED or REJECTED.
+  if (value.includes("PENDING")) {
+    // A cancellation IN PROGRESS. Reported as CANCEL_REQUESTED so the caller keeps confirming until
+    // the broker states a terminal cumulative quantity — the cancel-versus-fill race is decided by
+    // the broker, never by us.
+    if (value.includes("CANCEL")) return "CANCEL_REQUESTED";
+    // TRIGGER PENDING is a resting stop order: live at the exchange, working, not settled.
+    if (value === "TRIGGER PENDING") return "OPEN";
+    // MODIFY/VALIDATION/OPEN PENDING: accepted, not yet working. A partial fill outranks the label.
+    if (filled > 0 && filled < quantity) return "PARTIALLY_FILLED";
+    return "ACKNOWLEDGED";
+  }
+
   if (filled > 0 && filled < quantity) return "PARTIALLY_FILLED";
-  if (value === "OPEN" || value.includes("TRIGGER PENDING")) return "OPEN";
-  if (value.includes("VALIDATION") || value.includes("PUT ORDER")) return "ACKNOWLEDGED";
+  if (value === "OPEN") return "OPEN";
+  if (value === "PUT ORDER REQ RECEIVED" || value === "AMO REQ RECEIVED") return "ACKNOWLEDGED";
+  // Unrecognised: NOT terminal. Keep observing rather than inventing an outcome.
   return "UNKNOWN";
 }
 

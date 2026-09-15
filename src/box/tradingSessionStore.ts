@@ -286,7 +286,13 @@ export class BoxTradingSessionManager {
    * must be inert. Getting this wrong turned the default into "no Box may ever enter until an
    * operator clicks Arm", which is a silent full stop rather than a no-op.
    */
-  private enforcing(): boolean {
+  /**
+   * PUBLIC because the engine's POST-boundary entry-authorisation check must ask it. A deployment
+   * where sessions do not enforce has no authorisation to withdraw, so the boundary check must be a
+   * no-op there rather than inventing a refusal. Read-only: it reports configuration/arming state and
+   * mutates nothing.
+   */
+  enforcing(): boolean {
     if (this.deps.configuredMaxCompletedTrades() > 0) return true;
     // The ATTEMPT bound enforces on its own. A trial configured with an attempt ceiling but no cycle
     // ceiling must still be bounded — otherwise the one control that stops repeated failed attempts

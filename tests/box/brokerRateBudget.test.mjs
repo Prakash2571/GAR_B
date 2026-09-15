@@ -255,3 +255,71 @@ test("data reads are never order-budget metered and cannot be starved by placeme
   assert.equal(ledger.check("order_place", now).allowed, false, "order budget exhausted");
   assert.equal(ledger.check("data_read", now).allowed, true, "a data read is not order-metered");
 });
+
+
+// ── a PROTECTIVE PLACEMENT may draw on the recovery reserve ──────────────────────────────────
+
+/*
+ * THE DEFECT THESE PIN.
+ *
+ * Reserve eligibility was inferred from the BROKER'S endpoint class alone:
+ *
+ *     const isRecovery = klass === "order_cancel" || klass === "order_modify";
+ *
+ * Every new order — including an EXIT and an EMERGENCY_RESIDUAL buyback that closes a naked short —
+ * is metered by the broker as `order_place`. So a protective placement was held to the lower
+ * placement ceiling and REFUSED while the recovery reserve sat unused, at precisely the moment the
+ * reserve exists for. "Which endpoint the broker meters" and "does this order add or remove risk" are
+ * different questions, and only the second one should decide who may spend the reserve.
+ */
+
+test("a protective PLACEMENT (an exit/buyback) may spend the recovery reserve", () => {
+  const ledger = new RateBudgetLedger(BROKER_RATE_LIMITS.dhan, { workerCount: 1, recoveryReserveFraction: 0.2 });
+  const now = 4_000_000;
+  let placed = 0;
+  while (ledger.check("order_place", now).allowed) {
+    ledger.record("order_place", now);
+    placed++;
+    if (placed > 50) break;
+  }
+  assert.equal(placed, 8, "ordinary placement stops at the reserved ceiling");
+  assert.equal(ledger.check("order_place", now).allowed, false, "a NEW-EXPOSURE placement is refused");
+
+  // The same endpoint class, but this order REDUCES risk.
+  const protectivePlacement = ledger.check("order_place", now, { protective: true });
+  assert.equal(
+    protectivePlacement.allowed,
+    true,
+    "a risk-reducing placement must reach the broker using the reserve",
+  );
+  assert.match(protectivePlacement.reason ?? "", /within all published windows/);
+});
+
+test("the reserve does NOT admit an entry, so `protective` cannot become a general bypass", () => {
+  // Non-vacuous control: if `protective` were ignored (or defaulted true) this would fail.
+  const ledger = new RateBudgetLedger(BROKER_RATE_LIMITS.dhan, { workerCount: 1, recoveryReserveFraction: 0.2 });
+  const now = 5_000_000;
+  while (ledger.check("order_place", now).allowed) ledger.record("order_place", now);
+
+  assert.equal(ledger.check("order_place", now).allowed, false, "explicitly non-protective is refused");
+  assert.equal(
+    ledger.check("order_place", now, { protective: false }).allowed,
+    false,
+    "and `protective: false` is refused too",
+  );
+  const refusal = ledger.check("order_place", now, { protective: false });
+  assert.match(refusal.reason ?? "", /reserve withheld/, "the reason says the reserve was withheld");
+});
+
+test("a protective placement is still bounded by the ACCOUNT budget", () => {
+  // The reserve is a reservation WITHIN the published cap, never an extension of it. Protective
+  // traffic must not be able to exceed what the broker permits.
+  const ledger = new RateBudgetLedger(BROKER_RATE_LIMITS.dhan, { workerCount: 1, recoveryReserveFraction: 0.2 });
+  const now = 6_000_000;
+  let total = 0;
+  while (ledger.check("order_place", now, { protective: true }).allowed && total <= 100) {
+    ledger.record("order_place", now);
+    total++;
+  }
+  assert.equal(total, 10, "protective placements still stop at the 10/s account budget");
+});
