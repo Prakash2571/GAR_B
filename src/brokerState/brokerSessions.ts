@@ -86,6 +86,21 @@ export interface IKiteSession {
   user_name: string;
   login_date: string;
   updated_at: Date;
+  /**
+   * The Kite api key the token is bound to (the row's `api_key_or_client_id`).
+   *
+   * ADDITIVE, and load-bearing for the in-app login: `KiteClient.installProvidedToken`
+   * needs the api key alongside the token, so rehydrating a stored Zerodha session at
+   * boot is impossible without it. It also lets the adopter PIN the stored key against
+   * the configured `KITE_API_KEY` and refuse a session minted by a different app — a
+   * token/key mismatch otherwise surfaces as an opaque 403 from Zerodha on the first
+   * authenticated call.
+   *
+   * It is the same value that is already authenticated as AAD for the row, so it cannot
+   * have been altered without decryption failing first. NOT a secret: the api key is
+   * public and appears in the login URL.
+   */
+  api_key: string;
 }
 
 /** Dhan session — the predecessor codebase's `IDhanSession` shape (minus the Mongo `_id`). */
@@ -289,6 +304,7 @@ export async function loadKiteSession(): Promise<IKiteSession | null> {
     user_name: "",
     login_date: found.row.login_date,
     updated_at: new Date(),
+    api_key: found.row.api_key_or_client_id,
   };
 }
 

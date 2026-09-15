@@ -85,6 +85,15 @@ import {
   saveKiteSession,
   __internal as brokerSessionInternals,
 } from "./brokerState/brokerSessions.js";
+import { registerBrokerAuthRoutes } from "./brokerAuthRoutes.js";
+import { PendingLoginStore } from "./brokerAuth/pendingLogins.js";
+import {
+  registerTokenExposureRoutes,
+  tokenExposureConfigFromEnv,
+  tokenExposureEnabled,
+  type TokenLookup,
+} from "./tokenExposureRoutes.js";
+import { isDhanTokenExpired } from "./brokers/dhan/auth.js";
 
 import { MongoExportClient, exportConfigFromEnv } from "./outbox/mongo.js";
 import { Projector } from "./outbox/projector.js";
@@ -419,6 +428,46 @@ let projector: Projector | null = null;
 /* ========================================================================== */
 
 /**
+ * WHERE ACCESS TOKENS COME FROM: `in_app` (default) or `provider`.
+ *
+ * `in_app`   — the operator signs in to each broker FROM THIS DEPLOYMENT
+ *              (POST /api/broker/:broker/login/start → broker consent → callback), the
+ *              token is minted here, sealed into PostgreSQL and installed. The external
+ *              provider poller is NOT started, because there is nothing for it to do and
+ *              a poller racing an interactive login is a way to overwrite a session the
+ *              operator just established.
+ * `provider` — the historical behaviour: poll the external CalSpread token routes from
+ *              09:00 IST. Retained so an existing deployment can upgrade without changing
+ *              how it gets tokens, and so the two paths never have to run at once.
+ *
+ * Read ONCE here so a mid-session env edit cannot change token provenance without a
+ * restart. An unrecognised value falls back to `in_app` with a warning rather than
+ * failing boot: the in-app path needs no external secret, so it is the safe default.
+ */
+type BrokerLoginMode = "in_app" | "provider";
+
+function brokerLoginModeFromEnv(env: NodeJS.ProcessEnv = process.env): BrokerLoginMode {
+  const raw = (env.BROKER_LOGIN_MODE ?? "in_app").trim().toLowerCase();
+  if (raw === "in_app" || raw === "") return "in_app";
+  if (raw === "provider") return "provider";
+  console.warn(
+    `[Token] BROKER_LOGIN_MODE="${raw}" is not recognised (expected in_app | provider) — using in_app.`,
+  );
+  return "in_app";
+}
+
+const brokerLoginMode: BrokerLoginMode = brokerLoginModeFromEnv();
+
+/**
+ * Single-use, TTL-bounded record of an in-flight browser login, one slot per broker.
+ *
+ * This is what authenticates the OAuth callback, which cannot present the session cookie
+ * (it is SameSite=Strict and the redirect is cross-site). See
+ * src/brokerAuth/pendingLogins.ts for the full reasoning.
+ */
+const pendingBrokerLogins = new PendingLoginStore();
+
+/**
  * Which broker the token service is allowed to bring up.
  *
  * This is the enforcement point for the single-active-broker invariant on the token
@@ -653,18 +702,62 @@ boxModule.engine.setExternalReadinessBlockers(() => {
       detail: `${migrationState.pending} database migration(s) are still pending.`,
     });
   }
-  const activeToken = [tokenStatus.zerodha, tokenStatus.dhan].find((t) => t.broker === active);
-  if (!activeToken || activeToken.state !== "ready") {
+  /**
+   * IS THE ACTIVE BROKER'S TOKEN READY?
+   *
+   * The answer MUST come from whichever mechanism actually owns the token, or this blocker
+   * becomes permanent. In `in_app` mode the acquisition state machine is never started, so
+   * reading its state here would report `waiting` forever and refuse EVERY live entry no
+   * matter how recently the operator signed in — a gate that can never be satisfied is not
+   * a safety gate, it is an outage. So the session is consulted in that mode, exactly as
+   * `GET /api/runtime/status` does, keeping the readiness verdict and the status readout
+   * two projections of the same fact rather than two disagreeing answers.
+   */
+  const activeTokenState =
+    brokerLoginMode === "in_app"
+      ? inAppTokenState(active)
+      : [tokenStatus.zerodha, tokenStatus.dhan].find((t) => t.broker === active)?.state;
+  if (activeTokenState !== "ready") {
     blockers.push({
       code: "active_broker_token_not_ready",
       scope: "entry",
       detail:
-        `The ${active} session token is ${activeToken?.state ?? "unavailable"}. Without a ready token ` +
+        `The ${active} session token is ${activeTokenState ?? "unavailable"}. Without a ready token ` +
         `the broker refuses orders, so entry is refused locally rather than optimistically attempted.`,
     });
   }
   return blockers;
 });
+
+/**
+ * Project one broker's IN-APP session into the same `token_state` vocabulary the external
+ * poller uses, so `GET /api/runtime/status` has ONE shape regardless of token provenance
+ * and the frontend needs no second code path.
+ *
+ * The five states keep their established meanings:
+ *   configuration_error — the app credentials are missing; polling/clicking cannot fix it.
+ *   polling             — a browser login is in flight (the operator is at the broker).
+ *   ready               — a usable session exists RIGHT NOW.
+ *   invalid             — a session exists but its token is past its expiry / trading day.
+ *   waiting             — configured, nothing in flight, nobody signed in yet.
+ *
+ * Order matters: a configuration error outranks everything (no click will clear it), and
+ * an expired session is reported as `invalid` rather than collapsed into `waiting`,
+ * because "sign in again" and "sign in" are different instructions.
+ */
+function inAppTokenState(
+  broker: BrokerId,
+): "waiting" | "polling" | "ready" | "invalid" | "configuration_error" {
+  const creds =
+    broker === "zerodha" ? brokerManager.zerodhaCredentials() : brokerManager.dhanCredentials();
+  if (!creds.ok) return "configuration_error";
+
+  const session = brokerManager.sessionFor(broker);
+  if (session.authenticated && !session.token_expired) return "ready";
+  if (session.token_expired) return "invalid";
+  if (pendingBrokerLogins.isPending(broker)) return "polling";
+  return "waiting";
+}
 
 registerRuntimeStatusRoutes(app, {
   requireOperator,
@@ -689,11 +782,25 @@ registerRuntimeStatusRoutes(app, {
       return {
         brokers: tokens.map((t) => ({
           broker: t.broker,
-          token_state: t.state,
-          ist_day: t.istDay,
+          /**
+           * IN `in_app` MODE THE POLLER IS NOT RUNNING, SO ITS STATE WOULD BE A LIE.
+           *
+           * `tokenService.status()` reports the ACQUISITION state machine. With
+           * BROKER_LOGIN_MODE=in_app that machine never starts, so every broker would sit
+           * at `waiting` forever and the workspace would show "waiting for today's token"
+           * next to a perfectly good session the operator signed into minutes ago —
+           * telling them to wait for something that is never coming.
+           *
+           * So in that mode the token state is derived from the SESSION itself, which is
+           * the actual source of truth for "can this broker be used right now". In
+           * `provider` mode the poller IS the truth and is reported unchanged.
+           */
+          token_state: brokerLoginMode === "in_app" ? inAppTokenState(t.broker) : t.state,
+          ist_day: brokerLoginMode === "in_app" ? istDayKey() : t.istDay,
           last_attempt_at: t.lastAttemptAt === null ? null : new Date(t.lastAttemptAt).toISOString(),
           last_success_at: t.lastSuccessAt === null ? null : new Date(t.lastSuccessAt).toISOString(),
-          last_error: t.lastError,
+          // In in_app mode the actionable error is the LOGIN failure, not a fetch failure.
+          last_error: brokerLoginMode === "in_app" ? brokerManager.loginError(t.broker) : t.lastError,
           feed_connected: t.feedConnected,
           wanted_token_count: t.wantedTokenCount,
           subscribed_token_count: t.subscribedTokenCount,
@@ -749,6 +856,101 @@ registerBrokerRoutes(app, {
   },
   // Every open tab must see a broker change immediately, not on the next poll.
   onBrokerChanged: () => boxModule.engine.publishNow(),
+});
+
+/* ========================================================================== */
+/*  IN-APP BROKER LOGIN                                                       */
+/* ========================================================================== */
+
+/**
+ * The login routes are mounted for BOTH brokers unconditionally, and each one only ever
+ * touches the broker named in its path. That is what makes "signed in to both, trading on
+ * one" real: `completeZerodhaLogin`/`completeDhanLogin` establish and persist a session
+ * regardless of which broker is active, and only bring a FEED up when the broker they
+ * belong to is the active one.
+ */
+registerBrokerAuthRoutes(app, {
+  requireOperator,
+  pending: pendingBrokerLogins,
+  frontendUrl: config.frontendUrl,
+  // The callback is a GET and therefore bypasses the readiness mutation gate, so it
+  // checks readiness itself: a login completing mid-boot could otherwise be discarded by
+  // `restore()` adopting the stored session moments later.
+  mutationsAllowed: () => readiness.mutationsAllowed(),
+  login: {
+    beginZerodhaLogin: (state) => brokerManager.beginZerodhaLogin(state),
+    completeZerodhaLogin: (requestToken) => brokerManager.completeZerodhaLogin(requestToken),
+    beginDhanLogin: () => brokerManager.beginDhanLogin(),
+    completeDhanLogin: (tokenId) => brokerManager.completeDhanLogin(tokenId),
+    logoutZerodha: () => brokerManager.logoutZerodha(),
+    logoutDhan: () => brokerManager.logoutDhan(),
+    // Re-projected to a bare ok/reason so no credential value can cross this seam.
+    credentialsFor: (broker) => {
+      const creds =
+        broker === "zerodha" ? brokerManager.zerodhaCredentials() : brokerManager.dhanCredentials();
+      return creds.ok ? { ok: true } : { ok: false, reason: creds.reason };
+    },
+  },
+  // A session change alters what the workspace may do, so push a snapshot rather than
+  // waiting for the next 5s poll.
+  onSessionChanged: () => boxModule.engine.publishNow(),
+});
+
+/* ========================================================================== */
+/*  TOKEN EXPOSURE FOR SIBLING SERVICES                                       */
+/* ========================================================================== */
+
+const tokenExposureConfig = tokenExposureConfigFromEnv();
+
+/**
+ * Serve the CURRENTLY USABLE token for one broker, read from the durable store.
+ *
+ * PostgreSQL is the authority, so this reads (and decrypts) the stored row rather than
+ * reporting the manager's in-memory copy — one decryption path, and the answer cannot
+ * drift from what a restart would adopt.
+ *
+ * FRESHNESS IS ENFORCED HERE, not by the route: the route must not own broker policy.
+ *   • Zerodha is DAY-SCOPED — a session whose `login_date` is not the current IST day is
+ *     dead, and is reported as such rather than handed out.
+ *   • Dhan honours an EXPLICIT expiry; a null expiry is UNKNOWN, which is accepted (and
+ *     retired operationally by a 401), never treated as expired.
+ */
+async function currentExposedToken(broker: BrokerId): Promise<TokenLookup> {
+  if (broker === "zerodha") {
+    const session = await loadKiteSession();
+    if (!session) return { ok: false, reason: "no_session" };
+    if (session.login_date !== istDayKey()) return { ok: false, reason: "session_stale_day" };
+    return {
+      ok: true,
+      token: {
+        accessToken: session.access_token,
+        // The api key is what the token must be paired with in the Authorization header.
+        identity: session.api_key,
+        loginDate: session.login_date,
+        expiresAtMs: null,
+      },
+    };
+  }
+  const session = await loadDhanSession();
+  if (!session) return { ok: false, reason: "no_session" };
+  if (isDhanTokenExpired(session.expiry_time)) return { ok: false, reason: "session_expired" };
+  return {
+    ok: true,
+    token: {
+      accessToken: session.access_token,
+      identity: session.dhan_client_id,
+      loginDate: session.login_date,
+      expiresAtMs: session.expiry_time,
+    },
+  };
+}
+
+registerTokenExposureRoutes(app, {
+  config: tokenExposureConfig,
+  tokens: {
+    currentToken: currentExposedToken,
+    activeBroker: () => brokerManager.activeBroker,
+  },
 });
 
 app.use(errorHandler());
@@ -904,11 +1106,44 @@ async function boot(): Promise<void> {
     console.log("[Mongo] export disabled (MONGO_EXPORT_ENABLED=false or MONGODB_URI unset) — PostgreSQL remains authoritative.");
   }
 
-  /* 7 + 8 + 9. The daily token broker. It is the ONLY thing that installs a token,
-     loads instruments and opens the single dedicated Box market-data socket, and it
-     does so only for the ACTIVE broker. */
-  await tokenService.start();
-  console.log("[Token] dual-broker acquisition scheduled (Asia/Kolkata).");
+  /* 7 + 8 + 9. Bring the ACTIVE broker's runtime up.
+
+     TWO MUTUALLY EXCLUSIVE PATHS, AND THEY MUST NOT BOTH RUN.
+
+     `provider` — the external token poller is the ONLY thing that installs a token, loads
+     instruments and opens the dedicated Box market-data socket, and it does so only for
+     the ACTIVE broker (via its onActiveBrokerReady callback).
+
+     `in_app` — the token comes from an operator sign-in instead, so there is no poller and
+     therefore nothing to invoke that callback. `restore()` (step 3) has already rehydrated
+     BOTH brokers' stored sessions, so the runtime must be started HERE. Without this the
+     process would boot with a perfectly valid stored session and no feed — the exact class
+     of bug the Dhan adoption comment above documents, one layer up.
+
+     `startActiveRuntime()` is a no-op when the active broker has no session, so a first
+     boot before anyone has signed in stays idle and honest rather than erroring. */
+  if (brokerLoginMode === "provider") {
+    await tokenService.start();
+    console.log("[Token] dual-broker acquisition scheduled (Asia/Kolkata).");
+  } else {
+    await brokerManager.startActiveRuntime();
+    console.log(
+      "[Token] BROKER_LOGIN_MODE=in_app — the external token poller is NOT running. " +
+        "Sign in to each broker from the workspace (POST /api/broker/:broker/login/start).",
+    );
+  }
+
+  if (tokenExposureEnabled(tokenExposureConfig)) {
+    console.log(
+      "[Token] exposure ENABLED: GET /api/tokens/zerodha and /api/tokens/dhan serve the " +
+        "current access token to callers presenting x-token-access-key. Ensure TLS and " +
+        "network restrictions are in place.",
+    );
+  } else {
+    console.log(
+      "[Token] exposure disabled (TOKEN_EXPOSURE_KEY unset or too short) — /api/tokens/* answers 503.",
+    );
+  }
 
   /* 12 + 13. Deliberately absent: no engine.start(), no live arming. */
   console.log(

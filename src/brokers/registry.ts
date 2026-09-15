@@ -67,13 +67,23 @@ import {
   readDhanCredentials,
   type DhanAppCredentials,
 } from "./dhan/auth.js";
+import {
+  buildZerodhaLoginUrl,
+  exchangeZerodhaRequestToken,
+  readZerodhaCredentials,
+  ZerodhaAuthError,
+  type ZerodhaAppCredentials,
+} from "./zerodha/auth.js";
 import { dhanSegmentFor, type DhanExchangeSegment } from "./dhan/segments.js";
 import {
   clearDhanSession,
+  clearKiteSession,
   loadActiveBroker,
   loadDhanSession,
+  loadKiteSession,
   saveActiveBroker,
   saveDhanSession,
+  saveKiteSession,
 } from "../brokerState/brokerSessions.js";
 import type { BoxConfig } from "../box/config.js";
 import type { ExecutionTimingRecorder } from "../box/executionTiming.js";
@@ -366,6 +376,39 @@ export class ActiveBrokerManager {
     loginAt: number;
   } | null = null;
   private dhanProblems: string[] = [];
+
+  /* ---- Zerodha session metadata (the TOKEN itself lives in the KiteClient) ---- */
+  /**
+   * Who the Zerodha session belongs to and when it was established.
+   *
+   * The access token is deliberately NOT duplicated here: `deps.kite` owns it, and two
+   * copies of a credential are two things that can disagree. This holds only the facts
+   * the status surface needs — none of which is a secret.
+   *
+   * `loginDay` is the IST day key the token was minted on, and it is what makes Zerodha
+   * expiry KNOWABLE. Kite tokens die at the IST day boundary with no stated instant, so
+   * "is this token still valid?" is a day comparison; before the in-app login existed
+   * there was no login day recorded anywhere and the session simply claimed it never
+   * expired.
+   */
+  private zerodhaSessionMeta: {
+    userId: string;
+    userName: string;
+    apiKey: string;
+    loginDay: string;
+    loginAt: number;
+  } | null = null;
+
+  /**
+   * The most recent IN-APP LOGIN failure per broker, as an operator-facing sentence.
+   *
+   * Kept per broker and never shared, so a failed Dhan sign-in cannot put an error on
+   * the Zerodha card. Cleared on the next successful login or logout for that broker.
+   * NEVER a token, a checksum, an app secret or a request token — the auth modules
+   * guarantee their error messages carry none of those.
+   */
+  private loginErrors: Record<BrokerId, string | null> = { zerodha: null, dhan: null };
+
   /** Provenance of the most recent margin figure, for the status endpoints. */
   private lastMarginSource: BoxMarginSource | null = null;
   /**
@@ -764,11 +807,82 @@ export class ActiveBrokerManager {
         `[Broker] restored durable selection ${this.active} at generation ${this.gen}.`,
       );
     }
-    // Rehydrate a still-valid Dhan session so a restart does not force a re-login.
-    // A read/decrypt FAILURE rejects (see adoptStoredDhanSession); only a confirmed
-    // absent/expired session resolves false.
+    // Rehydrate BOTH brokers' still-valid sessions so a restart does not force a
+    // re-login, and so the STANDBY broker is honestly reported as connected rather than
+    // as "waiting for a token". A read/decrypt FAILURE rejects (see the adopters); only a
+    // confirmed absent/expired session resolves false.
+    //
+    // Both are adopted regardless of which broker is active: that is the whole point of
+    // holding two independent sessions. Neither adopter starts a feed — only
+    // `startActiveRuntime`/`switchBroker` do, and only for the active broker.
+    await this.adoptStoredKiteSession();
     await this.adoptStoredDhanSession();
-    if (this.active === "dhan") this.dhanProblems = this.computeDhanProblems();
+    this.dhanProblems = this.computeDhanProblems();
+  }
+
+  /**
+   * Read the encrypted Zerodha session out of PostgreSQL and install it in the running
+   * KiteClient.
+   *
+   * WHY THIS DID NOT EXIST BEFORE, AND WHY ITS ABSENCE WAS A BUG
+   * `restore()` adopted only the Dhan session. The Zerodha token was persisted to
+   * `broker_sessions` all the same, so after a restart the row was sitting there, valid,
+   * while the running `KiteClient` held `accessToken = null` — Zerodha reported itself
+   * unauthenticated and could not be selected until the external token service happened
+   * to re-acquire. With the in-app login there IS no re-acquirer, so without this the
+   * operator would have to sign in again after every deploy.
+   *
+   * DAY-SCOPED, AND THE DAY IS CHECKED HERE
+   * Kite tokens die at the IST day boundary. A stored session whose `login_date` is not
+   * today is INVALIDATED rather than adopted: installing yesterday's token would make
+   * `authenticated` true until the first call to Zerodha failed, which is strictly worse
+   * than reporting the truth.
+   *
+   * THE API KEY IS PINNED
+   * A stored session minted under a DIFFERENT `KITE_API_KEY` is refused. Tokens are bound
+   * to the app that minted them, so adopting a foreign pair would produce an opaque 403
+   * on the first authenticated call rather than a legible "sign in again".
+   *
+   * ABSENCE AND FAILURE ARE DIFFERENT ANSWERS (identical policy to the Dhan adopter)
+   *   - PostgreSQL confirmed there is no active Zerodha row → `false`
+   *   - the stored session is present but stale/foreign      → `false`, and it is invalidated
+   *   - the query failed, or the row cannot be decrypted     → REJECTS
+   *
+   * No plaintext token appears in any error or log on any of these paths.
+   */
+  async adoptStoredKiteSession(): Promise<boolean> {
+    // NOT `.catch(() => null)`. A query/decrypt failure must not masquerade as absence.
+    const session = await loadKiteSession();
+    if (!session) return false;
+
+    const today = this.deps.istDayKey();
+    if (session.login_date !== today) {
+      await clearKiteSession(`login_date ${session.login_date} is not the current IST day`).catch(
+        () => undefined,
+      );
+      this.zerodhaSessionMeta = null;
+      return false;
+    }
+
+    const configured = readZerodhaCredentials();
+    if (configured.ok && session.api_key && session.api_key !== configured.creds.apiKey) {
+      await clearKiteSession("stored session belongs to a different KITE_API_KEY").catch(
+        () => undefined,
+      );
+      this.zerodhaSessionMeta = null;
+      return false;
+    }
+
+    const apiKey = session.api_key || (configured.ok ? configured.creds.apiKey : "");
+    this.deps.kite.installProvidedToken(apiKey, session.access_token);
+    this.zerodhaSessionMeta = {
+      userId: session.user_id,
+      userName: session.user_name,
+      apiKey,
+      loginDay: session.login_date,
+      loginAt: session.updated_at instanceof Date ? session.updated_at.getTime() : Date.now(),
+    };
+    return true;
   }
 
   /**
@@ -870,6 +984,163 @@ export class ActiveBrokerManager {
     return readDhanCredentials();
   }
 
+  zerodhaCredentials(): { ok: true; creds: ZerodhaAppCredentials } | { ok: false; reason: string } {
+    return readZerodhaCredentials();
+  }
+
+  /** The last in-app login failure for a broker, or null. Never a credential. */
+  loginError(broker: BrokerId): string | null {
+    return this.loginErrors[broker];
+  }
+
+  /* ------------------------- Zerodha in-app login ------------------------ */
+
+  /**
+   * STEP 1 of the Zerodha login: the browser consent URL.
+   *
+   * `state` is the caller's single-use nonce; Kite echoes it back through
+   * `redirect_params` so the callback can prove it belongs to a login this deployment
+   * started. Nothing secret is placed in the URL — `api_key` is public.
+   */
+  beginZerodhaLogin(state: string): { loginUrl: string } {
+    const creds = readZerodhaCredentials();
+    if (!creds.ok) throw new ZerodhaAuthError(creds.reason, 400, "CONFIG");
+    return { loginUrl: buildZerodhaLoginUrl(creds.creds, { state }) };
+  }
+
+  /**
+   * STEP 3 of the Zerodha login: exchange the redirect's `request_token`, persist the
+   * session and install it — WITHOUT disturbing Dhan.
+   *
+   * The sequence mirrors `completeDhanLogin` and, critically, shares its central rule:
+   * everything up to and including the durable write happens unconditionally, but the
+   * FEED/UNIVERSE work happens ONLY when Zerodha is the active broker. Signing into
+   * Zerodha while Dhan is active establishes a genuine standby session and touches no
+   * socket, no instrument universe, no subscription table and no book — which is exactly
+   * what "log into both, trade on one" has to mean.
+   */
+  async completeZerodhaLogin(requestToken: string): Promise<BrokerSessionState> {
+    const creds = readZerodhaCredentials();
+    if (!creds.ok) throw new ZerodhaAuthError(creds.reason, 400, "CONFIG");
+
+    // Record the reason on the ZERODHA slot, then rethrow for the route to map. A failed
+    // Zerodha sign-in must never put an error on the Dhan card.
+    const session = await exchangeZerodhaRequestToken(creds.creds, requestToken).catch(
+      (err: unknown) => {
+        this.loginErrors.zerodha = err instanceof Error ? err.message : "Zerodha sign-in failed.";
+        throw err;
+      },
+    );
+
+    const loginDay = this.deps.istDayKey();
+    // Install BEFORE persisting: the running client is what serves requests, and a
+    // PostgreSQL hiccup must not leave the operator signed out of a session Zerodha has
+    // already minted. The persist failure is surfaced as a problem, not swallowed.
+    this.deps.kite.installProvidedToken(session.apiKey, session.accessToken);
+    this.zerodhaSessionMeta = {
+      userId: session.userId,
+      userName: session.userName,
+      apiKey: session.apiKey,
+      loginDay,
+      loginAt: session.loginTimeMs ?? Date.now(),
+    };
+    this.loginErrors.zerodha = null;
+
+    await saveKiteSession({
+      access_token: session.accessToken,
+      user_id: session.userId,
+      user_name: session.userName,
+      login_date: loginDay,
+      api_key: session.apiKey,
+      source_url: "in_app_login",
+    }).catch((err) => {
+      console.warn("[Zerodha] failed to persist the session:", err);
+      this.loginErrors.zerodha =
+        "Signed in, but the session could not be saved — a restart will require signing in again.";
+    });
+
+    // Bring the runtime up on the new session ONLY when Zerodha owns it. A standby
+    // sign-in must not open a Zerodha socket while Dhan is active.
+    if (this.active === "zerodha") {
+      await this.instrumentProvider.load(true).catch((err) =>
+        console.warn("[Zerodha] universe load after login failed:", err),
+      );
+      this.startActiveFeed();
+      // Replay EACH LANE's own table onto its own socket. The token namespace is
+      // unchanged (same broker), so the coordinators' tables are still valid — only the
+      // credential behind the socket is new.
+      const wanted = this.subscriptions.activeTokens();
+      const wantedBox = this.boxSubscriptions.activeTokens();
+      if (wanted.length > 0 || wantedBox.length > 0) {
+        console.log(
+          `[Broker] restoring ${wanted.length} futures + ${wantedBox.length} box ` +
+            `Zerodha subscription(s) after sign-in`,
+        );
+        this.subscribeUpstream("futures", wanted);
+        this.subscribeUpstream("box", wantedBox);
+      }
+      this.hooks?.publish();
+    }
+    return this.sessionFor("zerodha");
+  }
+
+  /**
+   * Drop the Zerodha session and everything derived from it.
+   *
+   * Mirrors `logoutDhan`. The feed is stopped and books invalidated ONLY when Zerodha is
+   * active — signing out of a standby Zerodha must not disturb a live Dhan runtime.
+   */
+  async logoutZerodha(): Promise<void> {
+    this.deps.kite.clearSession();
+    this.zerodhaSessionMeta = null;
+    this.loginErrors.zerodha = null;
+    await clearKiteSession("operator signed out").catch(() => undefined);
+    if (this.active === "zerodha") {
+      this.stopAllLanes();
+      this.instrumentProvider.invalidate();
+      this.lastTickAt = null;
+      this.hooks?.invalidateBooks();
+      this.hooks?.publish();
+    }
+  }
+
+  /**
+   * Operator-facing Zerodha problems.
+   *
+   * "Not configured" is reported FIRST and distinctly from "not signed in", because the
+   * two need different actions: one is an .env fix, the other is a click. Before the
+   * in-app login existed the only Zerodha problem string was "Zerodha is not connected",
+   * which told an operator with an empty KITE_API_KEY nothing actionable.
+   */
+  private computeZerodhaProblems(): string[] {
+    const problems: string[] = [];
+    const creds = readZerodhaCredentials();
+    if (!creds.ok) problems.push(creds.reason);
+
+    const token = this.deps.kite.getAccessToken();
+    if (token === null) {
+      problems.push("Zerodha is not connected — sign in to Zerodha");
+    } else if (this.zerodhaTokenStale()) {
+      problems.push("Zerodha session expired — sign in to Zerodha again");
+    }
+    const loginError = this.loginErrors.zerodha;
+    if (loginError) problems.push(loginError);
+    return problems;
+  }
+
+  /**
+   * Whether the in-memory Zerodha token is from an earlier IST day.
+   *
+   * An UNKNOWN login day (a token installed by a path that recorded no metadata) is NOT
+   * treated as stale: refusing a token we have no evidence against would break any
+   * deployment still provisioning tokens externally.
+   */
+  private zerodhaTokenStale(): boolean {
+    const meta = this.zerodhaSessionMeta;
+    if (!meta) return false;
+    return meta.loginDay !== this.deps.istDayKey();
+  }
+
   /** STEP 1 of the Dhan login: a consent + the browser URL. */
   async beginDhanLogin(): Promise<{ consentAppId: string; loginUrl: string }> {
     const creds = readDhanCredentials();
@@ -881,7 +1152,14 @@ export class ActiveBrokerManager {
   async completeDhanLogin(tokenId: string): Promise<BrokerSessionState> {
     const creds = readDhanCredentials();
     if (!creds.ok) throw new DhanError(creds.reason, 400, "CONFIG");
-    const session = await consumeDhanConsent(creds.creds, tokenId);
+    // Record the reason on the DHAN slot only, then rethrow for the route to map. A
+    // failed Dhan sign-in must never put an error on the Zerodha card.
+    const session = await consumeDhanConsent(creds.creds, tokenId).catch((err: unknown) => {
+      this.loginErrors.dhan = err instanceof Error ? err.message : "Dhan sign-in failed.";
+      this.dhanProblems = this.computeDhanProblems();
+      throw err;
+    });
+    this.loginErrors.dhan = null;
 
     this.dhanAccessToken = session.accessToken;
     this.dhanTokenExpiry = session.expiryTime;
@@ -1250,16 +1528,25 @@ export class ActiveBrokerManager {
   sessionFor(broker: BrokerId): BrokerSessionState {
     if (broker === "zerodha") {
       const token = this.deps.kite.getAccessToken();
+      const meta = this.zerodhaSessionMeta;
+      // A token minted on an earlier IST day is dead: Kite sessions end at the day
+      // boundary. `authenticated` therefore EXCLUDES a stale token, exactly as the Dhan
+      // branch below excludes an expired one, so both brokers project identically.
+      const stale = token !== null && this.zerodhaTokenStale();
       return {
         broker: "zerodha",
-        authenticated: token !== null,
-        client_id: null,
-        client_name: null,
-        // Kite tokens die at the IST day boundary; there is no stated instant.
+        authenticated: token !== null && !stale,
+        // Real identity now that the in-app login records who signed in. Redacted
+        // downstream by projectBrokerSession — never emitted raw.
+        client_id: meta?.userId || null,
+        client_name: meta?.userName || null,
+        // Kite tokens die at the IST day boundary; there is no stated instant, and one
+        // must not be invented — a guessed timestamp would either retire a live token
+        // early or present a dead one as valid until it failed at the broker.
         token_expires_at: null,
-        token_expired: false,
-        login_day: null,
-        login_at: null,
+        token_expired: stale,
+        login_day: meta?.loginDay ?? null,
+        login_at: meta?.loginAt ?? null,
       };
     }
     const expired = isDhanTokenExpired(this.dhanTokenExpiry);
@@ -1280,18 +1567,22 @@ export class ActiveBrokerManager {
     const session = this.sessionFor(broker);
     if (broker === "zerodha") {
       const connected = this.deps.tickerHub.isConnected();
+      // Recomputed on every read (like the Dhan branch) rather than trusting the cached
+      // field: credentials, the installed token and the IST day can all change between
+      // status polls, and a stale problem list is a status endpoint lying.
+      const problems = this.computeZerodhaProblems();
       return {
         broker: "zerodha",
         authenticated: session.authenticated,
         token_expires_at: null,
-        token_expired: false,
+        token_expired: session.token_expired,
         data_ready: session.authenticated,
         // Zerodha has no static-IP requirement; live gating is the Box config's job.
         trading_ready: session.authenticated,
         static_ip_configured: null,
         feed_connected: connected,
         feed_age_ms: null,
-        problems: session.authenticated ? [] : ["Zerodha is not connected"],
+        problems,
       };
     }
     const problems = this.computeDhanProblems();

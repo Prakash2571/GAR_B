@@ -3,10 +3,12 @@
  * Minimal Kite Connect v3 client implemented with native `fetch` so it needs no
  * external dependencies.
  *
- * This backend does NOT perform Zerodha OAuth: the api key and access token are
- * provisioned by the external CalSpread token provider and installed via
- * `KiteClient.installProvidedToken`. The request-token exchange and the login-URL
- * builder have been removed accordingly.
+ * THIS CLIENT DOES NOT OWN THE LOGIN. The api key and access token are INSTALLED into
+ * it via `KiteClient.installProvidedToken` — either by the in-app OAuth flow
+ * (`src/brokers/zerodha/auth.ts`, the default) or by the external token provider when
+ * `BROKER_LOGIN_MODE=provider`. Keeping the exchange out of this class is deliberate: the
+ * api SECRET is needed only to compute a login checksum, and it must not be reachable from
+ * the object that talks to the data and order endpoints.
  *
  * Docs: https://kite.trade/docs/connect/v3/
  */
@@ -474,16 +476,21 @@ export class KiteClient {
   }
 
   /**
-   * Step 2/3 — DISABLED IN STRIKEEDGE.
+   * Step 2/3 — NOT IMPLEMENTED HERE, ON PURPOSE.
    *
-   * The Zerodha request-token exchange is removed: This backend never performs its
-   * own broker OAuth. The access token is provisioned by the external CalSpread token
-   * provider and installed via {@link installProvidedToken}. Retained as a throwing
-   * stub so any lingering caller fails loudly rather than silently doing nothing.
+   * The request-token exchange lives in `src/brokers/zerodha/auth.ts`
+   * (`exchangeZerodhaRequestToken`), not on this client, so the api SECRET stays out of
+   * the object that holds the data/order transport. `ActiveBrokerManager.completeZerodhaLogin`
+   * performs the exchange and then calls {@link installProvidedToken} here.
+   *
+   * Retained as a throwing stub so a caller reaching for the wrong seam fails loudly and
+   * is pointed at the right one, rather than silently doing nothing.
    */
   async generateSession(_requestToken: string): Promise<SessionData> {
     throw new KiteError(
-      "Zerodha OAuth login is disabled in this backend: the access token is provisioned by the external CalSpread token provider, not by a request-token exchange.",
+      "KiteClient does not perform the Zerodha request-token exchange. Use " +
+        "exchangeZerodhaRequestToken() in src/brokers/zerodha/auth.ts (or " +
+        "ActiveBrokerManager.completeZerodhaLogin), which then installs the token here.",
       400,
     );
   }
@@ -515,9 +522,9 @@ export class KiteClient {
   private authHeader(): Record<string, string> {
     if (!this.accessToken) {
       throw new KiteError(
-        "Zerodha access token is not installed yet. This backend has no interactive login flow; " +
-          "the token is provisioned by the external CalSpread token acquisition service and installed via " +
-          "installProvidedToken(). Wait for token acquisition to complete (see GET /api/runtime/status).",
+        "Zerodha access token is not installed yet. Sign in to Zerodha from the workspace " +
+          "(POST /api/broker/zerodha/login/start), or — when BROKER_LOGIN_MODE=provider — wait for " +
+          "token acquisition to complete. See GET /api/runtime/status for the current token state.",
         401,
       );
     }

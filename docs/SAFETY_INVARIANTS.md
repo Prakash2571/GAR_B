@@ -116,3 +116,32 @@ and *are* strong (real assertions, real broker boundary, negative/positive contr
 
 No misleading test was found. No production defect was found — all 20 invariants are enforced; the
 sole gap was a missing *verification* for one clause of invariant 20, now closed.
+
+## The one deliberate exception to "no route returns a token"
+
+`GET /api/tokens/zerodha` and `GET /api/tokens/dhan` (`src/tokenExposureRoutes.ts`)
+return a **plaintext broker access token**. Everywhere else in this backend that is a
+hard invariant, so the exception is called out here rather than left for a reviewer to
+discover.
+
+**Why it exists.** Sibling services need the token this deployment already minted. The
+alternative — each service running its own broker login — means several logins per day,
+several places a secret can leak, and no single place that knows which session is live.
+
+**Why it is not a hole.**
+
+| Fence | Enforcement |
+| --- | --- |
+| Off by default | `TOKEN_EXPOSURE_KEY` unset ⇒ `503` for every request. Opt-in only. |
+| No weak keys | Shorter than 32 characters ⇒ `503` (misconfiguration), not honoured. |
+| Dedicated credential | `x-token-access-key` **header**, constant-time compared. Never a query string; never the site passcode, so it is independently revocable and cannot drive the UI. |
+| Brute-force bounded | 30 requests/minute/IP. |
+| Read-only | No branch mints, refreshes, invalidates or switches anything. It cannot change what this deployment trades. |
+| No leakage | Never logged (zero `console.*` calls in the module) and never cached (`Cache-Control: no-store`). |
+| Honest freshness | A token is served only while usable; otherwise `409` with a reason, so a caller never receives a dead credential. |
+| Scoped prefix | Not under `/api/broker/*`, so that prefix's no-token invariant remains literally true. |
+
+**Operator obligation.** TLS-terminate in front of it and restrict the route at the
+network/nginx layer to the hosts that need it. The response body is a bearer credential
+and the code cannot enforce transport security from behind a proxy that already
+terminated the connection.

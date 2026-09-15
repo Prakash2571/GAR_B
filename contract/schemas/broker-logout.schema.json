@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "broker-logout.schema.json",
+  "title": "POST /api/broker/{broker}/logout (200)",
+  "description": "Confirmation that ONE broker's session was dropped. Source: src/brokerAuthRoutes.ts POST /api/broker/:broker/logout success branch. Obtained via REAL HTTP with an inert BrokerLoginProvider. Scoped to the named broker: the other broker's stored session, feed and subscriptions are untouched. Carries no session detail at all — the caller re-reads GET /api/broker/status for the new state.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["ok", "broker"],
+  "properties": {
+    "ok": { "const": true },
+    "broker": { "enum": ["zerodha", "dhan"] }
+  }
+}

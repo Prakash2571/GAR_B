@@ -1,6 +1,7 @@
 /**
  * tokenProviderClient — the ONLY outbound HTTP that fetches a broker access token
- * from the predecessor codebase. This backend never performs its own broker OAuth: it asks the
+ * from the predecessor codebase. This client is used ONLY when BROKER_LOGIN_MODE=provider
+ * (the in-app OAuth login in src/brokers/{zerodha,dhan}/auth.ts is the default): it asks the
  * external CalSpread token route for the token that service already holds, validates it hard,
  * and hands it to the session store to encrypt.
  *
