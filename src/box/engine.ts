@@ -117,6 +117,13 @@ import {
   type BoxBoardItem,
   type BoxChainIndex,
 } from "./instruments.js";
+// THE UNIVERSE PIPELINE DIAGNOSIS. Names the FIRST stage that stopped, so "0 candidates" — a
+// symptom shared by fifteen different causes — is never the only thing an operator is told.
+import {
+  assessUniverseReadiness,
+  type InstrumentLoadState,
+  type UniverseReadiness,
+} from "./universeReadiness.js";
 import { buildCandidates, round2 } from "./math.js";
 import { BoxPositionBook, deriveBoxPositionState, fullLotByRole, isBoxPositionFlat, outstandingRoles, type BoxOpenPosition } from "./positions.js";
 import { exactEntryFillViolation, singleLotCandidateViolation, singleLotPositionViolation } from "./singleLotInvariant.js";
@@ -545,6 +552,71 @@ export class BoxEngine {
   private readonly tokenFeedGeneration = new Map<number, number>();
   private marketTimer: NodeJS.Timeout | null = null;
   private indicativeTimer: NodeJS.Timeout | null = null;
+
+  /* ─────────────── UNIVERSE PIPELINE OBSERVATIONS (see universeReadiness.ts) ───────────────
+   *
+   * These exist because `underlyings: this.windows.size` was the ONLY universe figure published, so
+   * "the instrument dump came back empty" and "the market is quiet" were both rendered as `0`. Each
+   * field is an observation recorded at the stage that produces it, never inferred.
+   */
+  /** How the instrument master load stands. Four states, because "loading" ≠ "failed" ≠ "empty". */
+  private instrumentLoadState: InstrumentLoadState = "never_attempted";
+  /** The broker's own load-failure message, verbatim. */
+  private instrumentsError: string | null = null;
+  /** Rows returned by the last successful load. */
+  private instrumentCount = 0;
+  private instrumentsLoadedAt: number | null = null;
+  /** Consecutive load failures. Drives the bounded retry AND is published. */
+  private instrumentLoadFailures = 0;
+  /** Board rows BEFORE the chain join. */
+  private boardRowsDerived = 0;
+  private chainsIndexed = 0;
+  /** Board rows that also have a chain — what the universe loop actually iterates. */
+  private boardWithChains = 0;
+  /** Joined underlyings still lacking a spot price, so no ATM window can be centred. */
+  private underlyingsMissingSpot = 0;
+  private spotSeedFailed = false;
+  private spotSeedError: string | null = null;
+  /** Last universe pass that produced at least one window. */
+  private lastSuccessfulBuildAt: number | null = null;
+  /**
+   * Bounded retry for a FAILED universe pass.
+   *
+   * The recurring universe timer already retries, but at `universeRefreshMs` — far too slow to be
+   * the recovery path for a transient instrument download failure, and it leaves the scanner blind
+   * in the meantime. This is a short, capped, DEDUPLICATED retry so a blip recovers on its own
+   * without an operator pressing anything, restarting the process or regenerating a token.
+   */
+  private universeRetryTimer: NodeJS.Timeout | null = null;
+  /**
+   * Consecutive FAILED universe passes — the backoff's own counter.
+   *
+   * Deliberately NOT `instrumentLoadFailures`: that one is reset to 0 immediately after a successful
+   * load, so deriving the delay from it pinned the backoff at the 2s base for any failure occurring
+   * AFTER the load (the spot seed, subscription application, anything added later). Every retry then
+   * re-ran the REST spot seed at 2s intervals — a retry storm, which is exactly what the bound exists
+   * to prevent.
+   */
+  private universeRetryAttempts = 0;
+  /**
+   * True while a universe pass is in flight.
+   *
+   * The retry timer, the recurring universe timer, RUN and a strike-level change can all invoke a
+   * pass. Deduplicating the TIMER is not enough — two overlapping passes each await the instrument
+   * load and then the REST spot seed while mutating `chains`/`board`/`spots`/`windows`. The provider's
+   * `inFlight` map collapses the download, but not the second REST quote call.
+   */
+  private universePassInFlight = false;
+  private static readonly UNIVERSE_RETRY_BASE_MS = 2_000;
+  private static readonly UNIVERSE_RETRY_MAX_MS = 60_000;
+  /**
+   * True once {@link dispose} has run.
+   *
+   * Needed so the bounded universe retry cannot re-arm itself during shutdown — a timer that
+   * rebuilds the universe after the engine has released its feed and stopped its monitors would
+   * resurrect work nothing is left to consume.
+   */
+  private disposed = false;
   private indicativeAt: number | null = null;
   private indicativePriced = 0;
   /** Positions whose margin fetch is currently in flight (dedupe guard). */
@@ -1894,7 +1966,10 @@ export class BoxEngine {
     this.startMarketWatch();
 
     try {
-      await this.refreshUniverse();
+      // WITH the bounded retry, not without it. RUN is exactly the moment the fast retry exists for:
+      // a transient instrument-master failure here used to arm nothing and leave the scanner blind
+      // until the next `universeRefreshMs` tick, which is what made an operator press RUN again.
+      await this.refreshUniverseWithRetry();
     } catch (err) {
       this.lastError = err instanceof Error ? err.message : String(err);
     }
@@ -1907,7 +1982,7 @@ export class BoxEngine {
 
     if (!this.universeTimer) {
       this.universeTimer = setInterval(() => {
-        void this.refreshUniverse().catch((err) => {
+        void this.refreshUniverseWithRetry().catch((err) => {
           this.lastError = err instanceof Error ? err.message : String(err);
         });
       }, this.cfg.universeRefreshMs);
@@ -1945,6 +2020,10 @@ export class BoxEngine {
       clearInterval(this.universeTimer);
       this.universeTimer = null;
     }
+    // AND the bounded retry. Clearing only the recurring timer left a pending retry armed, which then
+    // ran full universe passes — instrument load plus REST spot seed — and re-armed itself, for a
+    // scanner the operator had just stopped.
+    this.cancelUniverseRetry();
 
     // Release everything except what the open positions still need.
     this.shrinkToOpenPositions();
@@ -2124,6 +2203,9 @@ export class BoxEngine {
    * here so nothing keeps the process alive or leaks across a re-create.
    */
   dispose(): void {
+    // Set FIRST, so anything that re-arms a timer during teardown sees the shutdown.
+    this.disposed = true;
+    this.cancelUniverseRetry();
     this.orderManager?.setControls({ entryEnabled: false });
     this.stop();
     this.monitor.stop();
@@ -2573,12 +2655,61 @@ export class BoxEngine {
     const now = Date.now();
     const today = this.deps.istDayKey();
 
-    const [all, board] = await Promise.all([
-      this.deps.getAllInstruments(),
-      this.deps.getBoard(),
-    ]);
+    /*
+     * INSTRUMENT LOAD IS AN OBSERVED STAGE, NOT AN ASSUMPTION.
+     *
+     * `getAllInstruments()` returned `[]` for Zerodha for as long as this bug existed, and because
+     * an empty array is a perfectly successful Promise nothing here could tell the difference
+     * between "the broker has no instruments" and "we never asked". Every count below is recorded so
+     * `assessUniverseReadiness` can name the stage that actually stopped, and a REJECTION is
+     * recorded and rethrown rather than being flattened into an empty universe.
+     */
+    let all: Instrument[];
+    let board: BoxBoardItem[];
+    /*
+     * A RETRY DOES NOT DOWNGRADE `failed` TO `loading`.
+     *
+     * This was `if (this.instrumentLoadState !== "loaded") … = "loading"`, so every retry attempt
+     * flipped a known failure back to `loading` — and `loading` is classified TRANSIENT, whose whole
+     * message is "this resolves on its own, wait rather than restarting". An operator watching a
+     * broker that had already failed three times was told to wait, while the real 503 sat in
+     * `instruments_error` where the headline no longer pointed. `failed` is sticky until a load
+     * actually succeeds, which is also what this module's own "may not conflate loading with failed"
+     * rule requires.
+     */
+    if (this.instrumentLoadState === "never_attempted") this.instrumentLoadState = "loading";
+    try {
+      [all, board] = await Promise.all([this.deps.getAllInstruments(), this.deps.getBoard()]);
+    } catch (err) {
+      this.instrumentLoadState = "failed";
+      this.instrumentLoadFailures++;
+      this.instrumentsError = err instanceof Error ? err.message : String(err);
+      // Rethrow: the caller records it and the bounded retry below picks it up. Swallowing here is
+      // what would recreate the silent-empty-universe failure.
+      throw err;
+    }
+    this.instrumentLoadState = "loaded";
+    this.instrumentLoadFailures = 0;
+    this.instrumentsError = null;
+    this.instrumentCount = all.length;
+    if (all.length > 0) this.instrumentsLoadedAt = now;
+
     this.chains = indexOptionChains(all, today);
     this.board = prioritiseUniverse(board.filter((b) => this.chains.has(b.symbol)));
+    // Recorded BEFORE and AFTER the join, because "no board rows" and "the board and the chains do
+    // not intersect" have completely different causes and identical symptoms.
+    this.boardRowsDerived = board.length;
+    this.chainsIndexed = this.chains.size;
+    this.boardWithChains = this.board.length;
+    if (all.length > 0 && this.board.length === 0) {
+      // Loud, because this is the shape of the bug that started all this: a successful load whose
+      // universe is nonetheless unusable.
+      console.warn(
+        `[Box] universe unusable: ${all.length.toLocaleString()} instrument(s) produced ` +
+          `${board.length} board row(s) and ${this.chains.size} option chain(s), of which ` +
+          `${this.board.length} joined. Nothing can be subscribed.`,
+      );
+    }
 
     // Underlyings of open positions must always be in the universe, whatever the
     // budget says, so their legs keep streaming.
@@ -2733,6 +2864,20 @@ export class BoxEngine {
     this.skippedForBudget = skipped;
     this.skippedForIndicativeCap = skippedIndicative;
     this.universeBuiltAt = now;
+    /*
+     * HOW MANY JOINED UNDERLYINGS STILL HAVE NO PRICE TO CENTRE ON.
+     *
+     * This is the observation that separates `awaiting_spot_prices` from `no_windows_built`. It is
+     * counted over the joined board rather than the whole dump, because an underlying with no chain
+     * was never a candidate for a window in the first place and counting it would overstate the
+     * problem.
+     */
+    this.underlyingsMissingSpot = this.board.filter(
+      (b) => this.spots.get(b.spot_token) === undefined,
+    ).length;
+    // The last pass that produced at least one window. Distinguishes "never worked" from "worked
+    // until N minutes ago", which is the difference between a broken deployment and a live incident.
+    if (liveWindows.size > 0) this.lastSuccessfulBuildAt = now;
     this.applySubscriptions(wantOption, wantSpot);
     // Windows that dropped out of the universe must stop producing candidates.
     // Keyed on what this pass actually built, NOT on the subscription set: an
@@ -2744,6 +2889,85 @@ export class BoxEngine {
       this.scanner.removeUnderlying(underlying);
     }
     this.charges.prune();
+  }
+
+  /**
+   * Run a universe pass and, if it FAILS, schedule a bounded deduplicated retry.
+   *
+   * WHY THIS EXISTS. A transient instrument-master failure (a 5xx from the broker, a DNS blip, a
+   * truncated CSV) left the engine with no universe until the next `universeRefreshMs` tick — and
+   * before the diagnostics above, with no visible reason either. The observed operator response was
+   * to press RUN again, restart the process, or regenerate a token, none of which was the problem.
+   *
+   * The retry is:
+   *   - BOUNDED: exponential from 2s, capped at 60s, so a broker outage cannot become a retry storm;
+   *   - DEDUPLICATED: one timer at a time, so overlapping triggers (the recurring timer, a RUN, a
+   *     strike-level change) cannot stack into parallel multi-megabyte downloads. The
+   *     `InstrumentProvider`'s own `inFlight` map is the second line of defence for concurrent calls;
+   *   - SELF-CLEARING: a success cancels it and resets the backoff.
+   *
+   * It never throws: the caller has already recorded the failure, and an unhandled rejection inside
+   * a timer would take the process down over a recoverable condition.
+   */
+  private async refreshUniverseWithRetry(): Promise<void> {
+    // ONE PASS AT A TIME. Overlapping passes duplicate the REST spot seed and the window rebuild
+    // while mutating shared state; deduplicating only the timer does not prevent that.
+    if (this.universePassInFlight) return;
+    this.universePassInFlight = true;
+    try {
+      await this.refreshUniverse();
+      // Success clears both the pending retry and the backoff, so the next incident starts at the
+      // base delay rather than wherever the last one ended.
+      this.universeRetryAttempts = 0;
+      if (this.universeRetryTimer) {
+        clearTimeout(this.universeRetryTimer);
+        this.universeRetryTimer = null;
+      }
+    } catch (err) {
+      this.lastError = err instanceof Error ? err.message : String(err);
+      this.universeRetryAttempts++;
+      this.scheduleUniverseRetry();
+      throw err;
+    } finally {
+      this.universePassInFlight = false;
+    }
+  }
+
+  /**
+   * Arm the bounded retry. Idempotent: a pending retry is never duplicated.
+   *
+   * Refuses to arm once disposed, and once discovery has stopped — a retry that outlived STOP kept
+   * loading the instrument master and seeding spots over REST on a self-perpetuating timer, for a
+   * scanner the operator had switched off. Open positions do not need this path: they are monitored
+   * from the surviving subscriptions, not from a universe rebuild.
+   */
+  private scheduleUniverseRetry(): void {
+    if (this.universeRetryTimer !== null) return;
+    if (this.disposed || !this.running) return;
+    const attempt = Math.max(1, this.universeRetryAttempts);
+    const delay = Math.min(
+      BoxEngine.UNIVERSE_RETRY_MAX_MS,
+      BoxEngine.UNIVERSE_RETRY_BASE_MS * 2 ** Math.min(5, attempt - 1),
+    );
+    console.warn(
+      `[Box] universe pass failed (attempt ${attempt}); retrying in ${delay}ms. ` +
+        `Reason: ${this.instrumentsError ?? this.lastError ?? "unknown"}`,
+    );
+    this.universeRetryTimer = setTimeout(() => {
+      this.universeRetryTimer = null;
+      // Bare catch: the failure is already recorded and a further retry is armed inside.
+      void this.refreshUniverseWithRetry().catch(() => undefined);
+    }, delay);
+    this.universeRetryTimer.unref?.();
+  }
+
+  /** Cancel any pending universe retry and reset the backoff. */
+  private cancelUniverseRetry(): void {
+    if (this.universeRetryTimer) {
+      clearTimeout(this.universeRetryTimer);
+      this.universeRetryTimer = null;
+    }
+    this.universeRetryAttempts = 0;
   }
 
   /**
@@ -2771,7 +2995,26 @@ export class BoxEngine {
         const q = bySymbol.get(b.spot_token);
         if (q && q.last_price > 0) this.spots.set(b.spot_token, q.last_price, at);
       }
+      // A seed that returned nothing usable is not a success. Recorded so
+      // `awaiting_spot_prices` can say whether the REST call failed or simply came back empty.
+      this.spotSeedFailed = false;
+      this.spotSeedError = null;
     } catch (err) {
+      /*
+       * SURFACED, NOT JUST LOGGED.
+       *
+       * This catch used to be a bare `console.warn`, and it never touched any published field. That
+       * matters more than it looks: `refreshUniverse` skips an underlying entirely when it has no
+       * spot (`if (!state) continue`), so a failed seed produces ZERO windows, zero candidates and
+       * zero subscriptions — the same observable state as an empty instrument dump, with the
+       * explanation only in the process log.
+       *
+       * It stays non-fatal on purpose: a spot seed can fail for one chunk while the rest of the
+       * universe is fine, and the next pass retries. But it is now an OBSERVATION, so
+       * `assessUniverseReadiness` can report `awaiting_spot_prices` with the real reason attached.
+       */
+      this.spotSeedFailed = true;
+      this.spotSeedError = err instanceof Error ? err.message : String(err);
       console.warn("[Box] spot seed failed:", err);
     }
   }
@@ -5543,11 +5786,33 @@ export class BoxEngine {
       strike_level: this.strikeLevel,
       underlyings: this.windows.size,
       candidates: this.scanner.candidateCount,
+      /**
+       * THE UNIVERSE PIPELINE DIAGNOSIS — why the scanner is or is not evaluating.
+       *
+       * `underlyings` above is `this.windows.size`, which is `0` both when the instrument dump came
+       * back empty and when the market is simply quiet. This block names the FIRST stage that
+       * stopped, publishes the count behind every stage so the verdict can be checked rather than
+       * trusted, and separates "the operator pressed RUN" (`running`) from "the engine can actually
+       * evaluate a box" (`universe.ready_to_evaluate`).
+       */
+      universe: this.universeReadiness(),
       monitored_tokens: this.scanner.monitoredTokenCount,
       subscribed_option_tokens: this.subscribedOptionTokens.size,
       subscribed_spot_tokens: this.subscribedSpotTokens.size,
+      /**
+       * THE SHARED/FUTURES LANE, named as such.
+       *
+       * `hub_connected` is the SHARED board feed, which with `BOX_DEDICATED_MARKET_FEED=true` (the
+       * default) is a DIFFERENT socket from the one carrying box quotes. Publishing only this made a
+       * connected board lane read as proof the box lane was up. `box_lane_connected` below is the
+       * socket the box engine's books actually come from.
+       */
       hub_subscribed: this.deps.feed.subscribedCount(),
       hub_connected: this.deps.feed.isConnected(),
+      /** The BOX lane's own socket — the one that carries the option depth this engine trades on. */
+      box_lane_connected: this.marketDataSocketConnected,
+      /** True when the box lane is a separate socket from the shared board feed. */
+      box_lane_dedicated: this.cfg.boxDedicatedMarketFeed,
       quotes: this.quotes.size,
       quote_updates: this.quotes.updateCount,
       /** Preserved field: now correctly reports RAW current-socket tick age. */
@@ -5849,6 +6114,49 @@ export class BoxEngine {
   onMarketDataSessionLost(reason: string): void {
     this.marketDataMachine.onSessionLost();
     this.lastError = reason;
+  }
+
+  /**
+   * WHY THE SCANNER IS OR IS NOT EVALUATING CANDIDATES.
+   *
+   * Assembles every observation the universe pipeline recorded and hands them to the pure
+   * {@link assessUniverseReadiness}, which names the FIRST stage that stopped. This is the answer to
+   * the failure that started all of this: `instruments()` returned `[]` for Zerodha, so the board,
+   * the chains, the windows, the candidates and the subscriptions were all empty — and the only
+   * published figure was `underlyings: 0`, which is indistinguishable from a quiet market.
+   *
+   * `readyToEvaluate` is deliberately NOT `running`: the operator's intent and the engine's
+   * capability are different facts, and publishing only the former is what let `SCANNING` sit above
+   * a completely empty universe for an entire session.
+   */
+  universeReadiness(): UniverseReadiness {
+    const mdDiag = this.marketDataMachine.diagnostics();
+    return assessUniverseReadiness({
+      scannerRunning: this.running,
+      authenticated: this.deps.marketData.isAuthenticated(),
+      instrumentLoad: this.instrumentLoadState,
+      instrumentsError: this.instrumentsError,
+      instrumentCount: this.instrumentCount,
+      instrumentsLoadedAt: this.instrumentsLoadedAt,
+      instrumentLoadFailures: this.instrumentLoadFailures,
+      boardRows: this.boardRowsDerived,
+      chainsIndexed: this.chainsIndexed,
+      boardWithChains: this.boardWithChains,
+      underlyingsMissingSpot: this.underlyingsMissingSpot,
+      spotSeedFailed: this.spotSeedFailed,
+      spotSeedError: this.spotSeedError,
+      windowsBuilt: this.windows.size,
+      candidates: this.scanner.candidateCount,
+      desiredOptionSubscriptions: this.subscribedOptionTokens.size,
+      boxSocketConnected: this.marketDataSocketConnected,
+      // A subscribe frame was WRITTEN. Not an acknowledgement — this broker sends none, so usable
+      // depth (below) is the only real confirmation and is reported separately.
+      subscriptionsRequested: this.subscribedOptionTokens.size > 0,
+      framesObserved: mdDiag.frames,
+      depthObservations: mdDiag.depthObservations,
+      usableBooks: this.quotes.size,
+      lastSuccessfulBuildAt: this.lastSuccessfulBuildAt,
+    });
   }
 
   /** The current driven market-data health state (GAP 1). For status and the entry gate. */

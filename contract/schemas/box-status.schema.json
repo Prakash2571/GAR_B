@@ -77,7 +77,10 @@
     "economic_admission",
     "market_data_state",
     "market_data_health",
-    "operational_readiness"
+    "operational_readiness",
+    "box_lane_connected",
+    "box_lane_dedicated",
+    "universe"
   ],
   "properties": {
     "running": {
@@ -267,7 +270,9 @@
       "type": "number"
     },
     "hub_connected": {
-      "type": "boolean"
+      "type": "boolean",
+      "$comment": "The SHARED/FUTURES board lane. With BOX_DEDICATED_MARKET_FEED=true (the default) this is a DIFFERENT socket from the one carrying box option depth, so it is NOT evidence that the box lane is connected. Publishing only this field is why a connected board lane read as a healthy box feed. Use box_lane_connected for the socket the box engine's books actually come from.",
+      "description": "Shared/futures lane socket connection. Not the box lane."
     },
     "quotes": {
       "type": "number"
@@ -390,6 +395,194 @@
     },
     "config": {
       "$ref": "box-config.schema.json"
+    },
+    "box_lane_connected": {
+      "type": "boolean",
+      "description": "The BOX lane's own market-data socket — the one carrying the option depth this engine trades on. Distinct from hub_connected."
+    },
+    "box_lane_dedicated": {
+      "type": "boolean",
+      "description": "True when the box lane is a physically separate socket from the shared board feed (BOX_DEDICATED_MARKET_FEED). When false, hub_connected and box_lane_connected describe the same socket."
+    },
+    "universe": {
+      "type": "object",
+      "additionalProperties": false,
+      "$comment": "WHY THE SCANNER IS OR IS NOT EVALUATING. `underlyings` is windows.size, which is 0 both when the instrument master came back EMPTY and when the market is merely quiet — those rendered identically, which is how a scanner with a completely empty universe displayed SCANNING for a whole session. `stage` names the FIRST unsatisfied stage of the real pipeline (instruments -> board -> chains -> join -> spots -> windows -> candidates -> subscriptions -> socket -> frames -> depth); every later stage is unreachable, so exactly one blocker is reported. `counts` republishes the figure behind each stage so the verdict can be CHECKED rather than trusted. Source: src/box/universeReadiness.ts assessUniverseReadiness().",
+      "required": [
+        "readyToEvaluate",
+        "stage",
+        "detail",
+        "transient",
+        "counts",
+        "instrument_load",
+        "instruments_error",
+        "instruments_loaded_at",
+        "instrument_load_failures",
+        "spot_seed_failed",
+        "spot_seed_error",
+        "last_successful_build_at",
+        "subscriptions_requested",
+        "box_socket_connected"
+      ],
+      "properties": {
+        "readyToEvaluate": {
+          "type": "boolean",
+          "description": "Whether the engine can evaluate a candidate against real current-generation books. DELIBERATELY NOT the same as `running`: the operator's intent and the engine's capability are different facts, and publishing only the former is the defect this field exists to close."
+        },
+        "stage": {
+          "enum": [
+            "scanner_stopped",
+            "not_authenticated",
+            "instruments_never_loaded",
+            "instruments_loading",
+            "instruments_failed",
+            "instruments_empty",
+            "no_board_rows",
+            "no_option_chains",
+            "no_board_chain_overlap",
+            "awaiting_spot_prices",
+            "no_windows_built",
+            "no_candidates",
+            "no_desired_subscriptions",
+            "box_socket_disconnected",
+            "awaiting_first_tick",
+            "awaiting_usable_depth",
+            "evaluating"
+          ],
+          "description": "The FIRST unsatisfied stage. `evaluating` is the only value meaning the scanner is genuinely working on real books. `instruments_loading`/`instruments_failed`/`instruments_empty` are three DIFFERENT operator actions (wait / investigate the broker / investigate the filter) and must never be collapsed."
+        },
+        "detail": {
+          "type": "string",
+          "description": "Plain language, safe to display verbatim. Names the stage and what to do about it."
+        },
+        "transient": {
+          "type": "boolean",
+          "description": "True when the correct action is to WAIT rather than investigate — the stage clears on its own if the system is healthy."
+        },
+        "counts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "instruments",
+            "board_rows",
+            "chains_indexed",
+            "board_with_chains",
+            "underlyings_missing_spot",
+            "windows_built",
+            "candidates",
+            "desired_option_subscriptions",
+            "frames_observed",
+            "depth_observations",
+            "usable_books"
+          ],
+          "properties": {
+            "instruments": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Rows returned by the last successful instrument-master load. 0 here with instrument_load=loaded is `instruments_empty`: a broker/endpoint problem, not a filter one."
+            },
+            "board_rows": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "F&O board rows derived from the dump, BEFORE the chain join."
+            },
+            "chains_indexed": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Option chains indexed from the dump."
+            },
+            "board_with_chains": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Board rows that ALSO have a chain — what the universe loop actually iterates. Nonzero board_rows and chains_indexed with zero here means the two key spaces disagree."
+            },
+            "underlyings_missing_spot": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Joined underlyings with no spot price, so no ATM window can be centred."
+            },
+            "windows_built": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "candidates": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "desired_option_subscriptions": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "frames_observed": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "depth_observations": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Usable two-sided book observations this generation. frames_observed > 0 with this at 0 means the socket is alive but delivering nothing executable."
+            },
+            "usable_books": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "instrument_load": {
+          "enum": [
+            "never_attempted",
+            "loading",
+            "loaded",
+            "failed"
+          ],
+          "description": "Four states on purpose. `loading` and `never_attempted` used to be indistinguishable from `failed`, and they are the two where the correct action is to wait."
+        },
+        "instruments_error": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The broker's own load-failure message, verbatim. Null unless instrument_load is `failed`."
+        },
+        "instruments_loaded_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "Wall-clock ms of the last SUCCESSFUL load, or null."
+        },
+        "instrument_load_failures": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Consecutive failed attempts. Drives the bounded deduplicated retry."
+        },
+        "spot_seed_failed": {
+          "type": "boolean",
+          "description": "Whether the last REST spot seed threw. A failed seed yields zero windows and therefore zero subscriptions, which is observationally identical to an empty universe — hence it is published rather than only logged."
+        },
+        "spot_seed_error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_successful_build_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "Last universe pass that produced at least one window. Distinguishes `never worked` from `worked until N minutes ago`."
+        },
+        "subscriptions_requested": {
+          "type": "boolean",
+          "description": "A subscribe frame was WRITTEN. NOT a broker acknowledgement — Zerodha's protocol supplies none, so this must never be rendered as confirmed by the broker. Usable depth (counts.depth_observations) is the only real confirmation."
+        },
+        "box_socket_connected": {
+          "type": "boolean"
+        }
+      }
     }
   }
 }
