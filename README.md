@@ -73,7 +73,13 @@ Both are supported, with **exactly one active at a time**. They are never live
 simultaneously; switching is an explicit operator action that is **refused while there is
 live Box exposure or unresolved broker state**.
 
-This backend performs **no broker OAuth**. It does not log a user into Zerodha or Dhan.
+This backend performs **its own broker OAuth**, for both brokers, and that is the
+default (`BROKER_LOGIN_MODE=in_app`). An operator signs in to Zerodha and/or Dhan
+**from the workspace**; the token is minted here, sealed with
+`BROKER_TOKEN_ENCRYPTION_KEY` and stored in PostgreSQL. Set
+`BROKER_LOGIN_MODE=provider` to keep the previous behaviour of pulling tokens from
+an external service instead. Both brokers may hold a session simultaneously; which
+one **trades** is a separate, blocker-checked choice (`POST /api/broker/select`).
 Instead it fetches the day's access token from the **external CalSpread token routes**
 (`/api/kite/token`, `/api/dhan/token`) using a shared passcode, stores it encrypted under
 AES-256-GCM, and uses it for the trading day. Acquisition runs on a morning IST poll

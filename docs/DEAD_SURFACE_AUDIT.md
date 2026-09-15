@@ -46,6 +46,10 @@ No suite regressed. The +7 is the new `tests/pg/outboxPayloadContract.test.mjs`.
   once, by `generateDhanConsent` (`.../dhan/auth.ts:171` in the read-only source), which
   returned `{ consentAppId, loginUrl: dhanLoginUrl(consentAppId) }`.
 - **Why it is dead now.** This backend neutralised the consent flow: `generateDhanConsent` is a
+  **RESOLVED — the consent flow is implemented and reachable as of the in-app login
+  work; `generateDhanConsent`/`consumeDhanConsent` are live and covered by
+  `tests/brokerAuth/*`. The historical note below is retained for provenance.**
+
   throwing stub ("Dhan consent login is disabled in this backend…"). With its only caller
   neutralised, `dhanLoginUrl` had **zero references** anywhere in `src/**` or `tests/**`
   (verified by whole-tree token search). This is exactly the category "functions kept alive

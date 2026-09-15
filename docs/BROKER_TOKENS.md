@@ -1,10 +1,135 @@
 # Broker token acquisition, storage and the active-broker record
 
-This backend never performs its own broker OAuth. Both access tokens are fetched from
-the external CalSpread token provider, validated hard, encrypted with AES-256-GCM and stored in PostgreSQL. Only
-one broker is ever *active*; the other may hold a valid standby token but opens no
-socket. This document is the contract for the modules under `src/tokens/*`,
-`src/brokerState/*`, migrations `005`–`006` and the ported `ActiveBrokerManager`.
+Access tokens reach this backend by exactly **one of two mutually exclusive
+mechanisms**, selected by `BROKER_LOGIN_MODE`:
+
+| Mode | How a token is obtained |
+| --- | --- |
+| `in_app` (**default**) | The operator signs in to the broker **from this deployment**. This backend runs the OAuth/consent flow itself and mints the token. |
+| `provider` | The token is fetched from the external CalSpread token route using a shared passcode (the historical behaviour). |
+
+They never run at the same time: a poller racing an interactive login is a way to
+overwrite a session the operator just established, so in `in_app` mode the poller is
+not started at all.
+
+Either way the token is validated hard, encrypted with AES-256-GCM and stored in
+PostgreSQL, one row per broker. **Both brokers may hold a valid session at the same
+time.** Only one broker is ever *active*; the other holds a standby token and opens
+no socket. Signing in to a broker never makes it active, and switching the active
+broker never touches the other broker's token.
+
+This document is the contract for `src/tokens/*`, `src/brokerState/*`,
+`src/brokers/zerodha/auth.ts`, `src/brokers/dhan/auth.ts`, `src/brokerAuth/*`,
+`src/brokerAuthRoutes.ts`, `src/tokenExposureRoutes.ts`, migrations `005`–`006` and
+`ActiveBrokerManager`.
+
+## The in-app login flow (`BROKER_LOGIN_MODE=in_app`)
+
+Both brokers follow the same three-step shape. Steps 1 and 3 are server-side; only
+step 2 happens in the operator's browser.
+
+```
+  1. POST /api/broker/{broker}/login/start     (operator session + CSRF required)
+        -> { broker, login_url, expires_at }
+     A single-use nonce is recorded in the pending-login store.
+
+  2. The BROWSER visits login_url and authenticates at the broker (password + 2FA).
+     The broker redirects to the URL REGISTERED ON THE BROKER APP, which must be
+        https://<api-host>/api/broker/{broker}/callback
+
+  3. GET /api/broker/{broker}/callback
+     The pending-login entry is claimed (single-use), the one-time code is exchanged
+     for an access token server-side, the token is sealed into PostgreSQL and
+     installed, then the browser is redirected to
+        {FRONTEND_URL}/box?broker_login={broker}&status=connected
+     or ...&status=failed&reason=<stable code>
+```
+
+### Per broker
+
+| | Zerodha (Kite Connect v3) | Dhan (v2 consent) |
+| --- | --- | --- |
+| Consent URL | `kite.zerodha.com/connect/login?v=3&api_key=…&redirect_params=state%3D<nonce>` | `POST {authRoot}/app/generate-consent` → consent id → browser visits the login URL |
+| Redirect carries | `request_token` (+ our echoed `state`) | `tokenId` |
+| Exchange | `POST api.kite.trade/session/token` with `checksum = sha256(api_key + request_token + api_secret)` | `GET {authRoot}/app/consumeApp-consent?tokenId=…` with the id/secret headers |
+| Token expiry | **Day-scoped.** Dies at the IST day boundary; no stated instant, and one is never invented. | **Explicit `expiryTime`.** `null` means UNKNOWN — validated by use, never treated as immortal or expired. |
+| CSRF proof on callback | `state` nonce matched in constant time | existence + TTL + single-use only (Dhan round-trips nothing of ours) |
+
+**The redirect URL must be registered on the broker app and must point at this
+backend's callback.** Both brokers ignore any redirect target we send and always use
+their registered copy, so a mismatch is the most common cause of a login that never
+completes.
+
+### Why the Dhan consent endpoints are configurable
+
+Dhan has shipped this flow under two naming schemes — an "app" variant
+(`/app/generate-consent`, `/app/consumeApp-consent`, `app_id`/`app_secret`,
+`consentAppId`) and a "partner" variant (`/partner/…`, `partner_id`/`partner_secret`,
+`consentId`) — and which one a given set of credentials speaks depends on how the app
+was registered. Hardcoding one would 404 for half of all deployments and look like a
+credential problem. Every path, parameter and header name is therefore an environment
+variable defaulting to the "app" variant. `generateDhanConsent` accepts **both**
+consent-id spellings for the same reason.
+
+### Security properties of the login path
+
+- The app **secret** (`KITE_API_SECRET`, `DHAN_API_SECRET`) is only ever used inside
+  this process — as a checksum input or a request header. It is never a query
+  parameter, never logged, never returned by any API.
+- Both auth clients require **https** outside tests, refuse to follow **any 3xx**
+  (which would replay the credential to another host), bound headers *and* body with
+  a single `AbortController`, and cap the response body at 64 KiB.
+- The callback is authenticated by the **pending-login store**, not the session
+  cookie (which is `SameSite=Strict` and therefore absent on a cross-site redirect).
+  Entries are single-use, expire in 10 minutes, and there is at most one per broker.
+- Failure reasons reflected into the redirect URL are **stable codes from our own
+  code**, never broker prose.
+- The callback refuses while the process is not `ready`.
+
+## Token exposure for sibling services
+
+Two routes let **other servers** borrow the token this deployment minted, so only one
+place ever runs a broker login:
+
+```
+GET /api/tokens/zerodha     header  x-token-access-key: <TOKEN_EXPOSURE_KEY>
+GET /api/tokens/dhan        header  x-token-access-key: <TOKEN_EXPOSURE_KEY>
+
+200 { broker, access_token, identity, login_date, expires_at, active, fetched_at }
+```
+
+`identity` is the value the token must be **paired** with: the Kite `api_key` for
+Zerodha (`Authorization: token <identity>:<access_token>`), the Dhan client id for
+Dhan (`client-id: <identity>`, `access-token: <access_token>`).
+
+A token is returned **only when currently usable**:
+
+- Zerodha's `login_date` must be today's IST day (Kite sessions die at the day boundary);
+- Dhan's stated expiry must not have passed (a `null` expiry is UNKNOWN, and accepted);
+- the `identity` must be non-empty — Zerodha authenticates with the PAIR
+  `api_key:access_token`, so a token with no api key to pair it with is unusable and is
+  reported as such rather than served. The configured `KITE_API_KEY` is used as a fallback
+  before giving up.
+
+Otherwise `409` with a reason (`token_unavailable_no_session`, `…_session_expired`,
+`…_session_stale_day`, `…_no_identity`) so a polling caller backs off instead of caching a
+dead credential.
+
+**Signing out here does not revoke at the broker.** It stops this deployment serving the
+token; a sibling service that already fetched it keeps a working credential until the broker
+itself expires it. Rotate at the broker if a token must be treated as compromised.
+
+**These are the only two routes in this backend that return a plaintext access
+token.** That is a deliberate, bounded exception to the invariant stated below, and it
+is fenced accordingly:
+
+- **Off by default** — `TOKEN_EXPOSURE_KEY` unset ⇒ `503` everywhere. Opt-in only.
+- A key shorter than **32 characters** is refused as misconfiguration, not honoured.
+- Header-only credential, compared in **constant time**; never a query string.
+- Rate limited to **30 req/min per IP**; read-only; never logged; `no-store`.
+- Not under `/api/broker/*`, so that prefix's no-token invariant stays literally true.
+- Not the site passcode, so a leaked machine credential is independently revocable.
+- **Serve over TLS and restrict at the network layer.** The body is a live credential.
 
 ## Environment
 
@@ -23,12 +148,33 @@ socket. This document is the contract for the modules under `src/tokens/*`,
 | `BROKER_TOKEN_ENCRYPTION_KEY` | 32 bytes as 64-char hex or base64 | — |
 | `DEFAULT_ACTIVE_BROKER` | Preferred broker on a fresh deployment | `zerodha` |
 | `AUTO_FALLBACK_TO_DHAN` | Auto-start Dhan entry when Zerodha is down and flat | `false` |
+| `BROKER_LOGIN_MODE` | `in_app` (this backend runs the login) or `provider` (external token route) | `in_app` |
+| `KITE_API_KEY` | Kite app api key. Public; in the consent URL and the auth header | — |
+| `KITE_API_SECRET` | Kite app **secret**. Checksum input only; never transmitted | — |
+| `KITE_REDIRECT_URL` | The callback registered on the Kite app. Informational | — |
+| `KITE_LOGIN_URL` | Consent URL override (tests / host change) | `https://kite.zerodha.com/connect/login` |
+| `KITE_API_ROOT` | Exchange root override | `https://api.kite.trade` |
+| `DHAN_API_KEY` | Dhan app id. Sent as the id header on consent calls | — |
+| `DHAN_API_SECRET` | Dhan app **secret**. Sent as the secret header only | — |
+| `DHAN_REDIRECT_URL` | The callback registered on the Dhan app. Informational | — |
+| `DHAN_POSTBACK_URL` | Order postback URL on the Dhan app. Unused by the login | — |
+| `DHAN_AUTH_ROOT` | Dhan auth host | `https://auth.dhan.co` |
+| `DHAN_CONSENT_GENERATE_PATH` | Consent-generation path | `/app/generate-consent` |
+| `DHAN_CONSENT_CONSUME_PATH` | Consent-consumption path | `/app/consumeApp-consent` |
+| `DHAN_CONSENT_LOGIN_URL` | Browser login URL | `{DHAN_AUTH_ROOT}/login/consentApp-login` |
+| `DHAN_CONSENT_ID_PARAM` | Query parameter carrying the consent id | `consentAppId` |
+| `DHAN_AUTH_ID_HEADER` | Header carrying the app/partner id | `app_id` |
+| `DHAN_AUTH_SECRET_HEADER` | Header carrying the app/partner secret | `app_secret` |
+| `TOKEN_EXPOSURE_KEY` | Enables `/api/tokens/*`. Min 32 chars. Unset ⇒ disabled | — |
+
+The `KITE_TOKEN_*` / `DHAN_TOKEN_*` / `BROKER_TOKEN_POLL_*` variables are read **only
+when `BROKER_LOGIN_MODE=provider`**.
 
 The **two passcodes are separate variables**. The operator may set the same value
 for both, but the code never assumes they are equal and never copies one into the
 other. `SITE_ACCESS_SECRET` is never reused as a broker passcode.
 
-## Outgoing HTTP (`tokenProviderClient.ts`)
+## Outgoing HTTP (`tokenProviderClient.ts`) — `BROKER_LOGIN_MODE=provider` only
 
 - Passcode is sent in the **`x-token-passcode` header**, never the query string.
 - A redirect to another host is refused; HTTPS is required outside tests.
@@ -177,3 +323,30 @@ is unavailable but Dhan is valid and the system is flat, Dhan is reported
 local mock HTTP server on `127.0.0.1` (never contacting calspread.online), against
 PostgreSQL at `DATABASE_URL`. They **fail loudly** without PostgreSQL rather than
 skipping.
+
+## Signing out
+
+`POST /api/broker/{broker}/logout` drops ONE broker's session: the in-memory token, the
+durable row, and — when that broker is the ACTIVE one — both of its market-data lanes and its
+books. The other broker's session, feed and subscriptions are untouched.
+
+It is **refused with `409 logout_refused`** when the broker being signed out is active and
+still owns exposure or in-flight work, using the same blocker list as
+`POST /api/broker/select`. See `docs/SAFETY_INVARIANTS.md`.
+
+A failed durable clear is reported as a per-broker login problem rather than swallowed: the
+row would still be `active`, so the token-exposure endpoint would keep serving a credential the
+operator believes they have dropped.
+
+## Re-authenticating replaces the sockets, not just the token
+
+Both `completeZerodhaLogin` and `completeDhanLogin` **stop and drop that broker's market-data
+lanes** before replaying the subscription tables, and only when that broker is the active one.
+
+This is load-bearing rather than tidy-up. Neither transport re-authenticates a connection it
+already holds — `TickerHub.ensureSocket` reads credentials only when it has no handle, and both
+feed classes subscribe only tokens they are not already subscribed to — so without dropping the
+sockets first, a re-authentication would leave them bound to the **superseded** token while the
+runtime reported the feed healthy. When the broker later retired that token, the box lane's
+auth-death path tears down without scheduling a reconnect, so the lane would stay dead until the
+next strike-window diff.

@@ -19,7 +19,57 @@ exceptions:
 - the Box SSE stream `GET /api/box/stream`
 - `GET /api/runtime/status`
 - `GET /api/export/status`
-- every `/api/broker/*` endpoint (`status`, `switch-blockers`, `select`)
+- every `/api/broker/*` endpoint (`status`, `switch-blockers`, `select`) **and**
+  the in-app login controls `POST /api/broker/{broker}/login/start` and
+  `POST /api/broker/{broker}/logout`
+
+## What is deliberately NOT behind `requireOperator`
+
+Two surfaces, each for a concrete reason, each with its own credential.
+
+### 1. `GET /api/broker/{broker}/callback` — the broker OAuth redirect
+
+The session cookie is `SameSite=Strict`, so a browser arriving from
+`kite.zerodha.com` or `auth.dhan.co` sends **no cookie**. `requireOperator` here
+would `401` every genuine login, and relaxing the cookie to `Lax` would weaken the
+session everywhere to buy nothing.
+
+It is authenticated instead by the **pending-login store**
+(`src/brokerAuth/pendingLogins.ts`): a login must have been *started* moments
+earlier by a request that DID carry a valid operator session, the entry is
+**single-use**, and it expires in 10 minutes. Zerodha's `state` nonce is
+additionally compared in constant time. Dhan round-trips nothing of ours, so its
+proof is existence + TTL + single-use only — weaker **by the broker's design**, and
+documented rather than hidden.
+
+The callback also refuses while the process is not `ready`, because a login
+completing mid-boot could be silently discarded by `restore()` adopting the stored
+session moments later.
+
+**Cheap refusals never consume the pending login.** Because this route cannot require a
+session, anything it consumes an anonymous caller can consume. A request that lacks a
+credential, carries a broker-reported denial, or presents a wrong/absent `state` is
+rejected **without** spending the operator's in-flight sign-in — otherwise one bare
+`GET` would deny them a login, repeatably, with an error blaming their own browser.
+Only a matched claim is spent (and then it is strictly single-use). The route is
+additionally rate limited to 20 requests/minute/IP.
+
+### 2. `GET /api/tokens/zerodha` and `GET /api/tokens/dhan` — token exposure
+
+Callers are **other servers**, not browsers, so a session cookie is the wrong
+credential. These are the **only two routes in the whole backend that return a
+plaintext access token** — see `docs/BROKER_TOKENS.md` for the full rationale and
+`docs/SAFETY_INVARIANTS.md` for why this is a bounded exception rather than a hole.
+
+- **OFF BY DEFAULT.** `TOKEN_EXPOSURE_KEY` unset ⇒ `503` for every request.
+- Authenticated by a dedicated shared secret in the `x-token-access-key` **header**
+  (never a query string), compared in **constant time**.
+- A key shorter than **32 characters** is refused as a misconfiguration, not honoured.
+- Rate limited to **30 requests/minute per IP**.
+- Read-only: no branch mints, refreshes, invalidates or switches anything.
+- Never logged, never cached (`Cache-Control: no-store`).
+- Deliberately **not** the site passcode, so a leaked machine credential is
+  revocable without logging every operator out, and cannot drive the trading UI.
 
 ## What is public
 
@@ -43,6 +93,10 @@ Only these, and nothing else:
 | POST | `/api/access/verify` | public, rate-limited | check passcode, mint session + CSRF |
 | GET | `/api/access/status` | public | is there a live session? returns the CSRF token if so |
 | POST | `/api/access/logout` | session + CSRF + Origin | revoke the session row, clear cookies |
+| POST | `/api/broker/{broker}/login/start` | session + CSRF + Origin | begin a browser login; returns the broker's consent URL |
+| GET | `/api/broker/{broker}/callback` | single-use pending-login nonce, rate limited | the broker's redirect; exchanges the code for a token |
+| POST | `/api/broker/{broker}/logout` | session + CSRF + Origin | drop ONE broker's session; `409` if it still owns exposure |
+| GET | `/api/tokens/{broker}` | `x-token-access-key` header | serve the current access token to a sibling service |
 
 ## The passcode check
 

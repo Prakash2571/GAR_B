@@ -116,3 +116,62 @@ and *are* strong (real assertions, real broker boundary, negative/positive contr
 
 No misleading test was found. No production defect was found — all 20 invariants are enforced; the
 sole gap was a missing *verification* for one clause of invariant 20, now closed.
+
+## The one deliberate exception to "no route returns a token"
+
+`GET /api/tokens/zerodha` and `GET /api/tokens/dhan` (`src/tokenExposureRoutes.ts`)
+return a **plaintext broker access token**. Everywhere else in this backend that is a
+hard invariant, so the exception is called out here rather than left for a reviewer to
+discover.
+
+**Why it exists.** Sibling services need the token this deployment already minted. The
+alternative — each service running its own broker login — means several logins per day,
+several places a secret can leak, and no single place that knows which session is live.
+
+**Why it is not a hole.**
+
+| Fence | Enforcement |
+| --- | --- |
+| Off by default | `TOKEN_EXPOSURE_KEY` unset ⇒ `503` for every request. Opt-in only. |
+| No weak keys | Shorter than 32 characters ⇒ `503` (misconfiguration), not honoured. |
+| Dedicated credential | `x-token-access-key` **header**, constant-time compared. Never a query string; never the site passcode, so it is independently revocable and cannot drive the UI. |
+| Brute-force bounded | 30 requests/minute/IP — but see the note below: this raises the cost of noise, it is NOT the reason the secret is safe. |
+| Read-only | No branch mints, refreshes, invalidates or switches anything. It cannot change what this deployment trades. |
+| No leakage | Never logged (zero `console.*` calls in the module) and never cached (`Cache-Control: no-store`). |
+| Honest freshness | A token is served only while usable; otherwise `409` with a reason, so a caller never receives a dead credential. |
+| Scoped prefix | Not under `/api/broker/*`, so that prefix's no-token invariant remains literally true. |
+
+**What the rate limiter does and does not do.** `rateLimit` keys on the first
+`X-Forwarded-For` value, which a direct caller controls, so a determined attacker can rotate
+it. The **32-character key floor** is what actually makes the shared secret unguessable; the
+limiter bounds accidental hammering and casual probing. Do not read "rate limited" as
+"brute-force proof" — the network restriction below is the second real control.
+
+**Sign-out is not revocation.** `POST /api/broker/{broker}/logout` makes THIS deployment forget
+the token and stops serving it here. It does **not** invalidate the token at the broker, so any
+sibling service that already fetched it keeps a working credential until the broker expires it
+(end of the IST day for Zerodha; the stated expiry for Dhan). If a token must be considered
+compromised, rotate it at the broker — signing out here is not sufficient.
+
+**Operator obligation.** TLS-terminate in front of it and restrict the route at the
+network/nginx layer to the hosts that need it. The response body is a bearer credential
+and the code cannot enforce transport security from behind a proxy that already
+terminated the connection.
+
+## Dropping a broker session is guarded like changing broker
+
+`POST /api/broker/{broker}/logout` drops the credential that exits, protective cancellation
+and reconciliation depend on. Doing that while a Box is open, an order is working or an
+execution is in flight would strand real exposure with no way to reduce it.
+
+`POST /api/broker/select` has always refused in exactly those conditions. Sign-out reaches the
+same end state — no usable session for the broker that owns the position — so it is held to the
+same standard, from the **same** `ExposureProbe` (`ActiveBrokerManager.exposureBlockers`, shared
+by `switchBlockers` and `logoutBlockers`) rather than a second opinion that could drift.
+
+- Signing out of the **standby** broker is never blocked: it owns nothing.
+- Signing out of the **active** broker returns `409 logout_refused` with the full blocker list.
+
+The frontend also confirms first, and says plainly that open positions are not closed. That
+dialog is a courtesy, not a control — the refusal is enforced server-side, because anything
+holding an operator session can call the API directly.

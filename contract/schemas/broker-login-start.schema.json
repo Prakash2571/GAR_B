@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "broker-login-start.schema.json",
+  "title": "POST /api/broker/{broker}/login/start (200)",
+  "description": "The consent URL that begins an in-app browser login for ONE broker. Source: src/brokerAuthRoutes.ts POST /api/broker/:broker/login/start success branch. Obtained via REAL HTTP with an inert BrokerLoginProvider. login_url is the broker's own consent page and carries only public values (the Kite api_key, or a single-use Dhan consent id) plus, for Zerodha, the single-use state nonce — NEVER an app secret, a checksum or an access token. expires_at is when the pending-login entry stops being claimable, so the UI can tell the operator the attempt has lapsed.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["broker", "login_url", "expires_at"],
+  "properties": {
+    "broker": { "enum": ["zerodha", "dhan"] },
+    "login_url": { "type": "string" },
+    "expires_at": { "type": "string" }
+  }
+}

@@ -385,6 +385,12 @@ test("[SERDE] projectBrokerSession output (the REAL broker-session projection) c
   const cases = [
     { name: "waiting", s: { ...base, authenticated: false, token_expired: false }, active: "zerodha", expect: "waiting" },
     { name: "expired", s: { ...base, authenticated: true, token_expired: true }, active: "zerodha", expect: "expired" },
+    // THE REAL-WORLD EXPIRED SHAPE. Both brokers report `authenticated: false` once their
+    // token is past its expiry (Dhan by its stated instant, Zerodha by the IST day
+    // boundary), so this — not the case above — is what an expired session actually looks
+    // like. The projection used to test `!authenticated` FIRST and label it "waiting",
+    // telling the operator to wait for something while `problems` told them to act.
+    { name: "expired-unauthenticated", s: { ...base, authenticated: false, token_expired: true }, active: "zerodha", expect: "expired" },
     { name: "ready", s: { ...base, authenticated: true, token_expired: false }, active: "zerodha", expect: "ready" },
     { name: "standby", s: { ...base, authenticated: true, token_expired: false }, active: "dhan", expect: "standby" },
   ];

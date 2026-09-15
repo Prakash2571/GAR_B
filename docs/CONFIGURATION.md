@@ -76,26 +76,78 @@ they are what is running.
 | --- | --- | --- | --- | --- |
 | `BROKER_TOKEN_ENCRYPTION_KEY` | — | yes | AES-256-GCM key for tokens at rest. **Exactly 32 bytes**, as 64-char hex OR base64/base64url decoding to 32 bytes. | Wrong length/encoding ⇒ typed error. Changing it ⇒ old sealed tokens unreadable (re-acquired next morning). |
 
-## Zerodha token provider (`src/tokens/*`)
+## Where access tokens come from (`src/index.ts`, `src/brokerAuthRoutes.ts`)
+
+| Variable | Default | Req? | What it does | If wrong |
+| --- | --- | --- | --- | --- |
+| `BROKER_LOGIN_MODE` | `in_app` | no | `in_app`: an operator signs in to each broker **from this deployment** and the token is minted here. `provider`: poll the external CalSpread token routes instead. The two are mutually exclusive; in `in_app` mode the poller is not started. | An unrecognised value warns and falls back to `in_app` (the safe default — it needs no external secret). Setting `provider` without the passcodes ⇒ no token ever arrives. |
+
+Both brokers can hold a session **simultaneously** in either mode. Which one *trades*
+is a separate, blocker-checked decision (`POST /api/broker/select`); signing in never
+makes a broker active, and switching never touches the other broker's token.
+
+## Zerodha in-app login (`src/brokers/zerodha/auth.ts`) — `BROKER_LOGIN_MODE=in_app`
+
+Register the Kite app's redirect URL as `https://<api-host>/api/broker/zerodha/callback`.
+Kite always uses its registered copy and ignores anything we send.
+
+| Variable | Default | Req? | What it does | If wrong |
+| --- | --- | --- | --- | --- |
+| `KITE_API_SECRET` | — | yes (in_app Zerodha) | Kite app **secret**. Used ONLY to compute `sha256(api_key + request_token + api_secret)` inside this process; never a query parameter, never logged, never returned. | Unset ⇒ Zerodha reports "not configured" and `login/start` answers 409. Wrong ⇒ the exchange is rejected by Zerodha (`REJECTED`). |
+| `KITE_REDIRECT_URL` | — | no | The callback registered on the Kite app. **Informational only.** | A value that disagrees with the app's registration changes nothing here, but the login will land somewhere unexpected — fix it at Zerodha. |
+| `KITE_LOGIN_URL` | `https://kite.zerodha.com/connect/login` | no | Consent-URL override (host change / loopback mock in tests). | A bad URL ⇒ `login/start` returns a URL the browser cannot use. |
+| `KITE_API_ROOT` | `https://api.kite.trade` | no | Exchange root override. A trailing slash is stripped. | Non-https outside tests ⇒ refused with `CONFIG`. |
+
+## Dhan in-app login (`src/brokers/dhan/auth.ts`) — `BROKER_LOGIN_MODE=in_app`
+
+Register the Dhan app's redirect URL as `https://<api-host>/api/broker/dhan/callback`.
+
+The endpoint names are configurable because Dhan ships this flow under two naming
+schemes ("app" and "partner") and which one applies depends on how the app was
+registered — see `docs/BROKER_TOKENS.md`. Defaults below are the "app" variant.
+
+| Variable | Default | Req? | What it does | If wrong |
+| --- | --- | --- | --- | --- |
+| `DHAN_REDIRECT_URL` | — | no | The callback registered on the Dhan app. Informational only. | As `KITE_REDIRECT_URL`. |
+| `DHAN_POSTBACK_URL` | — | no | Order-postback URL on the Dhan app. Not used by the login. | — |
+| `DHAN_AUTH_ROOT` | `https://auth.dhan.co` | no | Auth host for both consent calls. | Non-https outside tests ⇒ refused with `CONFIG`. |
+| `DHAN_CONSENT_GENERATE_PATH` | `/app/generate-consent` | no | Step-1 path. | A 404 or a body with no consent id ⇒ `MALFORMED`, and the error names the partner-variant variables to set. |
+| `DHAN_CONSENT_CONSUME_PATH` | `/app/consumeApp-consent` | no | Step-3 path. | 404 ⇒ the callback fails with `exchange_failed`. |
+| `DHAN_CONSENT_LOGIN_URL` | `{DHAN_AUTH_ROOT}/login/consentApp-login` | no | The URL the **browser** visits. | Wrong ⇒ the operator lands on a Dhan error page. |
+| `DHAN_CONSENT_ID_PARAM` | `consentAppId` | no | Query parameter carrying the consent id on the login URL. | Wrong name ⇒ Dhan does not recognise the consent. |
+| `DHAN_AUTH_ID_HEADER` | `app_id` | no | Header carrying the app/partner id. | Wrong ⇒ 401 from Dhan. |
+| `DHAN_AUTH_SECRET_HEADER` | `app_secret` | no | Header carrying the app/partner **secret**. | Wrong ⇒ 401 from Dhan. |
+
+## Token exposure for sibling services (`src/tokenExposureRoutes.ts`)
+
+| Variable | Default | Req? | What it does | If wrong |
+| --- | --- | --- | --- | --- |
+| `TOKEN_EXPOSURE_KEY` | — | no | Enables `GET /api/tokens/zerodha` and `GET /api/tokens/dhan`, which return the **plaintext** access token to a caller presenting it in the `x-token-access-key` header. **Minimum 32 characters.** | Unset ⇒ both routes answer `503` (the default; opt-in only). Shorter than 32 ⇒ also `503`, treated as a misconfiguration rather than honoured. |
+
+These are the only two routes that return a raw token. **Serve over TLS and restrict
+at the network layer** — the response body is a live trading credential. See
+`docs/ACCESS_GATE.md` and `docs/BROKER_TOKENS.md`.
+
+## Zerodha token provider (`src/tokens/*`) — `BROKER_LOGIN_MODE=provider` only
 
 | Variable | Default | Req? | What it does | If wrong |
 | --- | --- | --- | --- | --- |
 | `KITE_TOKEN_BROKER_URL` | `https://calspread.online/api/kite/token` | no | the external CalSpread Zerodha token endpoint. | Wrong URL ⇒ token fetch fails; no Zerodha trading. |
 | `KITE_TOKEN_BROKER_PASSCODE` | — | yes (Zerodha) | Shared passcode for the external CalSpread token routes. | Unset/wrong ⇒ token fetch rejected. |
-| `KITE_API_KEY` | — | yes (Zerodha-live) | Zerodha API key used by the live order adapter (`src/brokers/zerodha/liveAdapter.ts`). Distinct from `KITE_API_KEY_EXPECTED`. | Unset ⇒ Zerodha live execution throws "KITE_API_KEY is missing" and refuses to go live. |
+| `KITE_API_KEY` | — | yes (Zerodha) | Zerodha API key. Used by the live order adapter (`src/brokers/zerodha/liveAdapter.ts`) **and** by the in-app login, where it appears in the consent URL and pairs with the access token in the auth header. Public, not a secret. Distinct from `KITE_API_KEY_EXPECTED`. | Unset ⇒ Zerodha live execution throws "KITE_API_KEY is missing"; the in-app login reports "not configured" and `login/start` answers 409. |
 | `KITE_API_KEY_EXPECTED` | — | prod | If set, fetched token's api_key must equal this. | Mismatch ⇒ token rejected as foreign (a safety feature). |
 
-## Dhan token provider (`src/tokens/*`)
+## Dhan token provider (`src/tokens/*`) — `BROKER_LOGIN_MODE=provider` only
 
 | Variable | Default | Req? | What it does | If wrong |
 | --- | --- | --- | --- | --- |
 | `DHAN_TOKEN_URL` | `https://calspread.online/api/dhan/token` | no | the external CalSpread Dhan token endpoint. | Wrong URL ⇒ no Dhan trading. |
 | `DHAN_TOKEN_BROKER_PASSCODE` | — | yes (Dhan) | Shared passcode for the Dhan token route. | Unset/wrong ⇒ token fetch rejected. |
-| `DHAN_API_KEY` | — | yes (Dhan-live) | Dhan app API key. Read by `readDhanCredentials()` and required for Dhan live readiness. | Unset ⇒ Dhan reports "not configured"; Dhan live is blocked. |
-| `DHAN_API_SECRET` | — | yes (Dhan-live) | Dhan app secret. Same credential check as above; never leaves the server. | Unset ⇒ Dhan "not configured"; Dhan live blocked. |
+| `DHAN_API_KEY` | — | yes (Dhan) | Dhan app id. Read by `readDhanCredentials()`; required for Dhan live readiness **and** sent as the id header on both in-app consent calls. | Unset ⇒ Dhan reports "not configured"; Dhan live is blocked and `login/start` answers 409. |
+| `DHAN_API_SECRET` | — | yes (Dhan) | Dhan app **secret**. Same credential check as above, and sent as the secret header on both in-app consent calls. Never leaves the server; never a query parameter. | Unset ⇒ Dhan "not configured"; Dhan live blocked and `login/start` answers 409. |
 | `DHAN_CLIENT_ID_EXPECTED` | — | prod | If set, fetched token's client_id must equal this. | Mismatch ⇒ token rejected. |
 
-## Token scheduling (`src/tokens/*`)
+## Token scheduling (`src/tokens/*`) — `BROKER_LOGIN_MODE=provider` only
 
 | Variable | Default | Req? | What it does | If wrong |
 | --- | --- | --- | --- | --- |
