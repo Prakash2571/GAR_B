@@ -32,12 +32,32 @@ import { TickRateCounter, type LaneFeedStats, type MarketDataLane } from "../mar
 const RECONNECT_BASE_MS = 500;
 const RECONNECT_MAX_MS = 15_000;
 
+/**
+ * Close codes that mean "this credential will never work", so retrying is pointless.
+ *
+ * Deliberately the SAME set the Dhan feed uses (`dhan/feed.ts` `isAuthClose`), so the two lanes
+ * classify a policy rejection identically and a reader does not have to hold two rules in mind.
+ * 1008 is the RFC 6455 policy-violation code; 4001/4401/4403 are the application-level rejections
+ * the brokers use for a bad or expired token.
+ */
+function isAuthClose(code: number): boolean {
+  return code === 1008 || code === 4001 || code === 4401 || code === 4403;
+}
+
 export interface ZerodhaFeedOptions {
   lane: MarketDataLane;
   /** Read fresh on every connect: a reconnect must use the CURRENT access token. */
   credentials: () => { apiKey: string; accessToken: string | null };
   onTicks: (ticks: Tick[]) => void;
   onConnectionChange?: (connected: boolean) => void;
+  /**
+   * A transport heartbeat (Kite's 1-byte keep-alive) arrived on this lane.
+   *
+   * Forwarded so the market-data health machine can tell "quiet but alive" from "dead". Proves
+   * TRANSPORT liveness only — never book freshness. Guarded on socket identity and generation
+   * exactly like `onTicks`, so a superseded socket's keep-alive cannot make a dead lane look live.
+   */
+  onHeartbeat?: () => void;
   /**
    * Kite order updates ride THIS SAME quote socket as TEXT frames (binary = ticks, text =
    * order/error/message postbacks) per the v3 docs. There is NO separate Zerodha order socket:
@@ -49,6 +69,15 @@ export interface ZerodhaFeedOptions {
   onTextFrame?: (raw: string) => void;
   /** Kite rejected the feed (dead or expired token). Not a reconnectable condition. */
   onDead?: (message: string) => void;
+  /**
+   * A reconnectable transport fault occurred. Diagnostics only — recovery is already scheduled.
+   *
+   * Exists so a network blip is VISIBLE without being fatal. Before this, the only way the lane
+   * could report trouble was `onDead`, which drives the health machine to the terminal
+   * AUTH_EXPIRED state, so "the network hiccuped" and "your token is dead" were reported as the
+   * same thing and both were unrecoverable.
+   */
+  onTransportFault?: (message: string) => void;
   /** The broker generation this feed belongs to, so stale ticks are identifiable. */
   generation: () => number;
   now?: () => number;
@@ -66,9 +95,24 @@ export class ZerodhaFeed {
   private reconnects = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private lastTickAt: number | null = null;
+  private lastHeartbeatAt: number | null = null;
   private rate = new TickRateCounter();
   /** The generation this socket was opened under, captured at open. */
   private socketGeneration: number;
+  /** Whether this lane has EVER completed a handshake (across reconnects). */
+  private everOpened = false;
+  /** Consecutive attempts that closed without ever opening. Reset by any successful open. */
+  private consecutiveFailedOpens = 0;
+  /** The most recent transport error message, for a reported diagnosis. */
+  private lastFault: string | null = null;
+  /**
+   * How many times a socket may close WITHOUT ever opening before the token is declared dead.
+   *
+   * Kite refuses a bad access token at the HTTP upgrade, which arrives as an ordinary abnormal
+   * close (1006) — indistinguishable on one sample from a transient network failure. A handful of
+   * attempts distinguishes them: a valid token connects on the first try.
+   */
+  private static readonly MAX_FAILED_OPENS = 5;
 
   constructor(private readonly opts: ZerodhaFeedOptions) {
     this.lane = opts.lane;
@@ -115,25 +159,84 @@ export class ZerodhaFeed {
             },
           }
         : {}),
+      // Kite's 1-byte keep-alive. Transport liveness only; never a book update.
+      onHeartbeat: () => {
+        if (this.handle !== handle || this.disposed) return;
+        if (this.socketGeneration !== this.opts.generation()) return;
+        this.lastHeartbeatAt = this.now();
+        this.opts.onHeartbeat?.();
+      },
       onOpen: () => {
         if (this.handle !== handle || this.disposed) return;
         this.reconnectAttempts = 0;
+        this.everOpened = true;
+        this.consecutiveFailedOpens = 0;
         // Resubscribe THIS LANE's wanted set. `connectTicker` already sent the
         // constructor list, so only record what is now live.
         this.subscribed = new Set(this.wanted);
         this.setConnected(true);
       },
+      /*
+       * A TRANSPORT ERROR IS NOT A DEAD TOKEN.
+       *
+       * This used to call `onDead(message)` and `teardown()`. Both halves were wrong, and together
+       * they made the Zerodha box lane die permanently on the first network hiccup of the session:
+       *
+       *   1. `ws.onerror` fires for ANY abnormal condition and carries no code — DNS failure, TCP
+       *      reset, TLS failure, an idle timeout. It is not evidence about the credential. But
+       *      `onDead` drives the market-data machine to AUTH_EXPIRED, which is documented as
+       *      TERMINAL: no data event can revive it. So one blip permanently reported an expired
+       *      session — and, because that blocker's scope is `both`, also reported exposure
+       *      management as blocked.
+       *   2. `teardown()` nulls `this.handle`, and `onClose` begins with
+       *      `if (this.handle !== handle) return`. So the close that always follows an error
+       *      returned early and `scheduleReconnect()` was NEVER reached. The lane had no socket, no
+       *      pending reconnect, and nothing that could ever create one — for the life of the
+       *      process.
+       *
+       * Recovery is now driven from `onClose` (which always follows and does carry a code), exactly
+       * as the Dhan feed already did. Here we only record and report.
+       */
       onError: (message) => {
         if (this.handle !== handle || this.disposed) return;
-        // A credential failure is terminal — retrying it would just spin.
-        this.opts.onDead?.(message);
-        this.teardown();
+        this.lastFault = message;
+        this.opts.onTransportFault?.(message);
       },
-      onClose: () => {
+      onClose: ({ code, everOpened }) => {
         if (this.handle !== handle || this.disposed) return;
         this.handle = null;
         this.subscribed.clear();
         this.setConnected(false);
+
+        // A POLICY close means the credential will never work; retrying it just spins.
+        if (isAuthClose(code)) {
+          this.opts.onDead?.(
+            `Kite feed rejected the session (close code ${code}) — the access token is invalid or expired.`,
+          );
+          return;
+        }
+
+        /*
+         * A socket that has NEVER completed a handshake is the ambiguous case, because Kite rejects
+         * a bad access token by refusing the HTTP upgrade, which surfaces as an ordinary abnormal
+         * close (1006) rather than a policy code. Retrying forever against a dead token would spin
+         * silently; declaring the token dead on the first 1006 would kill the lane over a transient
+         * DNS failure. So we retry a BOUNDED number of times and only then report a lost session —
+         * a valid token normally connects on the first attempt, so repeated failure to ever open is
+         * genuine evidence, whereas a single failure is not.
+         */
+        if (!everOpened && !this.everOpened) {
+          this.consecutiveFailedOpens++;
+          if (this.consecutiveFailedOpens >= ZerodhaFeed.MAX_FAILED_OPENS) {
+            this.opts.onDead?.(
+              `Kite feed could not establish a session in ${this.consecutiveFailedOpens} attempts ` +
+                `(last close code ${code}${this.lastFault ? `, last error: ${this.lastFault}` : ""}). ` +
+                `The access token is most likely invalid or expired; sign in again to replace it.`,
+            );
+            return;
+          }
+        }
+
         this.scheduleReconnect();
       },
     });
@@ -211,6 +314,8 @@ export class ZerodhaFeed {
       wantedTokens: this.wanted.size,
       ticksPerSecond: this.rate.perSecond(now),
       lastTickAgeMs: this.lastTickAt === null ? null : Math.max(0, now - this.lastTickAt),
+      lastHeartbeatAgeMs:
+        this.lastHeartbeatAt === null ? null : Math.max(0, now - this.lastHeartbeatAt),
       reconnects: this.reconnects,
       generation: this.socketGeneration,
     };
@@ -229,6 +334,12 @@ export class ZerodhaFeed {
     this.wanted.clear();
     this.rate.reset();
     this.lastTickAt = null;
+    this.lastHeartbeatAt = null;
+    // A new broker/session starts with no history: retaining `everOpened` would let a lane that
+    // once connected under a PREVIOUS session skip the bounded never-opened detection entirely.
+    this.everOpened = false;
+    this.consecutiveFailedOpens = 0;
+    this.lastFault = null;
   }
 
   private teardown(): void {

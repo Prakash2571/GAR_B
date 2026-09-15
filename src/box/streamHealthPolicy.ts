@@ -593,10 +593,29 @@ export class OrderStreamStateMachine {
  * used solely to compare against the heartbeat/book age bounds; determinism is total.
  */
 export interface MarketDataStateMachineOptions {
-  /** Whether market data is armed at all. When false the machine stays DISABLED. */
+  /**
+   * Whether market data is armed at all. When false the machine stays DISABLED.
+   *
+   * THIS IS NOT AN EXECUTION-MODE SWITCH. Market data is the QUOTE feed, and every supported
+   * execution mode — `live` and all three paper modes — consumes the same real broker quote
+   * socket. Wiring this to `executionMode === "live"` (as it once was) left every paper
+   * deployment with a permanently DISABLED machine: generation stuck at 0, `onUsableDepth`
+   * and `onAuthenticated` early-returning, no depth ever recorded, and a `DISABLED` blocker
+   * whose scope is `both` — which also falsely reported exposure management as blocked. The
+   * only legitimate reason to pass `false` is a deployment that genuinely consumes no quote
+   * feed at all.
+   */
   readonly enabled: boolean;
   /** Monotonic clock (ms). Injected so tests are deterministic; defaults to Date.now. */
   readonly now?: () => number;
+  /**
+   * WALL clock (ms since epoch), for AUDIT/DISPLAY timestamps only.
+   *
+   * The machine measures every age against {@link now} (monotonic) and NEVER subtracts a wall
+   * reading from a monotonic one. It keeps wall stamps in parallel purely so an operator can be
+   * told WHEN something last happened. Defaults to Date.now.
+   */
+  readonly nowWall?: () => number;
   /**
    * Maximum age (ms) of the newest received frame before a connected feed is DEGRADED. This is the
    * TRANSPORT-liveness bound (heartbeat/frame), distinct from book age. Default 5000.
@@ -614,6 +633,7 @@ export class MarketDataStateMachine {
   private current: MarketDataState;
   private readonly enabledInitially: boolean;
   private readonly nowFn: () => number;
+  private readonly nowWallFn: () => number;
   private readonly heartbeatMaxAgeMs: number;
   private readonly bookMaxAgeMs: number;
 
@@ -626,16 +646,39 @@ export class MarketDataStateMachine {
   /** Subscriptions the feed has CONFIRMED on the wire this generation. */
   private confirmed = new Set<number>();
 
-  /** Four distinct time facts (see class header). Null until first observed. */
+  /**
+   * Four distinct time facts (see class header), on the MONOTONIC clock. Null until first
+   * observed — and `null` must survive all the way to the payload as "never observed", which is
+   * a completely different operational fact from "observed a long time ago".
+   */
   private lastHeartbeatAt: number | null = null;
   private lastFrameAt: number | null = null;
   private lastDepthAt: number | null = null;
+  /**
+   * The same three facts on the WALL clock, for audit/display ONLY.
+   *
+   * Kept strictly in parallel and NEVER mixed with the monotonic readings above. The defect this
+   * pair exists to prevent: `buildOperationalReadiness` was handed `executionClock.wall()` as
+   * `now` and then subtracted the MONOTONIC `lastFrameAt` from it, yielding ages of roughly
+   * 1.7e12 ms (~55 years) that a dashboard could only render as garbage or "never". Ages are now
+   * computed HERE, inside the one clock domain that owns them, and published pre-computed.
+   */
+  private lastHeartbeatWallAt: number | null = null;
+  private lastFrameWallAt: number | null = null;
+  private lastDepthWallAt: number | null = null;
   /** True while the application ingestion pipeline is backed up. */
   private backlog = false;
+  /** Count of heartbeats observed — evidence of transport liveness, never of depth. */
+  private heartbeats = 0;
+  /** Count of inbound frames observed (ticks and heartbeats). */
+  private frames = 0;
+  /** Count of usable-depth observations across all instruments, this generation. */
+  private depthObservations = 0;
 
   constructor(opts: MarketDataStateMachineOptions) {
     this.enabledInitially = opts.enabled;
     this.nowFn = opts.now ?? Date.now;
+    this.nowWallFn = opts.nowWall ?? Date.now;
     this.heartbeatMaxAgeMs = Math.max(0, opts.heartbeatMaxAgeMs ?? 5_000);
     this.bookMaxAgeMs = Math.max(0, opts.bookMaxAgeMs ?? 10_000);
     this.current = opts.enabled ? "DISCONNECTED" : "DISABLED";
@@ -698,8 +741,19 @@ export class MarketDataStateMachine {
 
   /* ─────────────────────────── transport lifecycle → state ─────────────────────────── */
 
+  /**
+   * A connection attempt has begun.
+   *
+   * GUARDED ON AUTH_EXPIRED — and it was not, which was a hole straight through the terminal
+   * guarantee. `onSocketOpen` and `onAuthenticated` both refuse to leave AUTH_EXPIRED, but
+   * `onConnecting` only checked DISABLED, so the very first step of the reconnect the feed performs
+   * anyway moved the machine to CONNECTING. From there `onSocketOpen` → `onAuthenticated` saw a
+   * non-terminal state and proceeded, and a rejected token reached READY again on the next tick.
+   * A reconnect is not evidence about a credential; only an explicit
+   * {@link onSessionRestored} may clear this state.
+   */
   onConnecting(): void {
-    if (this.current === "DISABLED") return;
+    if (this.current === "DISABLED" || this.current === "AUTH_EXPIRED") return;
     this.current = "CONNECTING";
   }
 
@@ -721,23 +775,83 @@ export class MarketDataStateMachine {
     // Retain the map entries (cheap, bounded by desired set) but they no longer match this.gen,
     // so isInstrumentFresh treats them as absent until re-observed under the new generation.
     this.lastDepthAt = null;
+    this.lastDepthWallAt = null;
+    this.depthObservations = 0;
     this.backlog = false;
     this.current = "SYNCHRONIZING";
   }
 
+  /**
+   * A REPLACEMENT SESSION/TOKEN was installed, so AUTH_EXPIRED is no longer the truth.
+   *
+   * WHY THIS IS NEEDED. `onSessionLost()` moves the machine to AUTH_EXPIRED, which is documented
+   * as terminal — and it genuinely must be terminal with respect to DATA events, because no tick
+   * arriving on a socket that the broker already rejected can prove the token is valid again.
+   * But `onSocketOpen`/`onAuthenticated` also early-return on AUTH_EXPIRED, which meant that once
+   * a token expired, the machine could NEVER recover for the life of the process — not even after
+   * the operator signed in again and the feed reconnected happily with a fresh token. The feed
+   * recovered; the health machine that gates entry did not, and reported an expired session
+   * forever.
+   *
+   * So credential replacement — an event that comes from the AUTH path, not from the data path —
+   * is the one and only thing that may clear AUTH_EXPIRED. It resets to DISCONNECTED rather than
+   * to anything optimistic: the new socket must still connect, authenticate (advancing the
+   * generation) and deliver fresh depth before READY. Prior per-instrument readiness is dropped
+   * outright, because those books belong to the dead session.
+   */
+  onSessionRestored(): void {
+    if (this.current !== "AUTH_EXPIRED") return;
+    this.confirmed.clear();
+    this.depthAt.clear();
+    this.lastDepthAt = null;
+    this.lastDepthWallAt = null;
+    this.lastFrameAt = null;
+    this.lastFrameWallAt = null;
+    this.lastHeartbeatAt = null;
+    this.lastHeartbeatWallAt = null;
+    this.depthObservations = 0;
+    this.backlog = false;
+    this.current = "DISCONNECTED";
+  }
+
   /* ─────────────────────────── the four time facts ─────────────────────────── */
 
-  /** A transport heartbeat (the 1-byte keep-alive). Liveness only — NOT a depth update. */
+  /**
+   * A transport heartbeat (the 1-byte keep-alive). Liveness only — NOT a depth update.
+   *
+   * WHAT THIS MAY AND MAY NOT DO. It advances the heartbeat and frame clocks, which is what keeps
+   * {@link isTransportLive} true through a quiet spell. It deliberately does NOT touch
+   * `lastDepthAt`, does NOT enter anything into `depthAt`, and does NOT add to `confirmed` — so a
+   * socket that is heart-beating but delivering no books can never reach READY, and a book that
+   * has aged past `bookMaxAgeMs` can never be refreshed by keep-alive traffic. That separation is
+   * the whole reason this is a distinct method rather than an alias for {@link onFrame}.
+   *
+   * Ignored while DISABLED or AUTH_EXPIRED: a rejected token's socket is not a live transport, and
+   * recording fresh frame evidence against it would misreport a dead feed as merely quiet.
+   */
   onHeartbeat(at?: number): void {
+    if (this.current === "DISABLED" || this.current === "AUTH_EXPIRED") return;
     const t = at ?? this.nowFn();
+    this.heartbeats++;
+    this.frames++;
     this.lastHeartbeatAt = t;
     this.lastFrameAt = t;
+    const wall = this.nowWallFn();
+    this.lastHeartbeatWallAt = wall;
+    this.lastFrameWallAt = wall;
     this.reevaluate();
   }
 
-  /** Any inbound frame arrived (tick or heartbeat). Liveness only. */
+  /**
+   * Any inbound frame arrived (tick or heartbeat). Liveness only.
+   *
+   * Ignored while DISABLED or AUTH_EXPIRED, for the same reason as {@link onHeartbeat}.
+   */
   onFrame(at?: number): void {
+    if (this.current === "DISABLED" || this.current === "AUTH_EXPIRED") return;
+    this.frames++;
     this.lastFrameAt = at ?? this.nowFn();
+    this.lastFrameWallAt = this.nowWallFn();
     this.reevaluate();
   }
 
@@ -748,10 +862,15 @@ export class MarketDataStateMachine {
   onUsableDepth(token: number, at?: number): void {
     if (this.current === "DISABLED" || this.current === "AUTH_EXPIRED") return;
     const t = at ?? this.nowFn();
+    this.depthObservations++;
+    this.frames++;
     this.depthAt.set(token, { at: t, gen: this.gen });
     this.confirmed.add(token);
     this.lastDepthAt = t;
     this.lastFrameAt = t;
+    const wall = this.nowWallFn();
+    this.lastDepthWallAt = wall;
+    this.lastFrameWallAt = wall;
     this.reevaluate();
   }
 
@@ -906,27 +1025,90 @@ export class MarketDataStateMachine {
     return this.desired.has(token);
   }
 
-  diagnostics(): {
-    state: MarketDataState;
-    generation: number;
-    desired: number;
-    confirmed: number;
-    readyInstruments: number;
-    lastHeartbeatAt: number | null;
-    lastFrameAt: number | null;
-    lastDepthAt: number | null;
-    backlog: boolean;
-  } {
+  /**
+   * Age (ms) of an observation on THIS machine's monotonic clock, or null when never observed.
+   *
+   * The only place these subtractions are allowed to happen, because this is the only scope that
+   * knows which clock stamped the value. Callers receive finished ages and therefore cannot
+   * reintroduce the wall-minus-monotonic defect.
+   */
+  private ageOfMono(at: number | null, now: number): number | null {
+    if (at === null || !Number.isFinite(at)) return null;
+    return Math.max(0, now - at);
+  }
+
+  diagnostics(): MarketDataDiagnostics {
+    const now = this.nowFn();
+    const coverage = this.coverage();
     return {
       state: this.current,
       generation: this.gen,
       desired: this.desired.size,
       confirmed: this.confirmed.size,
-      readyInstruments: this.readyInstruments().length,
-      lastHeartbeatAt: this.lastHeartbeatAt,
-      lastFrameAt: this.lastFrameAt,
-      lastDepthAt: this.lastDepthAt,
+      readyInstruments: coverage.fresh,
       backlog: this.backlog,
+
+      // ── AGES: computed here, in the monotonic domain that stamped them ──
+      heartbeatAgeMs: this.ageOfMono(this.lastHeartbeatAt, now),
+      frameAgeMs: this.ageOfMono(this.lastFrameAt, now),
+      depthAgeMs: this.ageOfMono(this.lastDepthAt, now),
+
+      // ── WALL STAMPS: audit/display only, never used in a subtraction by a caller ──
+      lastHeartbeatWallAt: this.lastHeartbeatWallAt,
+      lastFrameWallAt: this.lastFrameWallAt,
+      lastDepthWallAt: this.lastDepthWallAt,
+
+      // ── EVIDENCE COUNTERS: distinguish "connected" from "actually delivering" ──
+      heartbeats: this.heartbeats,
+      frames: this.frames,
+      depthObservations: this.depthObservations,
+
+      // ── COVERAGE: desired vs usable, reported and deliberately NOT a gate ──
+      coverageDesired: coverage.desired,
+      coverageFresh: coverage.fresh,
+      coverageMissing: coverage.missing,
+
+      transportLive: this.isTransportLive(now),
+      bookMaxAgeMs: this.bookMaxAgeMs,
+      heartbeatMaxAgeMs: this.heartbeatMaxAgeMs,
     };
   }
+}
+
+/**
+ * What the market-data machine will tell you about itself.
+ *
+ * Named explicitly (rather than inferred from the method's return expression) because two
+ * consumers — `getStatus().market_data_health` and `buildOperationalReadiness` — depend on it, and
+ * a silent shape drift between them is exactly how the frame/depth ages became unreadable.
+ *
+ * NOTE THE ABSENCE of raw monotonic timestamps. They used to be published as `lastFrameAt` /
+ * `lastDepthAt` / `lastHeartbeatAt` and a caller subtracted a WALL `now` from them. They are now
+ * deliberately not exported at all: the machine publishes finished ages plus wall stamps, so the
+ * mixed-domain subtraction is not merely fixed but unavailable.
+ */
+export interface MarketDataDiagnostics {
+  readonly state: MarketDataState;
+  readonly generation: number;
+  readonly desired: number;
+  readonly confirmed: number;
+  readonly readyInstruments: number;
+  readonly backlog: boolean;
+  /** Ages in ms, monotonic domain. `null` means NEVER OBSERVED, never "0". */
+  readonly heartbeatAgeMs: number | null;
+  readonly frameAgeMs: number | null;
+  readonly depthAgeMs: number | null;
+  /** Wall-clock (epoch ms) stamps for audit/display. `null` means never observed. */
+  readonly lastHeartbeatWallAt: number | null;
+  readonly lastFrameWallAt: number | null;
+  readonly lastDepthWallAt: number | null;
+  readonly heartbeats: number;
+  readonly frames: number;
+  readonly depthObservations: number;
+  readonly coverageDesired: number;
+  readonly coverageFresh: number;
+  readonly coverageMissing: number;
+  readonly transportLive: boolean;
+  readonly bookMaxAgeMs: number;
+  readonly heartbeatMaxAgeMs: number;
 }

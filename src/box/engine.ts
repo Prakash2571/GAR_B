@@ -129,6 +129,7 @@ import {
   buildOperationalReadiness,
   type OperationalReadinessDecision,
   type ReadinessBlocker,
+  type MarketDataSource,
 } from "./operationalReadiness.js";
 import {
   brokerFundingLimitations,
@@ -625,6 +626,22 @@ export class BoxEngine {
    */
   private readonly marketDataMachine: MarketDataStateMachine;
   /**
+   * Whether the BOX market-data socket is currently connected.
+   *
+   * A raw TRANSPORT fact, tracked separately from {@link MarketDataStateMachine} state because the
+   * two answer different questions and a dashboard must be able to show both. "Connected" is not
+   * "ready": an open socket that has delivered no depth is connected and NOT usable, and reporting
+   * only the machine state left an operator unable to tell that case from a closed socket.
+   */
+  private marketDataSocketConnected = false;
+  /**
+   * The most recent RECONNECTABLE transport fault on the box lane, if any.
+   *
+   * Kept distinct from `lastError` semantics around session loss: this one is self-healing and must
+   * never be presented as an expired token.
+   */
+  private lastMarketDataTransportFault: string | null = null;
+  /**
    * THE BACKPRESSURE PIPELINE (GAP 2).
    *
    * Decouples ingestion from processing so a slow stage cannot block order-state processing on the
@@ -680,9 +697,39 @@ export class BoxEngine {
     // The market-data health machine reads the MONOTONIC clock so a heartbeat-gap / stale-book
     // comparison is never corrupted by an NTP step. heartbeatMaxAgeMs mirrors the feed-liveness
     // bound; bookMaxAgeMs mirrors the per-leg usable-book age the coherence gate already enforces.
+    /*
+     * ARMED IN EVERY EXECUTION MODE — this was the primary defect.
+     *
+     * This used to read `enabled: this.cfg.executionMode === "live"`, which coupled MARKET-DATA
+     * MONITORING to LIVE-ORDER EXECUTION. They have nothing to do with each other: market data is
+     * the quote feed, and `live` and all three paper modes consume the same real broker quote
+     * socket with the same full-depth subscriptions. The scanner cannot find a box without books
+     * whatever mode it is in.
+     *
+     * Under `paper_latency` the machine was therefore constructed DISABLED, and because almost
+     * every transition early-returns in that state the whole diagnostic surface was dead:
+     *
+     *   • `onAuthenticated()` early-returned  ⇒ generation stayed at 0 forever;
+     *   • `onUsableDepth()` early-returned    ⇒ no per-instrument depth was EVER recorded, so
+     *                                           `lastDepthAt` stayed null and `readyInstruments`
+     *                                           stayed 0 no matter how many books arrived;
+     *   • the state stayed `DISABLED`          ⇒ published as a DISABLED market-data lifecycle;
+     *   • `marketDataEntryBlocker("DISABLED")` has scope `both`, so it also reported EXPOSURE
+     *     MANAGEMENT as blocked — the red exposure warning that appeared in paper for no reason
+     *     other than that live readiness was off.
+     *
+     * That is the whole "SCANNING / DISABLED / generation 0 / no observed frame-or-depth" picture.
+     * Arming the machine unconditionally does NOT weaken any gate: READY still requires
+     * authentication, a live transport, no backlog and genuinely delivered depth in the current
+     * generation, and per-candidate admission is still decided per candidate.
+     */
     this.marketDataMachine = new MarketDataStateMachine({
-      enabled: this.cfg.executionMode === "live",
+      enabled: true,
       now: () => this.executionClock.mono(),
+      // Wall stamps for audit/display only. Supplying BOTH clocks is what lets the machine publish
+      // finished monotonic ages next to human-readable timestamps without any caller ever
+      // subtracting one domain from the other.
+      nowWall: () => this.executionClock.wall(),
       heartbeatMaxAgeMs: this.cfg.feedMaxAgeMs,
       bookMaxAgeMs: this.cfg.quoteMaxAgeMs,
     });
@@ -2313,6 +2360,27 @@ export class BoxEngine {
     }
     if (!this.removeConnectionListener) {
       this.removeConnectionListener = this.deps.feed.addConnectionListener((connected) => {
+        /*
+         * CROSS-LANE CONTAMINATION GUARD.
+         *
+         * `this.deps.feed` is the SHARED (futures/board) feed. When `BOX_DEDICATED_MARKET_FEED` is
+         * on — the default — the Box engine's books come from the separate BOX lane, whose own
+         * lifecycle arrives via `onBoxLaneConnection`. Driving the box market-data machine and
+         * invalidating the box quote generation from the FUTURES socket's connection edges meant a
+         * board-lane reconnect would, for a completely unrelated socket:
+         *   • bump the box feed generation, marking every warm box book stale;
+         *   • wipe the quote store, the spot cache and every detected opportunity;
+         *   • re-authenticate the box health machine, dropping all per-instrument readiness.
+         * A board lane that flaps therefore repeatedly blinded the box scanner, which shows up as
+         * exactly the reported "zero evaluated candidates" with a healthy-looking socket.
+         *
+         * With a dedicated box lane the shared feed is not the box engine's market-data source, so
+         * its connection edges must not speak for it. Without a dedicated lane the shared feed IS
+         * the source and the original behaviour is correct — hence the condition rather than a
+         * blanket removal.
+         */
+        if (this.cfg.boxDedicatedMarketFeed && this.deps.feed.setBoxTokens) return;
+        this.marketDataSocketConnected = connected;
         this.invalidateFeedGeneration();
         this.driveMarketDataConnection(connected);
       });
@@ -2726,9 +2794,25 @@ export class BoxEngine {
     // a busy board cannot displace strikes. Both option AND spot tokens go here: the Box
     // scanner's view of the underlying must not depend on the futures lane's health.
     if (this.cfg.boxDedicatedMarketFeed && this.deps.feed.setBoxTokens) {
-      this.deps.feed.setBoxTokens([...wantOption, ...wantSpot]);
+      /*
+       * RECORD THE INTENT BEFORE PUBLISHING IT UPSTREAM.
+       *
+       * `setBoxTokens` can synchronously create the box-lane socket, and the resulting
+       * `onBoxLaneConnection(true)` edge calls `setDesiredInstruments(this.subscribedOptionTokens)`.
+       * When the assignment happened AFTER the call, that edge could publish the PREVIOUS
+       * generation's desired set — empty on the very first subscription — so readiness would be
+       * measured against nothing (and `anyDesiredFresh` returns false for an empty set, keeping the
+       * machine below READY until the next market-watch tick re-asserted it).
+       *
+       * Assigning first makes the ordering irrelevant: whenever the connection edge lands, the
+       * desired set it reads is already the current one.
+       */
       this.subscribedOptionTokens = new Set(wantOption);
       this.subscribedSpotTokens = new Set(wantSpot);
+      // Keep the health machine's measurement target in step with the intent immediately, rather
+      // than waiting up to one market-watch period (15s) for the timer to re-assert it.
+      this.marketDataMachine.setDesiredInstruments(this.subscribedOptionTokens);
+      this.deps.feed.setBoxTokens([...wantOption, ...wantSpot]);
       if (toDrop.length > 0) this.quotes.forget(toDrop);
       return;
     }
@@ -5411,9 +5495,20 @@ export class BoxEngine {
           broker === "zerodha" ? zerodhaOrderStreamEnabledFromEnv() : dhanOrderStreamEnabledFromEnv(),
         // The running consumer's CURRENT health is refreshed into the map on every read (see
         // refreshOrderStreamConsumerHealth), so this reflects reality: a broker with a live
-        // consumer reports `armed` + its real projection health; a broker with no consumer
-        // (paper, or the inactive broker) honestly reports `not_wired` / `rest_polling_only`.
+        // consumer reports `armed` + its real projection health.
         consumers: this.refreshOrderStreamConsumerHealth(),
+        /*
+         * PAPER: absent is NOT_APPLICABLE, not broken.
+         *
+         * A paper process constructs no order-stream consumer BY DESIGN — building one implies a
+         * live order manager, and a paper process must contain no object capable of touching a
+         * real order. `orderStreamStatus` previously read "no consumer" as `not_wired`, whose
+         * documented meaning is "this should be running and is not", and paired it with
+         * `rest_polling_only`. So every paper deployment permanently reported a broken fast fill
+         * path that was never meant to exist, and claimed REST polling for orders that are never
+         * sent to a broker at all.
+         */
+        paperSimulated: this.cfg.executionMode !== "live",
       }),
       /**
        * THE EXECUTION FUNNEL (Task 8) — outcome counts with EXPLICIT denominators, from real
@@ -5622,10 +5717,72 @@ export class BoxEngine {
    * cached before the reconnect can be treated as warm and therefore executable.
    */
   onBoxLaneConnection(connected: boolean): void {
+    this.marketDataSocketConnected = connected;
     this.invalidateFeedGeneration();
     this.driveMarketDataConnection(connected);
     this.driveZerodhaOrderStreamConnection(connected);
     if (!connected) this.lastError = "box market-data lane disconnected";
+    else this.lastMarketDataTransportFault = null;
+  }
+
+  /**
+   * A TRANSPORT HEARTBEAT arrived on the box lane (keep-alive / non-tick frame).
+   *
+   * WHAT THIS DELIBERATELY DOES NOT DO. It does not touch `lastRawTickAt`, does not enter anything
+   * into the quote store, does not stamp `tokenFeedGeneration`, and does not flip `feedHealthy`.
+   * A keep-alive proves a route to the broker is alive and proves NOTHING about any instrument's
+   * book. Letting it refresh depth timestamps or warm an instrument would let a feed delivering no
+   * books at all report itself executable — the exact failure the four separate time facts exist
+   * to make impossible.
+   *
+   * It advances only the machine's heartbeat/frame clocks, which is what allows a genuinely quiet
+   * market to stay `transportLive` without ever becoming READY on stale books.
+   */
+  onBoxLaneHeartbeat(): void {
+    this.marketDataMachine.onHeartbeat();
+  }
+
+  /**
+   * The box lane hit a reconnectable transport fault. Recorded, never escalated.
+   *
+   * Explicitly NOT routed to {@link onMarketDataSessionLost}: that drives the terminal AUTH_EXPIRED
+   * state, and a network blip is not evidence that a token is dead. A reconnect is already
+   * scheduled by the feed.
+   */
+  onBoxLaneTransportFault(reason: string): void {
+    this.lastMarketDataTransportFault = reason;
+    this.lastError = `box market-data transport fault (recovering): ${reason}`;
+  }
+
+  /**
+   * A REPLACEMENT market-data credential was installed, so clear a terminal AUTH_EXPIRED verdict.
+   *
+   * Driven from the broker registry's login / token-refresh / broker-switch paths. This is the only
+   * thing permitted to clear AUTH_EXPIRED — no data event may, because a tick arriving on a socket
+   * the broker already rejected proves nothing about the credential. Without this the machine
+   * stayed terminally expired for the life of the process even after a successful re-login, and
+   * because that blocker's scope is `both` it also kept reporting exposure management as blocked.
+   */
+  onMarketDataSessionRestored(reason: string): void {
+    this.marketDataMachine.onSessionRestored();
+    // The books from the dead session are not evidence for the new one.
+    this.invalidateFeedGeneration();
+    this.lastError = `market-data session restored (${reason}); reconnecting`;
+  }
+
+  /**
+   * Where the box engine's quotes are coming from RIGHT NOW.
+   *
+   * Reported rather than assumed, so the "real broker WebSocket quotes" claim is always backed by
+   * the same evidence the payload publishes. A REST snapshot (indicative/last-close view) is a
+   * documented fallback and is labelled as such — never as executable streaming depth.
+   */
+  private marketDataSource(): MarketDataSource {
+    if (this.marketDataSocketConnected) return "broker_websocket";
+    // Not connected, but the last-close / indicative REST view may still be populating the screen.
+    // `indicativeAt` is set only by `refreshIndicative`, which prices from REST snapshots.
+    if (this.indicativeAt !== null) return "rest_snapshot_fallback";
+    return "none";
   }
 
   /**
@@ -5824,6 +5981,9 @@ export class BoxEngine {
       gateEnabled: (broker) =>
         broker === "zerodha" ? zerodhaOrderStreamEnabledFromEnv() : dhanOrderStreamEnabledFromEnv(),
       consumers: this.refreshOrderStreamConsumerHealth(),
+      // Same paper labelling as the `order_stream` block above, so the readiness decision and the
+      // published status can never disagree about the fill mechanism.
+      paperSimulated: this.cfg.executionMode !== "live",
     }).brokers[0];
 
     // External blockers, fail-safe: an unavailable provider is a BLOCKER, never an all-clear.
@@ -5945,10 +6105,40 @@ export class BoxEngine {
         generation: mdDiag.generation,
         desiredInstruments: mdDiag.desired,
         readyInstruments: mdDiag.readyInstruments,
-        lastFrameAt: mdDiag.lastFrameAt,
-        lastHeartbeatAt: mdDiag.lastHeartbeatAt,
-        lastDepthAt: mdDiag.lastDepthAt,
+        /*
+         * AGES, ALREADY COMPUTED IN THE MONOTONIC DOMAIN.
+         *
+         * This used to pass `lastFrameAt` / `lastHeartbeatAt` / `lastDepthAt` — MONOTONIC readings
+         * (`executionClock.mono()`) — into a builder whose `now` is `executionClock.wall()`. The
+         * builder subtracted them, so every published market-data age was roughly the Unix epoch
+         * in milliseconds: ~1.7e12 ms, about 55 years. Always positive, so the `Math.max(0, …)`
+         * floor could not even expose it, and a dashboard had no choice but to render it as
+         * garbage or as "never observed" — which is precisely the "last frame never observed"
+         * symptom, appearing even while ticks were arriving normally.
+         *
+         * The machine now computes these ages itself, inside the one clock domain that stamped
+         * them, and no longer exposes the raw monotonic timestamps at all — so the mixed-domain
+         * subtraction is not merely corrected here, it is unavailable to any caller.
+         */
+        frameAgeMs: mdDiag.frameAgeMs,
+        heartbeatAgeMs: mdDiag.heartbeatAgeMs,
+        depthAgeMs: mdDiag.depthAgeMs,
+        // Wall stamps travel alongside for audit/display. Never subtracted from anything.
+        lastFrameWallAt: mdDiag.lastFrameWallAt,
+        lastHeartbeatWallAt: mdDiag.lastHeartbeatWallAt,
+        lastDepthWallAt: mdDiag.lastDepthWallAt,
+        frames: mdDiag.frames,
+        heartbeats: mdDiag.heartbeats,
+        depthObservations: mdDiag.depthObservations,
         backlog: mdDiag.backlog,
+        source: this.marketDataSource(),
+        socketConnected: this.marketDataSocketConnected,
+        authenticated: this.deps.marketData.isAuthenticated(),
+        // Subscriptions have been REQUESTED once the engine has pushed a non-empty desired set at
+        // the lane. Deliberately not "confirmed": Zerodha sends no subscription ack, so claiming
+        // confirmation would be an assumption. Confirmation is evidenced by depth arriving.
+        subscriptionsRequested: this.subscribedOptionTokens.size > 0,
+        usableBooks: this.quotes.size,
       },
       orderStream: {
         lifecycle: orderStreamLifecycle,
@@ -5960,7 +6150,19 @@ export class BoxEngine {
         lastEventAt: health?.lastEventAt ?? null,
         disconnects: health?.disconnects ?? 0,
         reconcilePending: consumer?.reconcilePending() ?? false,
-        fillsObservedBy: published?.fills_observed_by ?? "rest_polling_only",
+        fillsObservedBy:
+          published?.fills_observed_by ??
+          // No published status for the active broker. Under paper the honest default is the
+          // simulator, NOT REST polling: nothing is sent to a broker, so nothing is polled for.
+          (this.cfg.executionMode === "live" ? "rest_polling_only" : "simulated_paper_fills"),
+      },
+      paperExecution: {
+        simulated: this.cfg.executionMode !== "live",
+        profile: this.cfg.executionMode === "live" ? null : this.cfg.executionMode,
+        // The simulator prices against the live quote store, so it is using streamed quotes exactly
+        // when the feed has actually delivered depth in the current generation. Claiming otherwise
+        // from an open socket is the conflation this whole payload exists to prevent.
+        usingStreamedQuotes: this.cfg.executionMode !== "live" && mdDiag.depthObservations > 0,
       },
       blockers: [...engineBlockers, ...external],
       openExposure: {

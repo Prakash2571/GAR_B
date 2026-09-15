@@ -218,9 +218,21 @@ test("the published readiness decision carries the instance identity as EXPLICIT
       desiredInstruments: 4,
       readyInstruments: 4,
       backlog: false,
-      lastFrameAt: 1_700_000_000_000,
-      lastHeartbeatAt: 1_700_000_000_000,
-      lastDepthAt: 1_700_000_000_000,
+      // Ages, in the machine's own monotonic domain (see operationalReadiness.ts).
+      frameAgeMs: 0,
+      heartbeatAgeMs: 0,
+      depthAgeMs: 0,
+      lastFrameWallAt: 1_700_000_000_000,
+      lastHeartbeatWallAt: 1_700_000_000_000,
+      lastDepthWallAt: 1_700_000_000_000,
+      frames: 100,
+      heartbeats: 5,
+      depthObservations: 80,
+      source: "broker_websocket",
+      socketConnected: true,
+      authenticated: true,
+      subscriptionsRequested: true,
+      usableBooks: 4,
     },
     orderStream: {
       lifecycle: "READY",
@@ -236,6 +248,7 @@ test("the published readiness decision carries the instance identity as EXPLICIT
       detail: "live",
     },
     blockers: [],
+    paperExecution: { simulated: false, profile: null, usingStreamedQuotes: false },
     openExposure: { openPositions: 0, residualLegs: 0, workingOrders: 0 },
   };
 

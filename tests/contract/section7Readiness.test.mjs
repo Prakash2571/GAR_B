@@ -185,7 +185,11 @@ test("[SERDE] RECONNECT: an owed gap repair is published as a blocker, and never
       identity: { broker: "zerodha", account: "AB1234", executionMode: "live", liveRuntimeArmed: true, deploymentLiveCapable: true },
       marketData: {
         state: "READY", generation: 2, desiredInstruments: 4, readyInstruments: 4,
-        lastFrameAt: t - 100, lastHeartbeatAt: t - 100, lastDepthAt: t - 150, backlog: false,
+        frameAgeMs: 100, heartbeatAgeMs: 100, depthAgeMs: 150, backlog: false,
+        lastFrameWallAt: t - 100, lastHeartbeatWallAt: t - 100, lastDepthWallAt: t - 150,
+        frames: 200, heartbeats: 8, depthObservations: 180,
+        source: "broker_websocket", socketConnected: true, authenticated: true,
+        subscriptionsRequested: true, usableBooks: 4,
       },
       orderStream: {
         lifecycle: consumer.lifecycleState(), publishedState: health.state, wiring: "armed", gateEnabled: true,
@@ -193,6 +197,7 @@ test("[SERDE] RECONNECT: an owed gap repair is published as a blocker, and never
         disconnects: health.disconnects, reconcilePending: consumer.reconcilePending(),
         fillsObservedBy: "rest_polling_only",
       },
+      paperExecution: { simulated: false, profile: null, usingStreamedQuotes: false },
       blockers: [], openExposure: { openPositions: 1, residualLegs: 0, workingOrders: 0 },
     }),
   );
@@ -310,7 +315,11 @@ async function makeReadinessBackedRuntimeProvider({ marketData = "DEGRADED", ord
     identity: { broker: "zerodha", account: "AB1234", executionMode: "live", liveRuntimeArmed: true, deploymentLiveCapable: true },
     marketData: {
       state: marketData, generation: 3, desiredInstruments: 4, readyInstruments: 2,
-      lastFrameAt: now - 9000, lastHeartbeatAt: now - 9000, lastDepthAt: now - 30000, backlog: false,
+      frameAgeMs: 9000, heartbeatAgeMs: 9000, depthAgeMs: 30000, backlog: false,
+      lastFrameWallAt: now - 9000, lastHeartbeatWallAt: now - 9000, lastDepthWallAt: now - 30000,
+      frames: 300, heartbeats: 12, depthObservations: 150,
+      source: "broker_websocket", socketConnected: true, authenticated: true,
+      subscriptionsRequested: true, usableBooks: 2,
     },
     orderStream: {
       lifecycle: orderStream, publishedState: "DEGRADED", wiring: "armed", gateEnabled: true,
@@ -318,6 +327,7 @@ async function makeReadinessBackedRuntimeProvider({ marketData = "DEGRADED", ord
       reconcilePending: false, fillsObservedBy: "rest_polling_only",
     },
     blockers: [{ code: "postgres_unavailable", scope: "entry", detail: "authoritative store unavailable" }],
+    paperExecution: { simulated: false, profile: null, usingStreamedQuotes: false },
     openExposure: { openPositions: 1, residualLegs: 0, workingOrders: 1 },
   });
   return {

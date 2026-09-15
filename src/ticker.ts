@@ -65,7 +65,30 @@ interface ConnectOptions {
   onTick: (ticks: Tick[]) => void;
   onOpen?: () => void;
   onError?: (message: string) => void;
-  onClose?: () => void;
+  /**
+   * The socket closed.
+   *
+   * The CLOSE CODE and whether the socket ever completed a handshake are both reported, because
+   * the caller's recovery decision genuinely depends on them and it used to be made blind. A
+   * policy close (1008/4401/…) means the credential is dead and retrying is pointless; a 1006
+   * after a healthy session is an ordinary network blip that MUST be retried. Previously `onClose`
+   * carried no arguments and `onError` was treated as terminal, so a blip and a dead token were
+   * indistinguishable — and both permanently killed the lane.
+   */
+  onClose?: (info: { code: number; everOpened: boolean }) => void;
+  /**
+   * A TRANSPORT HEARTBEAT arrived (Kite's 1-byte keep-alive).
+   *
+   * Kite sends a single zero-length/1-byte binary frame to keep the connection alive when no
+   * instrument has ticked. `parseBinary` correctly yields no ticks for it, and `onTick` is only
+   * invoked for a non-empty batch, so before this callback existed the frame was observed by
+   * nothing at all: a quiet-but-perfectly-alive socket was indistinguishable from a dead one, and
+   * the market-data machine's `onHeartbeat` had no production caller anywhere.
+   *
+   * This proves TRANSPORT LIVENESS ONLY. It is deliberately a separate callback from `onTick` so
+   * that it is impossible to wire it into anything that refreshes a book's freshness.
+   */
+  onHeartbeat?: () => void;
   /**
    * Kite streams ORDER UPDATES as TEXT frames on THIS SAME quote socket — shaped
    * `{ "type": "order"|"error"|"message", "data": … }` per the current v3 docs
@@ -87,19 +110,39 @@ export function connectTicker(opts: ConnectOptions): TickerHandle {
   ws.binaryType = "arraybuffer";
 
   let isOpen = false;
+  /**
+   * Whether a handshake ever completed on THIS socket.
+   *
+   * Distinct from `isOpen`, which is the CURRENT state. The caller's reconnect policy needs the
+   * historical fact: a socket that never opened and then closed points at the credential or the
+   * endpoint, whereas one that opened, streamed and then closed points at the network.
+   */
+  let everOpened = false;
   // Tokens requested before the socket finished opening are queued here and
   // flushed on open.
   let pendingTokens: number[] = [...opts.tokens];
 
   function sendSubscribe(tokens: number[]) {
     if (tokens.length === 0) return;
-    ws.send(JSON.stringify({ a: "subscribe", v: tokens }));
-    // "full" mode includes the day's close price AND open interest (oi).
-    ws.send(JSON.stringify({ a: "mode", v: ["full", tokens] }));
+    try {
+      ws.send(JSON.stringify({ a: "subscribe", v: tokens }));
+      // "full" mode includes the day's close price AND open interest (oi) — and, critically, the
+      // five-level bid/ask ladder the Box engine needs for an EXECUTABLE book. Full depth is
+      // requested unconditionally and in every execution mode: paper prices against the same
+      // ladder live would, which is the only way paper can shadow live honestly.
+      ws.send(JSON.stringify({ a: "mode", v: ["full", tokens] }));
+    } catch (err) {
+      // The socket died mid-send. Do NOT throw into the WebSocket callback: `onclose` will follow
+      // and the lane resubscribes its whole wanted set on the next open, so these tokens are not
+      // lost. Reported because a silent failure here looks exactly like a subscription the broker
+      // ignored.
+      opts.onError?.(`Kite subscribe send failed: ${String(err)}`);
+    }
   }
 
   ws.onopen = () => {
     isOpen = true;
+    everOpened = true;
     sendSubscribe(pendingTokens);
     pendingTokens = [];
     opts.onOpen?.();
@@ -123,12 +166,28 @@ export function connectTicker(opts: ConnectOptions): TickerHandle {
       return;
     }
     if (!(data instanceof ArrayBuffer)) return;
+    // KEEP-ALIVE. Kite sends a 0/1-byte binary frame when nothing has ticked. It carries no
+    // packets, so it is transport liveness and NOTHING else — never a book update.
+    if (data.byteLength < 2) {
+      opts.onHeartbeat?.();
+      return;
+    }
     const ticks = parseBinary(data);
     if (ticks.length) opts.onTick(ticks);
   };
 
+  // NOT terminal. `onerror` carries no code and fires for every abnormal condition — DNS failure,
+  // TCP reset, TLS error, an idle-timeout reset — so it cannot distinguish a dead token from a
+  // blip. It is reported for diagnostics and recovery is driven from `onclose`, which always
+  // follows and does carry a code. (Treating this as proof of credential death is what used to
+  // kill the Zerodha box lane permanently on the first network hiccup.)
   ws.onerror = () => opts.onError?.("Kite WebSocket error.");
-  ws.onclose = () => opts.onClose?.();
+  ws.onclose = (ev: { code?: number } = {}) => {
+    // Mark the socket unusable BEFORE notifying, so a handler that synchronously calls
+    // subscribe()/unsubscribe() queues the tokens instead of sending on a closed socket.
+    isOpen = false;
+    opts.onClose?.({ code: ev?.code ?? 0, everOpened });
+  };
 
   return {
     close: () => {

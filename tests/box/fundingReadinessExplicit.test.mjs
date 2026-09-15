@@ -236,10 +236,22 @@ test("INVARIANT: a funding blocker refuses ENTRY and leaves risk reduction permi
       generation: 7,
       desiredInstruments: 4,
       readyInstruments: 4,
-      lastFrameAt: 1_700_000_000_000 - 200,
-      lastHeartbeatAt: 1_700_000_000_000 - 200,
-      lastDepthAt: 1_700_000_000_000 - 300,
+      // Ages, in the machine's own monotonic domain (see operationalReadiness.ts).
+      frameAgeMs: 200,
+      heartbeatAgeMs: 200,
+      depthAgeMs: 300,
+      lastFrameWallAt: 1_700_000_000_000 - 200,
+      lastHeartbeatWallAt: 1_700_000_000_000 - 200,
+      lastDepthWallAt: 1_700_000_000_000 - 300,
+      frames: 500,
+      heartbeats: 10,
+      depthObservations: 400,
       backlog: false,
+      source: "broker_websocket",
+      socketConnected: true,
+      authenticated: true,
+      subscriptionsRequested: true,
+      usableBooks: 4,
     },
     orderStream: {
       lifecycle: "READY",
@@ -254,6 +266,7 @@ test("INVARIANT: a funding blocker refuses ENTRY and leaves risk reduction permi
       fillsObservedBy: "stream_primary_rest_reconcile",
     },
     blockers: funding,
+    paperExecution: { simulated: false, profile: null, usingStreamedQuotes: false },
     openExposure: { openPositions: 1, residualLegs: 0, workingOrders: 0 },
   });
 

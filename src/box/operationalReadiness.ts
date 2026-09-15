@@ -115,16 +115,80 @@ export interface ReadinessIdentityInput {
   readonly deploymentLiveCapable: boolean;
 }
 
+/**
+ * Market-data facts as handed to the builder.
+ *
+ * AGES, NOT TIMESTAMPS — deliberately. This interface used to take `lastFrameAt`,
+ * `lastHeartbeatAt` and `lastDepthAt` and the builder subtracted `now` from each. The engine
+ * stamps those three on the MONOTONIC clock but passed `executionClock.wall()` as `now`, so every
+ * published age was roughly the Unix epoch in milliseconds (~55 years) — always positive, so
+ * `Math.max(0, …)` could not even reveal it, and a dashboard could only render it as nonsense or
+ * as "never observed". Taking finished ages that were computed inside the monotonic domain makes
+ * the mixed-domain subtraction impossible to write here, rather than merely absent today.
+ *
+ * `null` in any age means NEVER OBSERVED and must be published as `null`, never coerced to 0.
+ */
 export interface ReadinessMarketDataInput {
   readonly state: MarketDataState;
   /** Connection generation. A book observed under a superseded socket is not evidence. */
   readonly generation: number;
   readonly desiredInstruments: number;
   readonly readyInstruments: number;
-  readonly lastFrameAt: number | null;
-  readonly lastHeartbeatAt: number | null;
-  readonly lastDepthAt: number | null;
+  /** Pre-computed ages (ms) in the machine's own monotonic domain. Null ⇒ never observed. */
+  readonly frameAgeMs: number | null;
+  readonly heartbeatAgeMs: number | null;
+  readonly depthAgeMs: number | null;
+  /** Wall-clock (epoch ms) stamps, for audit/display only. Null ⇒ never observed. */
+  readonly lastFrameWallAt: number | null;
+  readonly lastHeartbeatWallAt: number | null;
+  readonly lastDepthWallAt: number | null;
+  /**
+   * Evidence counters. These are what separate "a socket is open" from "data is arriving": a
+   * connection with `frames > 0` but `depthObservations === 0` is a real and nameable state.
+   */
+  readonly frames: number;
+  readonly heartbeats: number;
+  readonly depthObservations: number;
   readonly backlog: boolean;
+  /**
+   * Where the quotes are coming from. `broker_websocket` is the only value that licenses the
+   * "real broker WebSocket quotes" claim, and even then only when tick evidence supports it.
+   */
+  readonly source: MarketDataSource;
+  /** Whether the quote socket is currently connected (transport fact, NOT readiness). */
+  readonly socketConnected: boolean;
+  /** Whether the feed reports itself authenticated (transport fact, NOT readiness). */
+  readonly authenticated: boolean;
+  /** Whether subscriptions have been REQUESTED for the current generation. */
+  readonly subscriptionsRequested: boolean;
+  /** Count of instruments with a currently usable executable book. */
+  readonly usableBooks: number;
+}
+
+/**
+ * The mechanism supplying quotes.
+ *
+ * `rest_snapshot_fallback` is NOT equivalent to `broker_websocket`: a REST snapshot is a documented
+ * fallback for discovery and last-close views, and must never be silently presented as executable
+ * streaming depth.
+ */
+export type MarketDataSource = "broker_websocket" | "rest_snapshot_fallback" | "none";
+
+/**
+ * How PAPER execution is realised, published separately from any broker order stream.
+ *
+ * A broker cannot emit order-update events for orders that were never sent to it. Paper fills are
+ * produced by the local simulator against real streamed quotes, and saying so plainly is the only
+ * honest option: reporting paper fills as `rest_polling_only` (as the order-stream status did)
+ * implies a broker round trip that does not happen.
+ */
+export interface ReadinessPaperExecutionInput {
+  /** True when this deployment simulates execution rather than sending real orders. */
+  readonly simulated: boolean;
+  /** The paper profile in force (e.g. paper_latency), or null under live. */
+  readonly profile: string | null;
+  /** Whether the simulator is pricing against real streamed quotes right now. */
+  readonly usingStreamedQuotes: boolean;
 }
 
 export interface ReadinessOrderStreamInput {
@@ -170,6 +234,11 @@ export interface OperationalReadinessInput {
   readonly identity: ReadinessIdentityInput;
   readonly marketData: ReadinessMarketDataInput;
   readonly orderStream: ReadinessOrderStreamInput;
+  /**
+   * How execution is actually performed. Required so the payload can state the paper mechanism
+   * instead of leaving a reader to infer it from an order-stream field that does not apply.
+   */
+  readonly paperExecution: ReadinessPaperExecutionInput;
   /**
    * Everything OUTSIDE the two transports that legitimately blocks something: env gates, PostgreSQL,
    * token state, session budget, scanner state, reservations, recovery. Each carries its scope, so
@@ -229,6 +298,33 @@ export interface OperationalReadinessDecision {
     readonly backlog: boolean;
     /** True ONLY in READY: fresh usable depth per traded instrument, this generation. */
     readonly usable_for_entry: boolean;
+
+    /*
+     * THE SIX DISTINCT FACTS A DASHBOARD MUST NOT COLLAPSE.
+     *
+     * "Is the socket up?" and "is there executable depth?" are different questions, and a UI that
+     * had only `state` to work with could do nothing but conflate them. Each of the following is
+     * separately observable, so an operator can see exactly how far along the chain the feed got:
+     * connected → authenticated → subscriptions requested → frames arriving → usable depth →
+     * per-candidate readiness (which is answered per candidate, not here).
+     */
+    /** Where quotes come from. Never `broker_websocket` unless a broker socket is the source. */
+    readonly source: MarketDataSource;
+    readonly socket_connected: boolean;
+    readonly authenticated: boolean;
+    readonly subscriptions_requested: boolean;
+    /** Instruments with a currently usable executable book. */
+    readonly usable_books: number;
+    /**
+     * Whether any tick/frame has been received IN THE CURRENT GENERATION.
+     *
+     * This is the field that licenses the "real broker WebSocket quotes" claim. An open socket
+     * alone must never produce it.
+     */
+    readonly ticks_observed: boolean;
+    readonly frames_observed: number;
+    readonly heartbeats_observed: number;
+    readonly depth_observations: number;
   };
 
   readonly order_stream: {
@@ -251,12 +347,42 @@ export interface OperationalReadinessDecision {
     readonly detail: string;
   };
 
-  /** How old the evidence behind this decision is. `null` means NEVER OBSERVED — not fresh. */
+  /**
+   * PAPER EXECUTION, published separately from any broker order stream.
+   *
+   * Present in every payload so a reader never has to decide whether an order-stream field applies.
+   * When `simulated` is true, fills come from the local simulator and NO broker order confirmation
+   * exists or is possible — which is a normal, healthy state, not a degraded one.
+   */
+  readonly paper_execution: {
+    readonly simulated: boolean;
+    readonly profile: string | null;
+    readonly using_streamed_quotes: boolean;
+    /** Plain language, safe to display verbatim. */
+    readonly detail: string;
+  };
+
+  /**
+   * How old the evidence behind this decision is. `null` means NEVER OBSERVED — not fresh.
+   *
+   * Every market-data age here was computed in the MONOTONIC domain by the state machine that
+   * stamped it (see {@link ReadinessMarketDataInput}). `order_stream_event_age_ms` is computed here
+   * from `now`, which is legitimate because the order-stream event time is a WALL reading and `now`
+   * is `executionClock.wall()` — same domain, so the subtraction is sound.
+   */
   readonly evidence: {
     readonly market_data_frame_age_ms: number | null;
     readonly market_data_heartbeat_age_ms: number | null;
     readonly market_data_depth_age_ms: number | null;
     readonly order_stream_event_age_ms: number | null;
+    /** Wall-clock stamps for audit/display. `null` means never observed. */
+    readonly market_data_last_frame_at: number | null;
+    readonly market_data_last_depth_at: number | null;
+    /**
+     * Which clock produced the market-data ages, published so a reader can verify the domains
+     * were not mixed rather than trusting that they were not.
+     */
+    readonly market_data_age_clock: "monotonic";
   };
 
   readonly reconciliation: {
@@ -310,10 +436,65 @@ export function maskAccountId(account: string | null | undefined): string | null
 
 /* ─────────────────────────── the builder ─────────────────────────── */
 
-/** Age of an observation, or null when it was never observed. NEVER 0 for "never". */
+/**
+ * Age of an observation, or null when it was never observed. NEVER 0 for "never".
+ *
+ * ONLY valid when `now` and `at` are readings of the SAME clock. The one remaining caller is the
+ * order-stream event age, where both are `executionClock.wall()`. Market-data ages arrive
+ * pre-computed precisely so this function cannot be misapplied across clock domains again.
+ */
 function ageOf(now: number, at: number | null): number | null {
   if (at === null || !Number.isFinite(at)) return null;
   return Math.max(0, now - at);
+}
+
+/**
+ * Normalise an already-computed age for publication.
+ *
+ * The schema declares these as INTEGER-or-null with a zero floor, and a monotonic clock is
+ * fractional (`performance.now()`), so a raw 12.7 would violate the contract. `null` passes
+ * through untouched: "never observed" is not a number and must not become one.
+ */
+function intAge(age: number | null): number | null {
+  if (age === null || !Number.isFinite(age)) return null;
+  return Math.max(0, Math.round(age));
+}
+
+/**
+ * Describe the paper execution mechanism in plain language, gated on REAL evidence.
+ *
+ * The "real broker WebSocket quotes · simulated execution" claim is only made when frames have
+ * actually been observed on the broker socket. With no tick evidence the text says so instead,
+ * because a confident label over an empty feed is exactly the failure this whole payload exists to
+ * prevent.
+ */
+function describePaperExecution(
+  paper: ReadinessPaperExecutionInput,
+  marketData: ReadinessMarketDataInput,
+): string {
+  if (!paper.simulated) {
+    return "Live execution: orders are sent to the broker and fills are broker-confirmed.";
+  }
+  const profile = paper.profile ? ` (${paper.profile})` : "";
+  if (marketData.source === "broker_websocket" && marketData.frames > 0) {
+    return (
+      `Real broker WebSocket quotes · simulated execution${profile}. Fills are produced by the ` +
+      `local execution simulator against streamed quotes; NO order reaches the broker, so no ` +
+      `broker fill confirmation exists or is possible.`
+    );
+  }
+  if (marketData.source === "broker_websocket") {
+    return (
+      `Simulated execution${profile}, but NO tick has been observed on the broker quote socket ` +
+      `yet — so there is no streamed pricing basis to simulate against. This is a market-data ` +
+      `fault, not an execution one.`
+    );
+  }
+  return (
+    `Simulated execution${profile}. Quotes are NOT coming from a broker WebSocket ` +
+    `(source: ${marketData.source}), so any fill simulated now is priced off fallback data and ` +
+    `must not be read as executable.`
+  );
 }
 
 /** Reasons a market-data state does not license NEW ENTRY, named per state. */
@@ -455,7 +636,7 @@ const EXPOSURE_LIMITATIONS: readonly string[] = Object.freeze([
 export function buildOperationalReadiness(
   input: OperationalReadinessInput,
 ): OperationalReadinessDecision {
-  const { now, marketData, orderStream, identity, openExposure } = input;
+  const { now, marketData, orderStream, identity, openExposure, paperExecution } = input;
 
   // (1) The SHARED table — never a local re-derivation.
   const permissions: OperationPermissions = combinedPermissions({
@@ -580,6 +761,17 @@ export function buildOperationalReadiness(
       ready_instruments: marketData.readyInstruments,
       backlog: marketData.backlog,
       usable_for_entry: marketData.state === "READY",
+      source: marketData.source,
+      socket_connected: marketData.socketConnected,
+      authenticated: marketData.authenticated,
+      subscriptions_requested: marketData.subscriptionsRequested,
+      usable_books: marketData.usableBooks,
+      // Tick evidence is a COUNT, not a socket state. `frames > 0` is the only thing that can
+      // justify telling an operator that real broker quotes are arriving.
+      ticks_observed: marketData.frames > 0,
+      frames_observed: marketData.frames,
+      heartbeats_observed: marketData.heartbeats,
+      depth_observations: marketData.depthObservations,
     },
 
     order_stream: {
@@ -595,17 +787,42 @@ export function buildOperationalReadiness(
     fill_observation: {
       mechanism: orderStream.fillsObservedBy,
       stream_assisted: streamAssisted,
-      detail: streamAssisted
-        ? "A broker push is observing fills first; REST reconciles behind it."
-        : "REST polling is observing fills. Fill-observation latency is bounded by the polling " +
-          "cadence and the pacing floor, not by broker push latency.",
+      /*
+       * THREE mechanisms, three sentences. This used to be a two-way ternary on `streamAssisted`,
+       * so paper mode — which is not stream-assisted — fell into the REST branch and told the
+       * operator "REST polling is observing fills" about orders that are never sent to a broker at
+       * all. The mechanism label was already corrected to `simulated_paper_fills`; leaving the prose
+       * behind would have contradicted it in the same object.
+       */
+      detail:
+        orderStream.fillsObservedBy === "stream_primary_rest_reconcile"
+          ? "A broker push is observing fills first; REST reconciles behind it."
+          : orderStream.fillsObservedBy === "simulated_paper_fills"
+            ? "The local execution simulator is producing fills against streamed quotes. No order " +
+              "reaches the broker, so there is no broker confirmation to wait for and nothing is " +
+              "being polled — fill timing is the simulator's modelled latency, not broker latency."
+            : "REST polling is observing fills. Fill-observation latency is bounded by the polling " +
+              "cadence and the pacing floor, not by broker push latency.",
+    },
+
+    paper_execution: {
+      simulated: paperExecution.simulated,
+      profile: paperExecution.profile,
+      using_streamed_quotes: paperExecution.usingStreamedQuotes,
+      detail: describePaperExecution(paperExecution, marketData),
     },
 
     evidence: {
-      market_data_frame_age_ms: ageOf(now, marketData.lastFrameAt),
-      market_data_heartbeat_age_ms: ageOf(now, marketData.lastHeartbeatAt),
-      market_data_depth_age_ms: ageOf(now, marketData.lastDepthAt),
+      // Already computed in the monotonic domain by the market-data machine. NOT recomputed from
+      // `now`, which is a wall reading — that mixture is the defect this shape removes.
+      market_data_frame_age_ms: intAge(marketData.frameAgeMs),
+      market_data_heartbeat_age_ms: intAge(marketData.heartbeatAgeMs),
+      market_data_depth_age_ms: intAge(marketData.depthAgeMs),
+      // Wall minus wall: `now` is executionClock.wall() and so is lastEventAt.
       order_stream_event_age_ms: ageOf(now, orderStream.lastEventAt),
+      market_data_last_frame_at: marketData.lastFrameWallAt,
+      market_data_last_depth_at: marketData.lastDepthWallAt,
+      market_data_age_clock: "monotonic",
     },
 
     reconciliation: {

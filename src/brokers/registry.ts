@@ -164,6 +164,22 @@ export interface SwitchHooks {
    * — the cross-broker leak the switch exists to prevent.
    */
   dropMarketDataSessions?: () => number;
+  /**
+   * A REPLACEMENT market-data credential was installed (re-login, token refresh, broker switch).
+   *
+   * WHY THIS HOOK EXISTS. `MarketDataStateMachine.onSessionLost()` moves to AUTH_EXPIRED, and both
+   * `onSocketOpen` and `onAuthenticated` early-return in that state — correctly, because no tick on
+   * a socket the broker already rejected can prove the token is good again. The consequence,
+   * though, was that AUTH_EXPIRED survived the fix: an operator could sign in again, the lane would
+   * reconnect and stream happily, and the health machine would still report an expired session for
+   * the remaining life of the process — blocking new entry and (scope `both`) falsely reporting
+   * exposure management as blocked too.
+   *
+   * Credential replacement comes from the AUTH path, not the data path, which is exactly why it is
+   * allowed to clear AUTH_EXPIRED when a tick is not. The machine returns to DISCONNECTED and must
+   * still connect, authenticate and observe fresh depth before it is READY again.
+   */
+  marketDataSessionRestored?: (reason: string) => void;
 }
 
 export interface ActiveBrokerManagerDeps {
@@ -194,6 +210,27 @@ export interface ActiveBrokerManagerDeps {
    * known-invalid token. Distinct from a plain `onBoxLaneConnection(false)`.
    */
   onBoxLaneSessionLost?: (reason: string) => void;
+  /**
+   * A TRANSPORT HEARTBEAT (keep-alive / non-tick frame) arrived on the BOX lane.
+   *
+   * Forwarded so the market-data health machine can distinguish "quiet but alive" from "dead"
+   * WITHOUT any of it counting as book freshness. Deliberately a separate callback from
+   * `onBoxLaneTicks` so it cannot be accidentally routed into the quote store — a heartbeat that
+   * warmed an instrument would let a feed with no depth at all report itself executable.
+   *
+   * Note it does NOT call `noteTick()`: that drives the broker-wide tick-liveness clock, and a
+   * keep-alive is not a tick.
+   */
+  onBoxLaneHeartbeat?: () => void;
+  /**
+   * The BOX lane hit a RECONNECTABLE transport fault (network blip, TLS/DNS failure).
+   *
+   * Strictly distinct from `onBoxLaneSessionLost`, which means the credential is dead. This one is
+   * self-healing: a reconnect is already scheduled. It exists so the condition is VISIBLE without
+   * being mistaken for token expiry — conflating the two is what used to drive the health machine
+   * into the terminal AUTH_EXPIRED state over a momentary hiccup.
+   */
+  onBoxLaneTransportFault?: (reason: string) => void;
   /**
    * Kite order-update TEXT frames from the BOX lane's Zerodha socket.
    *
@@ -608,11 +645,21 @@ export class ActiveBrokerManager {
           this.deps.onBoxLaneTicks?.(ticks);
         },
         onConnectionChange: (connected) => this.deps.onBoxLaneConnection?.(connected),
+        // Keep-alive frames. Transport liveness ONLY — note the absence of `noteTick()`.
+        onHeartbeat: () => this.deps.onBoxLaneHeartbeat?.(),
         onDead: (message) => {
           console.warn(`[Broker] box lane (zerodha) feed died: ${message}`);
           // A Kite feed death is a credential/token rejection (not a reconnectable network blip):
           // surface it as a market-data session loss so the health machine goes AUTH_EXPIRED.
+          // The feed now only reaches this path on a POLICY close code, or after a bounded number
+          // of attempts that never opened — never on a bare `ws.onerror`, which carries no
+          // evidence about the credential at all.
           this.deps.onBoxLaneSessionLost?.(message);
+        },
+        onTransportFault: (message) => {
+          // Reconnectable. Reported, never escalated to a session loss.
+          console.warn(`[Broker] box lane (zerodha) transport fault (recovering): ${message}`);
+          this.deps.onBoxLaneTransportFault?.(message);
         },
         // Order postbacks ride this SAME socket as text frames — no extra Zerodha socket exists.
         ...(this.deps.onBoxLaneOrderText
@@ -634,6 +681,8 @@ export class ActiveBrokerManager {
           this.deps.onBoxLaneTicks?.(ticks);
         },
         onConnection: (connected) => this.deps.onBoxLaneConnection?.(connected),
+        // Non-tick frames (market status, informational text). Transport liveness ONLY.
+        onHeartbeat: () => this.deps.onBoxLaneHeartbeat?.(),
         onSessionLost: (reason) => {
           // Distinguish an auth/session rejection (dhan/feed classifies close codes 1008/4401 etc)
           // from a transient drop: this path only fires for the former, so it is a market-data
@@ -1159,6 +1208,11 @@ export class ActiveBrokerManager {
        */
       this.stopZerodhaLanes();
       this.lastTickAt = null;
+      // A REPLACEMENT token is now installed, so a previous AUTH_EXPIRED verdict is no longer the
+      // truth. Clear it explicitly: no data event is permitted to clear it (see
+      // MarketDataStateMachine.onSessionRestored), so without this the health machine would stay
+      // terminally expired even though the lanes below are about to reconnect on a valid token.
+      this.hooks?.marketDataSessionRestored?.("Zerodha sign-in installed a replacement access token");
 
       await this.instrumentProvider.load(true).catch((err) =>
         console.warn("[Zerodha] universe load after login failed:", err),
@@ -1316,6 +1370,12 @@ export class ActiveBrokerManager {
     // and a fresh instance is cheaper to reason about than a mutated one.
     console.log("[Broker] recycling the Dhan feeds onto the new access token");
     this.stopDhanLanes();
+    // A REPLACEMENT token is installed, so clear any terminal AUTH_EXPIRED verdict. Scoped to the
+    // case where Dhan owns the runtime: a STANDBY Dhan sign-in must not touch the health machine
+    // that a live Zerodha feed is driving.
+    if (this.active === "dhan") {
+      this.hooks?.marketDataSessionRestored?.("Dhan sign-in installed a replacement access token");
+    }
     // `lastTickAt` is the ACTIVE broker's tick clock, NOT Dhan's — clearing it while
     // Zerodha is active would demote a perfectly live Zerodha feed to "connecting" and
     // make it fail the usability check. Signing into a STANDBY broker must not be able to
@@ -2535,6 +2595,11 @@ export class ActiveBrokerManager {
       this.instrumentProvider.invalidate();
       this.lastTickAt = null;
       hooks?.invalidateBooks();
+      // The INCOMING broker's market-data session is a different credential entirely, so any
+      // AUTH_EXPIRED verdict earned by the OUTGOING broker's token must not be inherited — it
+      // would leave the new broker's feed reporting an expired session it has nothing to do with,
+      // and (scope `both`) falsely report exposure management as blocked on the new broker too.
+      hooks?.marketDataSessionRestored?.(`broker switch ${previous} -> ${target}`);
       // Contract reservations are broker-namespaced, so they die here too — alongside
       // the books, and for the same reason. Awaited: the durable tier is a database
       // write and must land before the new broker's feed can produce a candidate.

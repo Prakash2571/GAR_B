@@ -24,8 +24,8 @@
         "properties": {
           "broker": { "enum": ["zerodha", "dhan"] },
           "wiring": {
-            "enum": ["not_built", "not_wired", "gated_off", "armed"],
-            "description": "not_built = no implementation. not_wired = implemented and unit-tested but NO running component consumes it, so it cannot deliver a fill (this is NOT 'disabled by choice'). gated_off = wired but the env gate is not armed. armed = gate on; the health field then decides."
+            "enum": ["not_built", "not_wired", "gated_off", "armed", "not_applicable_paper"],
+            "description": "not_built = no implementation. not_wired = implemented and unit-tested but NO running component consumes it, so it cannot deliver a fill (this is NOT 'disabled by choice'). gated_off = wired but the env gate is not armed. armed = gate on; the health field then decides. not_applicable_paper = this deployment SIMULATES execution, so no order is sent to the broker and the broker has no order to report on; a paper process constructs no consumer BY DESIGN, because building one implies a live order manager and a paper process must contain no object capable of touching a real order. The absence of not_applicable_paper was itself a reporting defect: every paper deployment fell through to not_wired and so permanently reported a broken fast fill path that was never meant to exist. A client MUST render this as inactive / not applicable, NEVER as broken."
           },
           "gate_env_var": {
             "type": "string",
@@ -79,8 +79,8 @@
             }
           },
           "fills_observed_by": {
-            "enum": ["rest_polling_only", "stream_primary_rest_reconcile"],
-            "description": "The mechanism CURRENTLY responsible for observing a fill. rest_polling_only means fill-observation latency is bounded by the polling cadence and the pacing floor, not by broker push latency."
+            "enum": ["rest_polling_only", "stream_primary_rest_reconcile", "simulated_paper_fills"],
+            "description": "The mechanism CURRENTLY responsible for observing a fill. rest_polling_only means fill-observation latency is bounded by the polling cadence and the pacing floor, not by broker push latency. simulated_paper_fills means the LOCAL execution simulator produces the fill against real streamed quotes: a broker cannot emit an order-update event for an order it never received, so reporting paper fills as rest_polling_only was not a conservative understatement but false, implying a broker round trip and a confirmation that do not exist. A client MUST render this as 'Simulated fills', never as 'REST polling only'."
           },
           "detail": { "type": "string" }
         }
