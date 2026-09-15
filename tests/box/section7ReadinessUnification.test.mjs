@@ -224,15 +224,32 @@ const READY_INPUT = {
     liveRuntimeArmed: true,
     deploymentLiveCapable: true,
   },
+  /*
+   * AGES, NOT TIMESTAMPS. The builder used to take monotonic timestamps and subtract a WALL `now`
+   * from them, which published every market-data age as ~55 years. It now takes ages already
+   * computed inside the machine's own clock domain, so the mixed-domain subtraction cannot be
+   * written here at all.
+   */
   marketData: {
     state: "READY",
     generation: 7,
     desiredInstruments: 4,
     readyInstruments: 4,
-    lastFrameAt: 1_700_000_000_000 - 200,
-    lastHeartbeatAt: 1_700_000_000_000 - 200,
-    lastDepthAt: 1_700_000_000_000 - 300,
+    frameAgeMs: 200,
+    heartbeatAgeMs: 200,
+    depthAgeMs: 300,
+    lastFrameWallAt: 1_700_000_000_000 - 200,
+    lastHeartbeatWallAt: 1_700_000_000_000 - 200,
+    lastDepthWallAt: 1_700_000_000_000 - 300,
+    frames: 1_200,
+    heartbeats: 40,
+    depthObservations: 900,
     backlog: false,
+    source: "broker_websocket",
+    socketConnected: true,
+    authenticated: true,
+    subscriptionsRequested: true,
+    usableBooks: 4,
   },
   orderStream: {
     lifecycle: "READY",
@@ -246,6 +263,7 @@ const READY_INPUT = {
     reconcilePending: false,
     fillsObservedBy: "stream_primary_rest_reconcile",
   },
+  paperExecution: { simulated: false, profile: null, usingStreamedQuotes: false },
   blockers: [],
   openExposure: { openPositions: 0, residualLegs: 0, workingOrders: 0 },
 };
@@ -376,12 +394,148 @@ test("a reduction-scoped blocker DOES block reduction (reduction keeps its own r
 test("evidence freshness is reported as an AGE, and an absent observation is null — never 0", () => {
   const d = buildOperationalReadiness({
     ...READY_INPUT,
-    marketData: { ...READY_INPUT.marketData, lastDepthAt: null, lastFrameAt: null, lastHeartbeatAt: null },
+    marketData: {
+      ...READY_INPUT.marketData,
+      depthAgeMs: null,
+      frameAgeMs: null,
+      heartbeatAgeMs: null,
+      lastDepthWallAt: null,
+      lastFrameWallAt: null,
+      lastHeartbeatWallAt: null,
+      frames: 0,
+      heartbeats: 0,
+      depthObservations: 0,
+    },
     orderStream: { ...READY_INPUT.orderStream, lastEventAt: null },
   });
   assert.equal(d.evidence.market_data_depth_age_ms, null, "never-observed depth is null, not a fresh 0");
   assert.equal(d.evidence.market_data_frame_age_ms, null);
+  assert.equal(d.evidence.market_data_heartbeat_age_ms, null);
   assert.equal(d.evidence.order_stream_event_age_ms, null);
+  // Wall stamps follow the same rule: absent means absent.
+  assert.equal(d.evidence.market_data_last_frame_at, null);
+  assert.equal(d.evidence.market_data_last_depth_at, null);
+  // And no tick evidence means the payload must not claim any.
+  assert.equal(d.market_data.ticks_observed, false);
+});
+
+test("market-data ages are published in the MONOTONIC domain, never wall-minus-monotonic", () => {
+  /*
+   * THE REGRESSION GUARD for the defect that made "last frame never observed" appear while ticks
+   * were arriving normally. The engine stamps frame/depth/heartbeat times with
+   * `executionClock.mono()` (a small number — process uptime), but passed `executionClock.wall()`
+   * as the builder's `now` (~1.7e12). Subtracting them yielded ages of roughly 55 years, always
+   * positive so the `Math.max(0, …)` floor could not reveal it.
+   *
+   * `now` here is a realistic WALL value while the ages are small monotonic spans. If the builder
+   * ever recomputed an age from `now` again, these numbers would come back in the trillions.
+   */
+  const d = buildOperationalReadiness({
+    ...READY_INPUT,
+    now: 1_700_000_000_000,
+    marketData: { ...READY_INPUT.marketData, frameAgeMs: 137.4, depthAgeMs: 412.9, heartbeatAgeMs: 12.2 },
+  });
+  assert.equal(d.evidence.market_data_frame_age_ms, 137, "the age the machine measured, rounded");
+  assert.equal(d.evidence.market_data_depth_age_ms, 413);
+  assert.equal(d.evidence.market_data_heartbeat_age_ms, 12);
+  assert.equal(d.evidence.market_data_age_clock, "monotonic", "the domain is published, not assumed");
+  for (const age of [
+    d.evidence.market_data_frame_age_ms,
+    d.evidence.market_data_depth_age_ms,
+    d.evidence.market_data_heartbeat_age_ms,
+  ]) {
+    assert.ok(age < 60_000, `a market-data age of ${age}ms betrays a mixed clock domain`);
+    assert.ok(Number.isInteger(age), "the contract declares an integer");
+  }
+});
+
+test("PAPER: the payload reports simulated fills and a not-applicable order stream, not a fault", () => {
+  /*
+   * The paper-mode reporting defect, end to end. A paper deployment constructs no order-stream
+   * consumer by design, and the old code read that absence as `not_wired` (documented as "should be
+   * running and is not") plus `rest_polling_only` — claiming a broker REST round trip for orders
+   * that are never sent anywhere.
+   */
+  const paper = buildOperationalReadiness({
+    ...READY_INPUT,
+    identity: {
+      ...READY_INPUT.identity,
+      executionMode: "paper_latency",
+      liveRuntimeArmed: false,
+      deploymentLiveCapable: false,
+    },
+    orderStream: {
+      ...READY_INPUT.orderStream,
+      lifecycle: "DISABLED",
+      publishedState: "DISABLED",
+      wiring: "not_applicable_paper",
+      gateEnabled: false,
+      connected: false,
+      authorised: false,
+      lastEventAt: null,
+      fillsObservedBy: "simulated_paper_fills",
+    },
+    paperExecution: { simulated: true, profile: "paper_latency", usingStreamedQuotes: true },
+  });
+
+  assert.equal(paper.paper_execution.simulated, true);
+  assert.equal(paper.paper_execution.profile, "paper_latency");
+  assert.equal(paper.paper_execution.using_streamed_quotes, true);
+  assert.match(
+    paper.paper_execution.detail,
+    /Real broker WebSocket quotes · simulated execution/,
+    "the claim is made — and only because there IS tick evidence",
+  );
+  assert.match(paper.paper_execution.detail, /NO order reaches the broker/);
+  assert.equal(paper.fill_observation.mechanism, "simulated_paper_fills");
+  assert.equal(paper.fill_observation.stream_assisted, false);
+
+  // A DISABLED order stream never blocks entry: it is the documented paper baseline, not a fault.
+  const entryCodes = paper.entry.reasons.map((r) => r.code);
+  assert.ok(
+    !entryCodes.some((c) => String(c).startsWith("order_stream")),
+    `a not-applicable paper order stream must not block entry (got ${entryCodes.join(", ")})`,
+  );
+
+  // THE RED EXPOSURE WARNING. Paper must never report exposure management as blocked merely
+  // because live readiness is off.
+  assert.equal(paper.exposure_management.exit_and_reduce, true);
+  assert.equal(paper.exposure_management.protective_cancel, true);
+  assert.deepEqual(paper.exposure_management.blocked_reasons, []);
+});
+
+test("PAPER: the streamed-quotes claim is REFUSED when no tick has been observed", () => {
+  // The honesty half of the test above: with an open socket but zero frames, the payload must not
+  // say "real broker WebSocket quotes".
+  const paper = buildOperationalReadiness({
+    ...READY_INPUT,
+    identity: { ...READY_INPUT.identity, executionMode: "paper_latency", deploymentLiveCapable: false },
+    marketData: {
+      ...READY_INPUT.marketData,
+      state: "SYNCHRONIZING",
+      frames: 0,
+      heartbeats: 0,
+      depthObservations: 0,
+      frameAgeMs: null,
+      depthAgeMs: null,
+      heartbeatAgeMs: null,
+      readyInstruments: 0,
+      usableBooks: 0,
+      socketConnected: true,
+    },
+    paperExecution: { simulated: true, profile: "paper_latency", usingStreamedQuotes: false },
+  });
+
+  assert.equal(paper.market_data.ticks_observed, false, "an open socket is not tick evidence");
+  assert.equal(paper.market_data.socket_connected, true, "and the two are reported separately");
+  assert.equal(paper.market_data.usable_for_entry, false);
+  assert.doesNotMatch(
+    paper.paper_execution.detail,
+    /Real broker WebSocket quotes/,
+    "no ticks ⇒ the claim must NOT be made",
+  );
+  assert.match(paper.paper_execution.detail, /NO tick has been observed/);
+  assert.equal(paper.entry.permitted, false, "and entry is still refused");
 });
 
 /* ═══════════ 4. PRODUCTION WIRING: the decision must be FED and PUBLISHED, not merely built ═══════════ */

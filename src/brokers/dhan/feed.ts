@@ -60,6 +60,15 @@ export interface DhanFeedOptions {
   onConnection?: (connected: boolean) => void;
   /** Fatal/auth failures: the session is unusable and must be re-established. */
   onSessionLost?: (reason: string) => void;
+  /**
+   * A TRANSPORT-LIVENESS frame arrived that carried no usable book.
+   *
+   * Dhan's feed sends non-tick frames (market-status packets, informational text frames, and
+   * packets whose code carries no ladder). They prove the socket is alive and prove NOTHING about
+   * any instrument's depth. Forwarded on a dedicated callback — deliberately separate from
+   * `onTicks` — so it is impossible to wire this into anything that refreshes book freshness.
+   */
+  onHeartbeat?: () => void;
   /** Resolves an internal token back to the Dhan (segment, securityId) pair. */
   resolve: (token: number) => DhanFeedInstrument | null;
   /**
@@ -215,8 +224,12 @@ export class DhanFeed {
     ws.onmessage = (ev: MessageEvent) => {
       if (this.ws !== ws) return;
       const data = ev.data;
-      // Dhan's market feed is binary. A text frame is informational only.
-      if (!(data instanceof ArrayBuffer)) return;
+      // Dhan's market feed is binary. A text frame is informational only — but it IS inbound
+      // traffic, so it counts as transport liveness (and nothing more).
+      if (!(data instanceof ArrayBuffer)) {
+        this.opts.onHeartbeat?.();
+        return;
+      }
       this.handleFrame(data);
     };
 
@@ -274,7 +287,14 @@ export class DhanFeed {
       const depthUpdated = packet.bids !== undefined || packet.asks !== undefined;
       ticks.push(toTick(merged, depthUpdated));
     }
-    if (ticks.length === 0) return;
+    if (ticks.length === 0) {
+      // The frame decoded, but produced no tick — a market-status packet, a server DISCONNECT
+      // notice, or packets we could not attribute to a wanted token. Inbound traffic proves the
+      // TRANSPORT is alive; it must never be allowed to refresh a book's freshness, which is why
+      // this is the heartbeat callback and not `onTicks([])`.
+      this.opts.onHeartbeat?.();
+      return;
+    }
     // FIRST tick only. It is the single most valuable log line here (it proves the
     // whole chain end to end), and logging every tick would bury everything else.
     if (this.lastTickAt === 0) {
@@ -369,6 +389,7 @@ export class DhanFeed {
       );
     }
 
+    let failedBatches = 0;
     for (let i = 0; i < list.length; i += SUBSCRIBE_BATCH) {
       const batch = list.slice(i, i + SUBSCRIBE_BATCH);
       // Dhan's per-message instrument cap is a WS protocol limit, entirely separate
@@ -386,9 +407,31 @@ export class DhanFeed {
           }),
         );
       } catch (err) {
-        console.warn(`[Dhan feed] failed to send request ${requestCode}:`, err);
-        return;
+        /*
+         * CONTINUE, DO NOT RETURN.
+         *
+         * This used to `return`, which abandoned every REMAINING chunk. With the Box universe at
+         * ~2,200 tokens that is 22 chunks, so one transient send failure on chunk 3 silently left
+         * ~1,900 instruments unsubscribed — and because `subscribed` is only populated from
+         * inbound packets, the lane then looked "connected" while most of the universe never
+         * ticked. Failing one chunk is not a reason to abandon the other twenty.
+         */
+        failedBatches++;
+        console.warn(
+          `[Dhan feed] failed to send request ${requestCode} for batch ` +
+            `${i / SUBSCRIBE_BATCH + 1} (${batch.length} instrument(s)):`,
+          err,
+        );
       }
+    }
+    if (failedBatches > 0) {
+      // Surfaced, not swallowed: the caller's `wanted` set still contains these tokens, so the
+      // next reconnect resubscribes them — but an operator must be able to see that the CURRENT
+      // socket is streaming less than it was asked for.
+      console.warn(
+        `[Dhan feed] ${failedBatches} subscription batch(es) failed to send on this socket; ` +
+          `the affected instruments are NOT streaming until the next resubscribe.`,
+      );
     }
   }
 

@@ -16,7 +16,10 @@
  *     previous generation do not make an instrument executable again;
  *   - a heartbeat gap / stale book / processing backlog degrades a READY machine to DEGRADED
  *     (exposure management continues, new entry stops) and recovers on fresh depth;
- *   - socket loss → DISCONNECTED; token rejection → AUTH_EXPIRED (terminal, no auto-recovery);
+ *   - socket loss → DISCONNECTED; token rejection → AUTH_EXPIRED (no recovery from any DATA event;
+ *     cleared ONLY by an explicit credential replacement via onSessionRestored);
+ *   - ages are computed in the machine's own MONOTONIC domain and published finished, with wall
+ *     stamps alongside for audit — so no caller can subtract a wall `now` from a monotonic stamp;
  *   - the four time facts (transport heartbeat, last received frame, last valid depth, per-leg
  *     book age) are kept DISTINCT — the machine never reads a heartbeat as a depth update;
  *   - DESIRED subscriptions are kept separate from CONFIRMED/OBSERVED readiness.
@@ -37,9 +40,15 @@ import {
 function makeMachine(instruments = [1, 2, 3, 4], opts = {}) {
   let now = opts.start ?? 1_000;
   const clock = { mono: () => now };
+  // Two INDEPENDENT clocks, deliberately far apart. `now` is a small monotonic counter and
+  // `nowWall` is a realistic epoch value, so any code that mixed the two domains would produce an
+  // age in the trillions and every age assertion in this file would fail loudly. That separation is
+  // the regression guard for the wall-minus-monotonic defect.
+  let wall = opts.startWall ?? 1_760_000_000_000;
   const machine = new MarketDataStateMachine({
     enabled: true,
     now: () => now,
+    nowWall: () => wall,
     heartbeatMaxAgeMs: opts.heartbeatMaxAgeMs ?? 5_000,
     bookMaxAgeMs: opts.bookMaxAgeMs ?? 10_000,
   });
@@ -48,8 +57,10 @@ function makeMachine(instruments = [1, 2, 3, 4], opts = {}) {
     machine,
     advance: (ms) => {
       now += ms;
+      wall += ms;
     },
     at: () => now,
+    atWall: () => wall,
     clock,
   };
 }
@@ -285,11 +296,98 @@ test("the four time facts are distinct: a heartbeat is not a depth update", () =
   machine.evaluate();
   assert.equal(machine.state(), "DEGRADED", "a heartbeat must not stand in for a depth update");
 
+  // The machine now publishes finished AGES (computed in its own monotonic domain) plus wall
+  // stamps for audit, instead of raw monotonic timestamps a caller could subtract a wall `now`
+  // from. Assert the ages directly: it is a stronger check than "is a number", because it pins
+  // the RELATIONSHIP the four-time-facts rule is about.
   const diag = machine.diagnostics();
-  assert.equal(typeof diag.lastHeartbeatAt, "number");
-  assert.equal(typeof diag.lastFrameAt, "number");
-  assert.equal(typeof diag.lastDepthAt, "number");
-  assert.ok(diag.lastHeartbeatAt >= diag.lastDepthAt, "heartbeat clock advanced past the depth clock");
+  assert.equal(typeof diag.heartbeatAgeMs, "number");
+  assert.equal(typeof diag.frameAgeMs, "number");
+  assert.equal(typeof diag.depthAgeMs, "number");
+  assert.equal(diag.heartbeatAgeMs, 0, "the heartbeat just arrived");
+  assert.equal(diag.frameAgeMs, 0, "a heartbeat IS an inbound frame");
+  assert.equal(
+    diag.depthAgeMs,
+    3_000,
+    "the DEPTH clock did not move: heartbeats must never refresh a book's freshness",
+  );
+  assert.ok(
+    diag.depthAgeMs > diag.heartbeatAgeMs,
+    "the book is older than the transport — which is exactly why the state is DEGRADED",
+  );
+  // Wall stamps travel alongside for display, and are never the basis of an age.
+  assert.equal(typeof diag.lastHeartbeatWallAt, "number");
+  assert.equal(typeof diag.lastDepthWallAt, "number");
+  // Evidence counters separate "connected" from "delivering".
+  assert.equal(diag.depthObservations, 1, "exactly one usable book was ever observed");
+  assert.equal(diag.heartbeats, 2);
+});
+
+test("a heartbeat can never CREATE readiness: an open, heart-beating socket with no depth is not READY", () => {
+  // The converse of the test above, and the case the dashboard was getting wrong: a socket that is
+  // open and alive but has delivered no book at all must not be reported as executable.
+  const { machine } = makeMachine([1, 2], { heartbeatMaxAgeMs: 10_000, bookMaxAgeMs: 2_000 });
+  machine.onConnecting();
+  machine.onSocketOpen();
+  machine.onAuthenticated();
+  machine.onSubscriptionsConfirmed([1, 2]);
+
+  for (let i = 0; i < 50; i++) machine.onHeartbeat();
+
+  assert.equal(
+    machine.state(),
+    "SYNCHRONIZING",
+    "fifty heartbeats prove the transport is alive and prove nothing about any book",
+  );
+  assert.equal(machine.permissions().newEntry, false, "and they must not license new entry");
+  const diag = machine.diagnostics();
+  assert.equal(diag.depthAgeMs, null, "never observed stays NULL — never a fresh-looking 0");
+  assert.equal(diag.lastDepthWallAt, null);
+  assert.equal(diag.depthObservations, 0);
+  assert.equal(diag.transportLive, true, "the transport genuinely IS live");
+  assert.equal(diag.readyInstruments, 0);
+});
+
+test("a REPLACEMENT credential is the only thing that clears AUTH_EXPIRED", () => {
+  // Before this, AUTH_EXPIRED survived a successful re-login for the life of the process: every
+  // path back out of it early-returned on AUTH_EXPIRED, so the feed recovered but the machine that
+  // gates entry did not — and that blocker's scope is `both`, so it also reported exposure
+  // management as blocked.
+  const { machine } = makeMachine([1]);
+  machine.onConnecting();
+  machine.onSocketOpen();
+  machine.onAuthenticated();
+  machine.onUsableDepth(1);
+  assert.equal(machine.state(), "READY");
+  const generationWhenLive = machine.generation();
+
+  machine.onSessionLost();
+  assert.equal(machine.state(), "AUTH_EXPIRED");
+
+  // No DATA event may revive it — a tick on a socket the broker already rejected proves nothing.
+  machine.onFrame();
+  machine.onHeartbeat();
+  machine.onUsableDepth(1);
+  machine.onSocketOpen();
+  machine.onAuthenticated();
+  assert.equal(machine.state(), "AUTH_EXPIRED", "data cannot vouch for a rejected credential");
+  assert.equal(machine.generation(), generationWhenLive, "and cannot advance the generation");
+
+  // A replacement credential can, because it comes from the AUTH path.
+  machine.onSessionRestored();
+  assert.equal(machine.state(), "DISCONNECTED", "restored, but NOT optimistically ready");
+  assert.equal(machine.permissions().newEntry, false);
+  const diag = machine.diagnostics();
+  assert.equal(diag.depthAgeMs, null, "books from the dead session are not evidence for the new one");
+  assert.equal(diag.frameAgeMs, null);
+
+  // And it still has to earn READY the normal way.
+  machine.onSocketOpen();
+  machine.onAuthenticated();
+  assert.equal(machine.state(), "SYNCHRONIZING");
+  assert.ok(machine.generation() > generationWhenLive, "the new session is a new generation");
+  machine.onUsableDepth(1);
+  assert.equal(machine.state(), "READY");
 });
 
 test("DISABLED permits nothing and ignores lifecycle events", () => {

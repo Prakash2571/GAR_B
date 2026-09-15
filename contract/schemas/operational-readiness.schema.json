@@ -14,6 +14,7 @@
     "market_data",
     "order_stream",
     "fill_observation",
+    "paper_execution",
     "evidence",
     "reconciliation",
     "entry",
@@ -89,7 +90,16 @@
         "desired_instruments",
         "ready_instruments",
         "backlog",
-        "usable_for_entry"
+        "usable_for_entry",
+        "source",
+        "socket_connected",
+        "authenticated",
+        "subscriptions_requested",
+        "usable_books",
+        "ticks_observed",
+        "frames_observed",
+        "heartbeats_observed",
+        "depth_observations"
       ],
       "properties": {
         "state": {
@@ -116,6 +126,42 @@
         "usable_for_entry": {
           "type": "boolean",
           "description": "True ONLY in READY: fresh usable depth per traded instrument in the current generation."
+        },
+        "source": {
+          "enum": ["broker_websocket", "rest_snapshot_fallback", "none"],
+          "description": "WHERE the quotes come from. broker_websocket is the only value that may be presented as executable streaming depth, and even then only when ticks_observed is true. rest_snapshot_fallback is the documented indicative/last-close REST view and is NOT equivalent: it must be labelled as fallback, never as executable depth. none means neither is available."
+        },
+        "socket_connected": {
+          "type": "boolean",
+          "description": "RAW TRANSPORT FACT: is the quote socket open right now. Deliberately separate from state/usable_for_entry, because an open socket that has delivered no book is connected and NOT usable — a distinction a single status field cannot express, and whose absence let an open socket be read as readiness."
+        },
+        "authenticated": {
+          "type": "boolean",
+          "description": "RAW TRANSPORT FACT: the broker session behind the feed reports itself authenticated. Not readiness."
+        },
+        "subscriptions_requested": {
+          "type": "boolean",
+          "description": "Whether a non-empty subscription set has been REQUESTED for the current generation. Deliberately not 'confirmed': Zerodha sends no subscription acknowledgement, so confirmation would be an assumption. Confirmation is evidenced by depth actually arriving (see depth_observations)."
+        },
+        "usable_books": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Instruments holding a currently usable executable book (two-sided depth in the current generation)."
+        },
+        "ticks_observed": {
+          "type": "boolean",
+          "description": "Whether ANY frame has been received in the current generation. THIS is the field that licenses a 'real broker WebSocket quotes' claim in the UI. An open socket alone must never produce it."
+        },
+        "frames_observed": { "type": "integer", "minimum": 0 },
+        "heartbeats_observed": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Transport keep-alives seen. Proves the socket is alive and proves NOTHING about any book's freshness — a heartbeat can never warm an instrument or refresh a depth timestamp."
+        },
+        "depth_observations": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Usable two-sided book observations in the current generation. frames_observed > 0 with depth_observations === 0 is a real, nameable state: the socket is alive but delivering no executable depth."
         }
       }
     },
@@ -157,7 +203,10 @@
           ],
           "description": "The same fact as published in order_stream.brokers[].health.state, DERIVED from the lifecycle above so the two cannot disagree."
         },
-        "wiring": { "enum": ["not_built", "not_wired", "gated_off", "armed"] },
+        "wiring": {
+          "enum": ["not_built", "not_wired", "gated_off", "armed", "not_applicable_paper"],
+          "description": "not_applicable_paper: this deployment SIMULATES execution, so no order is sent to the broker and the broker has no order to report on. A paper process constructs no order-stream consumer BY DESIGN (building one implies a live order manager). This is the expected configuration, NOT a fault, and must never render as not_wired — whose meaning is 'this should be running and is not'."
+        },
         "gate_enabled": { "type": "boolean" },
         "connected": { "type": "boolean" },
         "authorised": { "type": "boolean" },
@@ -170,7 +219,10 @@
       "required": ["mechanism", "stream_assisted", "detail"],
       "description": "The mechanism ACTUALLY responsible for observing a fill right now.",
       "properties": {
-        "mechanism": { "enum": ["rest_polling_only", "stream_primary_rest_reconcile"] },
+        "mechanism": {
+          "enum": ["rest_polling_only", "stream_primary_rest_reconcile", "simulated_paper_fills"],
+          "description": "simulated_paper_fills: fills are produced by the LOCAL execution simulator against real streamed quotes. A broker cannot emit an order-update event for an order it never received, so reporting paper fills as rest_polling_only was not a conservative understatement but false — it implied a broker round trip and a confirmation that do not exist."
+        },
         "stream_assisted": { "type": "boolean" },
         "detail": { "type": "string" }
       }
@@ -182,14 +234,55 @@
         "market_data_frame_age_ms",
         "market_data_heartbeat_age_ms",
         "market_data_depth_age_ms",
-        "order_stream_event_age_ms"
+        "order_stream_event_age_ms",
+        "market_data_last_frame_at",
+        "market_data_last_depth_at",
+        "market_data_age_clock"
       ],
       "description": "How old the evidence behind this decision is. NULL means NEVER OBSERVED — it must never render as a fresh 0. The four time facts are kept distinct: a heartbeat is not a depth update.",
       "properties": {
         "market_data_frame_age_ms": { "type": ["integer", "null"], "minimum": 0 },
         "market_data_heartbeat_age_ms": { "type": ["integer", "null"], "minimum": 0 },
         "market_data_depth_age_ms": { "type": ["integer", "null"], "minimum": 0 },
-        "order_stream_event_age_ms": { "type": ["integer", "null"], "minimum": 0 }
+        "order_stream_event_age_ms": { "type": ["integer", "null"], "minimum": 0 },
+        "market_data_last_frame_at": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "WALL-CLOCK (epoch ms) stamp of the last frame, for audit and display only. NEVER the basis of an age — see market_data_age_clock."
+        },
+        "market_data_last_depth_at": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "WALL-CLOCK (epoch ms) stamp of the last usable depth observation, for audit and display only."
+        },
+        "market_data_age_clock": {
+          "const": "monotonic",
+          "description": "Which clock produced the market-data ages above, published so a reader can VERIFY the domains were not mixed rather than trust that they were not. The defect this documents: the engine stamped frame/depth/heartbeat times with executionClock.mono() but the builder subtracted executionClock.wall() as `now`, yielding ages of ~1.7e12 ms (about 55 years). Always positive, so the zero floor could not reveal it, and a dashboard could only render it as garbage or as 'never observed' — which is exactly the reported 'last frame never observed' while ticks were arriving normally."
+        }
+      }
+    },
+    "paper_execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["simulated", "profile", "using_streamed_quotes", "detail"],
+      "description": "HOW EXECUTION IS ACTUALLY PERFORMED, published separately from any broker order stream and present in EVERY payload so a reader never has to decide whether an order-stream field applies. When simulated is true, fills come from the local simulator and no broker confirmation exists or is possible — a normal, healthy state, not a degraded one.",
+      "properties": {
+        "simulated": {
+          "type": "boolean",
+          "description": "True in every paper mode. The process contains no object capable of placing a real order."
+        },
+        "profile": {
+          "type": ["string", "null"],
+          "description": "The paper profile in force (e.g. paper_latency), or null under live."
+        },
+        "using_streamed_quotes": {
+          "type": "boolean",
+          "description": "Whether the simulator is currently pricing against REAL streamed depth. True only when depth has actually been observed in the current generation — never inferred from an open socket."
+        },
+        "detail": {
+          "type": "string",
+          "description": "Plain language, safe to display verbatim. Says 'Real broker WebSocket quotes · simulated execution' ONLY when tick evidence supports it, and says so explicitly when it does not."
+        }
       }
     },
     "reconciliation": {

@@ -218,6 +218,14 @@ const brokerManager = new ActiveBrokerManager({
   // A market-data session/token rejection on the box lane drives the health machine to
   // AUTH_EXPIRED (no fast-forever reconnect on a known-invalid token), distinct from a drop.
   onBoxLaneSessionLost: (reason) => boxModule.engine.onMarketDataSessionLost(reason),
+  // TRANSPORT HEARTBEAT (keep-alive / non-tick frame). Deliberately NOT routed through
+  // `noteTick()` or the quote store: it proves a live route to the broker and nothing about any
+  // instrument's book, so it must not be able to warm an instrument or refresh a depth timestamp.
+  onBoxLaneHeartbeat: () => boxModule.engine.onBoxLaneHeartbeat(),
+  // A RECONNECTABLE fault (network blip / TLS / DNS). Recorded for diagnosis and explicitly NOT
+  // escalated to a session loss: the feed already scheduled a reconnect, and treating a blip as
+  // token death is what used to strand the lane in a terminal AUTH_EXPIRED state.
+  onBoxLaneTransportFault: (reason) => boxModule.engine.onBoxLaneTransportFault(reason),
   // Kite order postbacks ride the box lane's quote socket as TEXT frames (no dedicated Zerodha
   // order socket exists). Forward them to the engine's order-stream consumer.
   onBoxLaneOrderText: (raw) => boxModule.engine.ingestBoxLaneOrderText(raw),
@@ -421,6 +429,12 @@ brokerManager.attach(
     clearInstrumentReservations: () => boxModule.engine.clearInstrumentReservations(),
     reloadUniverse: () => boxModule.engine.reloadUniverse(),
     publish: () => boxModule.engine.publishNow(),
+    // A REPLACEMENT credential was installed (re-login / token refresh / broker switch). This is
+    // the ONLY thing allowed to clear the terminal AUTH_EXPIRED market-data verdict — a tick
+    // cannot, because a tick on a socket the broker already rejected proves nothing about the
+    // credential. Without it, one expiry stranded the health machine as "session expired" for the
+    // life of the process even after a successful sign-in.
+    marketDataSessionRestored: (reason) => boxModule.engine.onMarketDataSessionRestored(reason),
   },
 );
 

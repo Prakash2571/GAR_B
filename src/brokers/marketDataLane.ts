@@ -66,6 +66,17 @@ export interface LaneFeedStats {
   wantedTokens: number;
   ticksPerSecond: number;
   lastTickAgeMs: number | null;
+  /**
+   * Age of the last TRANSPORT HEARTBEAT (keep-alive), or null when none was ever seen.
+   *
+   * Reported separately from `lastTickAgeMs` because the two answer different questions. A lane
+   * with a stale `lastTickAgeMs` but a fresh heartbeat is ALIVE and merely quiet — the instruments
+   * are not trading. A lane where both are stale is genuinely dead. Collapsing them is how a quiet
+   * feed gets misdiagnosed as a broken one (and vice versa, which is worse).
+   *
+   * Optional so a producer that observes no keep-alive is not forced to invent one.
+   */
+  lastHeartbeatAgeMs?: number | null;
   reconnects: number;
   /** The broker generation this lane's socket was opened under. */
   generation: number;
