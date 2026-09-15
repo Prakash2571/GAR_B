@@ -34,11 +34,23 @@
  * resending a captured URL — finds nothing and is refused. A token exchange is a state
  * change and must happen at most once per initiation.
  *
+ * CONCURRENT LOGINS ARE SUPPORTED, AND THAT IS THE POINT
+ * Entries are keyed by NONCE, not by broker, so several operators (or several browsers) can
+ * have a sign-in to the SAME broker in flight at once and each one completes on its own
+ * nonce. This used to be one entry per broker, and the consequence was a genuine defect: two
+ * people clicking "Connect Zerodha" within ten minutes of each other meant the second start
+ * silently destroyed the first, and the first operator's redirect came back to
+ * `state_mismatch` — an error that reads like tampering and was really just a colleague.
+ *
+ * The site is a shared console: anyone with the passcode is a legitimate operator, and the
+ * broker session they establish is shared process state. Two of them signing in at the same
+ * time is ordinary, not an anomaly to be refused.
+ *
  * BOUNDED BY CONSTRUCTION
- * At most ONE pending login per broker (a new start supersedes the previous one), so the
- * map holds at most two entries and no eviction policy or unbounded growth is possible.
- * Starting a second login for the same broker deliberately invalidates the first: the
- * operator's most recent intent is the real one.
+ * At most {@link MAX_PENDING_PER_BROKER} live entries per broker, oldest evicted first, and
+ * lapsed entries are pruned on every read and write. So the map is hard-bounded at
+ * `MAX_PENDING_PER_BROKER * 2` regardless of traffic — and only an AUTHENTICATED operator can
+ * create one at all, since `login/start` sits behind `requireOperator`.
  *
  * NO SECRETS LIVE HERE
  * The nonce is not a credential — it proves initiation, nothing more. No access token, no
@@ -99,8 +111,22 @@ export function nonceMatches(presented: string, expected: string): boolean {
   return timingSafeEqual(Buffer.from(presented, "utf8"), Buffer.from(expected, "utf8"));
 }
 
+/**
+ * How many sign-ins to the SAME broker may be in flight at once.
+ *
+ * Generous enough that a small team never collides, small enough that the store stays
+ * trivially bounded. When the cap is reached the OLDEST entry is evicted, because the
+ * newest intent is the one most likely still being acted on.
+ */
+export const MAX_PENDING_PER_BROKER = 8;
+
 export class PendingLoginStore {
-  private readonly entries = new Map<BrokerId, PendingLogin>();
+  /**
+   * Keyed by NONCE so several logins to the same broker can coexist. The broker is a field
+   * on the entry rather than the key, and every lookup filters on it — a nonce minted for
+   * one broker can therefore never claim a login for the other.
+   */
+  private readonly entries = new Map<string, PendingLogin>();
   private readonly ttlMs: number;
   private readonly now: () => number;
   private readonly mint: () => string;
@@ -111,11 +137,23 @@ export class PendingLoginStore {
     this.mint = opts.mintNonce ?? mintLoginNonce;
   }
 
+  /** Live (unexpired) entries for one broker, oldest first. Prunes lapsed ones as it goes. */
+  private liveFor(broker: BrokerId): PendingLogin[] {
+    const now = this.now();
+    const live: PendingLogin[] = [];
+    for (const entry of [...this.entries.values()]) {
+      if (entry.broker !== broker) continue;
+      if (now > entry.expiresAtMs) this.entries.delete(entry.nonce);
+      else live.push(entry);
+    }
+    return live;
+  }
+
   /**
    * Record that an authenticated operator has started a login for `broker`.
    *
-   * Supersedes any previous pending login for that broker. Returns the entry so the
-   * caller can put the nonce into the consent URL.
+   * Does NOT disturb another in-flight login for the same broker — see the header. Returns
+   * the entry so the caller can put the nonce into the consent URL.
    */
   start(broker: BrokerId, opts: { startedBy: string; consentId?: string | null }): PendingLogin {
     const startedAtMs = this.now();
@@ -127,7 +165,16 @@ export class PendingLoginStore {
       startedAtMs,
       expiresAtMs: startedAtMs + this.ttlMs,
     };
-    this.entries.set(broker, pending);
+
+    // Prune lapsed entries first, so a quiet period never counts against the cap.
+    const live = this.liveFor(broker);
+    // Evict oldest-first until there is room for this one.
+    for (let i = 0; i <= live.length - MAX_PENDING_PER_BROKER; i += 1) {
+      const oldest = live[i];
+      if (oldest) this.entries.delete(oldest.nonce);
+    }
+
+    this.entries.set(pending.nonce, pending);
     return pending;
   }
 
@@ -144,15 +191,13 @@ export class PendingLoginStore {
     presentedNonce: string | null,
     opts: { requireNonce: boolean },
   ): ConsumeResult {
-    const pending = this.entries.get(broker);
-    if (!pending) return { ok: false, reason: "no_pending_login" };
-
-    if (this.now() > pending.expiresAtMs) {
-      // Lapsed: remove it. It could never be claimed again anyway, and keeping it would
-      // only let a later caller receive `login_expired` instead of the truthful
-      // `no_pending_login`.
-      this.entries.delete(broker);
-      return { ok: false, reason: "login_expired" };
+    // Were there ANY entries for this broker, live or lapsed? Distinguishing that from "none
+    // at all" is what lets an operator be told their attempt EXPIRED rather than that it
+    // never happened.
+    const existedAtAll = [...this.entries.values()].some((e) => e.broker === broker);
+    const live = this.liveFor(broker); // also prunes the lapsed ones
+    if (live.length === 0) {
+      return { ok: false, reason: existedAtAll ? "login_expired" : "no_pending_login" };
     }
 
     if (opts.requireNonce) {
@@ -171,20 +216,33 @@ export class PendingLoginStore {
        * TTL. Single-use still holds where it matters, because a MATCHED claim is spent below.
        */
       if (!presentedNonce) return { ok: false, reason: "state_missing" };
-      if (!nonceMatches(presentedNonce, pending.nonce)) {
-        return { ok: false, reason: "state_mismatch" };
-      }
+      // Matched against EVERY live entry for this broker, so one operator's redirect is
+      // never refused because a colleague started a sign-in in the meantime. Each candidate
+      // is compared in constant time; a nonce belonging to the other broker cannot match
+      // because `live` is already filtered by broker.
+      const matched = live.find((entry) => nonceMatches(presentedNonce, entry.nonce));
+      if (!matched) return { ok: false, reason: "state_mismatch" };
+      this.entries.delete(matched.nonce);
+      return { ok: true, pending: matched };
     }
 
-    // Proof accepted (or not required for this broker): spend the initiation now, so a
-    // replayed callback — Back, a broker retry, a captured URL — finds nothing.
-    this.entries.delete(broker);
-    return { ok: true, pending };
+    /**
+     * DHAN: no nonce comes back, so the entries are indistinguishable and ANY live one
+     * authorises this exchange. The most recent is chosen — with concurrent sign-ins the
+     * latest intent is the one most likely being completed right now — and only that one is
+     * spent, so a colleague's parallel attempt survives.
+     */
+    const chosen = live[live.length - 1];
+    if (!chosen) return { ok: false, reason: "no_pending_login" };
+    this.entries.delete(chosen.nonce);
+    return { ok: true, pending: chosen };
   }
 
-  /** Drop a broker's pending login without claiming it (e.g. an explicit logout). */
+  /** Drop ALL of a broker's pending logins without claiming them (e.g. an explicit logout). */
   clear(broker: BrokerId): void {
-    this.entries.delete(broker);
+    for (const entry of [...this.entries.values()]) {
+      if (entry.broker === broker) this.entries.delete(entry.nonce);
+    }
   }
 
   /**
@@ -194,13 +252,7 @@ export class PendingLoginStore {
    * to finish" instead of leaving the operator staring at an unchanged card.
    */
   isPending(broker: BrokerId): boolean {
-    const pending = this.entries.get(broker);
-    if (!pending) return false;
-    if (this.now() > pending.expiresAtMs) {
-      // Expired entries are swept lazily on read; nothing else can claim them anyway.
-      this.entries.delete(broker);
-      return false;
-    }
-    return true;
+    // Lapsed entries are swept lazily on read; nothing could claim them anyway.
+    return this.liveFor(broker).length > 0;
   }
 }
