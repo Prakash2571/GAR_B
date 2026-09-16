@@ -875,7 +875,13 @@ export class KiteBrokerAdapter implements BrokerAdapter {
       if (error instanceof BrokerPreSubmitRefusedError) throw error;
       // Withdraw it if it is STILL QUEUED. A true return proves no request was transmitted.
       if (submission.abandon("The cancellation deadline expired.") || error instanceof TransportRequestAbandonedError) {
-        throw new BrokerCancelNotTransmittedError(clientOrderId, brokerOrderId);
+        throw new BrokerCancelNotTransmittedError(
+          clientOrderId,
+          brokerOrderId,
+          // The LATEST accepted snapshot, not the pre-cancel one: a fill observed while the
+          // cancellation sat queued is real exposure and must travel with the refusal.
+          clone(this.orders.get(clientOrderId) ?? priorOrder),
+        );
       }
       this.quarantine(clientOrderId, priorOrder);
       throw error;
