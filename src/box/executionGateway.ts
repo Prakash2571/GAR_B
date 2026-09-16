@@ -1,6 +1,8 @@
 import type { BrokerOrder, BrokerOrderRequest } from "./brokerAdapter.js";
 import {
   BrokerAmbiguousSubmitError,
+  BrokerCancelNotTransmittedError,
+  BrokerCancelUnresolvedError,
   BrokerOrderRejectedError,
   BrokerPreSubmitRefusedError,
   boxClientOrderId,
@@ -640,6 +642,20 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     const orders = canonicalRoleOrder(ordersFromSettled(settled));
     const uncertain = settled.some((item) => item.status === "rejected" &&
       (item.reason instanceof OrderPersistenceAfterFillError ||
+        /*
+         * DECIDED BY TYPE, NOT BY THE WORDS IN A MESSAGE.
+         *
+         * This was a regex over `error.message` alone. A cancellation withdrawn while still queued means
+         * the ENTRY LEG IS STILL WORKING AT THE BROKER, but `BrokerCancelNotTransmittedError`'s message
+         * contains none of "unknown", "ambiguous" or "reconcil" — so `uncertain` came out FALSE,
+         * `entryLegOutcomes` reported the leg as never submitted, and `planPartialEntryRecovery` unwound
+         * the siblings' CONFIRMED FILLS against a live leg. The regex remains as a backstop for untyped
+         * errors, but a type whose entire contract is "the outcome is not proven" must never depend on
+         * its prose to be recognised.
+         */
+        item.reason instanceof BrokerCancelNotTransmittedError ||
+        item.reason instanceof BrokerCancelUnresolvedError ||
+        item.reason instanceof BrokerAmbiguousSubmitError ||
         /unknown|ambiguous|reconcil/i.test(errorMessage(item.reason)))) ||
       orders.some((order) => order.state === "UNKNOWN" || order.state === "RECONCILIATION_REQUIRED");
     if (uncertain) {

@@ -880,6 +880,9 @@ export class TransportPacer {
     this.refuseExpiredQueueEntries();
     const next = this.pickNext();
     if (!next) return false;
+    // Attributes any fault raised below to THIS entry, so containment can scope to it rather than
+    // failing the whole queue. Cleared on every exit path from this method.
+    this.faultingEntry = next;
 
     const now = this.clock.now();
     const classWait = pacingWaitMs({
@@ -937,11 +940,11 @@ export class TransportPacer {
        * "PROVEN nothing was transmitted" — and then be dispatched anyway on the fall-through below,
        * charging its budget, stamping the watermarks and putting the DELETE on the wire.
        */
-      if (next.state !== "queued") return true;
+      if (next.state !== "queued") { this.faultingEntry = null; return true; }
 
       // The clock advanced: re-evaluate from scratch. The remaining wait may be shorter, or
       // something more urgent may have arrived.
-      if (served > 0) return true;
+      if (served > 0) { this.faultingEntry = null; return true; }
       /*
        * A BACKWARD STEP IS NOT A FROZEN CLOCK, AND MUST NOT BE A FREE PASS.
        *
@@ -957,6 +960,7 @@ export class TransportPacer {
        */
       if (served < 0) {
         this.backwardClockSteps++;
+        this.faultingEntry = null;
         return true;
       }
       // A clock that does not advance across a wait cannot express pacing at all (several suites
@@ -989,7 +993,7 @@ export class TransportPacer {
       error: new TransportRequestAbandonedError(
         `This request's own deadline or clock faulted (${error instanceof Error ? error.message : String(error)}); nothing was transmitted.`,
         entry.klass,
-        Math.max(0, this.clock.now() - entry.enqueuedAt),
+        0,
       ),
     });
   }
