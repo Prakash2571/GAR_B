@@ -123,8 +123,34 @@ export interface BrokerOrder {
   execution_evidence?: ExecutionEvidenceQuality;
   reject_family: BrokerRejectFamily | null;
   reject_reason: string | null;
+  /**
+   * OUR clock when this order was first observed. Local, monotonic-ish, comparable with our own times.
+   */
   created_at: number;
+  /**
+   * OUR clock when this snapshot was accepted. Local — NEVER the broker's own stamp.
+   *
+   * THE MIXED-CLOCK DEFECT THIS FIXES. `updated_at` used to be set from the broker's
+   * `exchange_update_timestamp` when one was present and from our clock when it was not, so a SINGLE
+   * FIELD carried two different clocks depending on the payload. `executionGateway.liveRecord` then
+   * subtracted a LOCAL `detectedAt` from it to produce `decision_to_first_fill_ms` and friends, which
+   * made those figures wrong by the host-to-exchange offset — and made `first_to_last_fill_ms`
+   * subtract two values from different clocks, so it could come out NEGATIVE. Those are precisely the
+   * numbers an operator would use to judge legging exposure, so they have to be internally consistent.
+   *
+   * The broker's own claim is preserved separately in {@link exchange_updated_at}. Nothing is lost;
+   * the two are simply no longer conflated.
+   */
   updated_at: number;
+  /**
+   * The EXCHANGE's own stamp for this update, or null when the broker published none.
+   *
+   * Second-resolution IST wall clock (see `brokerTimestamps.ts`). Useful for reconciling against the
+   * broker's records and for exchange-relative spans, and NOT comparable with our local clock: the
+   * host-to-exchange offset is unknown and the resolution is whole seconds. Kept separate so that a
+   * caller has to choose deliberately which clock it is reasoning in.
+   */
+  exchange_updated_at?: number | null;
 }
 
 export interface BrokerPosition {

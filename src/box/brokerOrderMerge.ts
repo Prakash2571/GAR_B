@@ -309,6 +309,18 @@ export function mergeBrokerOrderSnapshot(
     // Never let the observation clock run backwards for this identity.
     updated_at: Math.max(current.updated_at, candidate.updated_at),
   };
+  /*
+   * THE EXCHANGE STAMP IS CARRIED, ON ITS OWN AXIS.
+   *
+   * Merged with `Math.max` like `updated_at` but SEPARATELY, because the two are different clocks and
+   * taking the max across them would silently reintroduce exactly the conflation this field exists to
+   * remove. A candidate that published no exchange stamp must not erase one we already had — absent is
+   * not "earlier".
+   */
+  const exchangeStamps = [current.exchange_updated_at, candidate.exchange_updated_at]
+    .filter((value): value is number => typeof value === "number" && Number.isFinite(value));
+  if (exchangeStamps.length > 0) merged.exchange_updated_at = Math.max(...exchangeStamps);
+
   if (evidence !== undefined) merged.execution_evidence = evidence;
   else if (current.execution_evidence !== undefined) merged.execution_evidence = current.execution_evidence;
 

@@ -1843,7 +1843,9 @@ function normalizeKiteOrder(raw: KiteTransportOrder, known: BrokerOrder | undefi
     fills: [],
     reject_family: null,
     reject_reason: null,
-    created_at: parseTime(raw.order_timestamp) ?? now,
+    // OUR clock. `order_timestamp` is the broker's IST wall clock and belongs on the exchange axis,
+    // not on the axis we measure our own latency against.
+    created_at: now,
     updated_at: now,
   };
   return {
@@ -1862,12 +1864,17 @@ function normalizeKiteOrder(raw: KiteTransportOrder, known: BrokerOrder | undefi
       quantity: filled,
       // NULL, never zero: an unpublished average price is absent data, not a free execution.
       price: verdict.averagePrice,
-      at: parseTime(raw.exchange_update_timestamp) ?? now,
+      // The fill's RECEIPT time on our clock. The exchange's own stamp for the same event is on the
+      // order as `exchange_updated_at`; mixing the two is what made the latency fields unsound.
+      at: now,
     }] : [],
     execution_evidence: verdict.quality,
     reject_family: state === "REJECTED" ? classifyKiteReject(raw.status_message ?? raw.status) : null,
     reject_reason: state === "REJECTED" ? raw.status_message ?? raw.status : verdict.detail,
-    updated_at: parseTime(raw.exchange_update_timestamp) ?? now,
+    // OUR clock, always. The broker's own stamp is carried separately below so the two clocks can
+    // never be subtracted from one another by accident.
+    updated_at: now,
+    exchange_updated_at: parseTime(raw.exchange_update_timestamp),
   };
 }
 

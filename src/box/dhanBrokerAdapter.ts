@@ -1254,7 +1254,7 @@ export class DhanBrokerAdapter implements BrokerAdapter {
               quantity: numberOr(t.tradedQuantity, 0),
               // An unpublished trade price is NULL, never zero. Zero would be fabricated P&L.
               price: tradePrice.value,
-              at: parseDhanTime(t.exchangeTime ?? t.updateTime ?? t.createTime, now),
+              at: now,
             };
           })
         // No trade-book detail: synthesize ONE aggregate fill so exposure is still exact, matching
@@ -1265,7 +1265,7 @@ export class DhanBrokerAdapter implements BrokerAdapter {
               fill_id: `dhan:${remote.orderId}:${filled}:${verdict.averagePrice ?? "unpriced"}`,
               quantity: filled,
               price: verdict.averagePrice,
-              at: parseDhanTime(remote.exchangeTime ?? remote.updateTime, now),
+              at: now,
             }]
           : [],
       execution_evidence: verdict.quality,
@@ -1275,8 +1275,10 @@ export class DhanBrokerAdapter implements BrokerAdapter {
       reject_reason: rejected
         ? remote.omsErrorDescription ?? remote.omsErrorCode ?? "Dhan rejected the order."
         : verdict.detail,
-      created_at: parseDhanTime(remote.createTime, now),
-      updated_at: parseDhanTime(remote.updateTime ?? remote.exchangeTime, now),
+      created_at: now,
+      // OUR clock, always -- see BrokerOrder.updated_at. Dhan's own stamp is kept beside it.
+    updated_at: now,
+    exchange_updated_at: parseIstBrokerTimestamp(remote.exchangeTime ?? remote.updateTime),
     };
   }
 
@@ -1582,8 +1584,9 @@ function orphanOrder(order: DhanOrder): BrokerOrder {
     execution_evidence: verdict.quality,
     reject_family: null,
     reject_reason: verdict.detail,
-    created_at: parseDhanTime(order.createTime, now),
-    updated_at: parseDhanTime(order.updateTime, now),
+    created_at: now,
+    updated_at: now,
+    exchange_updated_at: parseIstBrokerTimestamp(order.updateTime),
   };
 }
 
