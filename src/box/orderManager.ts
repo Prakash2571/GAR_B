@@ -2888,14 +2888,44 @@ export class BoxOrderManager {
           return;
         }
         if (error instanceof BrokerAmbiguousSubmitError || isTimeoutLike(error) || !(error instanceof BrokerOrderRejectedError)) {
-          if (error instanceof BrokerAmbiguousSubmitError && error.order) {
-            await this.persistOrder(intent, error.order, error.message);
-          } else {
-            await this.transition(
-              intent,
-              "RECONCILIATION_REQUIRED",
-              null,
-              errorMessage(error),
+          /*
+           * FAILING TO RECORD THE UNCERTAINTY DOES NOT MAKE IT GO AWAY.
+           *
+           * THE BLOCKER THIS CLOSES. These writes can throw — "connection terminated unexpectedly" is
+           * the ordinary case — and the throw used to escape to the outer catch, which rejected the
+           * action with the DATABASE error. That replaced the typed `BrokerAmbiguousSubmitError` with a
+           * generic one, and the gateway then did not recognise the leg as uncertain: it treated a SELL
+           * whose broker outcome was UNKNOWN as one that was never submitted, and partial-entry recovery
+           * bought back the confirmed short and sold BOTH BUY hedges — including the hedge protecting
+           * the unresolved SELL. If that SELL later fills, its protection has already been sold.
+           *
+           * Reproduced end-to-end as `PARTIAL_ENTRY_UNWOUND` with an empty `residual_exposure` and no
+           * invariant violation, while the adapter still held the SELL as RECONCILIATION_REQUIRED.
+           *
+           * So: the durable write is attempted, its failure is recorded as a persistence fault, and the
+           * ORIGINAL typed error is what the caller receives either way. A broker submission that may
+           * exist must keep saying so even when we cannot write it down.
+           */
+          try {
+            if (error instanceof BrokerAmbiguousSubmitError && error.order) {
+              await this.persistOrder(intent, error.order, error.message);
+            } else {
+              await this.transition(
+                intent,
+                "RECONCILIATION_REQUIRED",
+                null,
+                errorMessage(error),
+              );
+            }
+          } catch (recordFailure) {
+            // The row may now disagree with the broker, which is exactly what crash recovery is for.
+            this.health.persistence = "unhealthy";
+            this.noteFailure("broker uncertainty could not be recorded durably");
+            this.crashOnlyAttributedExposure = true;
+            console.error(
+              `[BoxOrderManager] could not durably record broker uncertainty for ` +
+                `${intent.client_order_id}: ${errorMessage(recordFailure)}. The original broker ` +
+                `outcome is UNKNOWN and is being reported as such.`,
             );
           }
           this.unknownOrders++;

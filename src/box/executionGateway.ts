@@ -640,7 +640,23 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     );
     // Canonical role order for OUTPUT/accounting; the POSTs above were hedge-first.
     const orders = canonicalRoleOrder(ordersFromSettled(settled));
-    const uncertain = settled.some((item) => item.status === "rejected" &&
+    /*
+     * AN ABSENT RESULT MEANS "NEVER SUBMITTED" ONLY WITH EXPLICIT PROOF.
+     *
+     * Uncertainty used to be recognised by listing the ways it can look — a type here, some words in a
+     * message there — so anything unrecognised defaulted to "certain, nothing happened", and recovery
+     * then unwound hedges protecting an order that might exist. That default is the wrong way round.
+     *
+     * These two types are the ONLY proof that no exposure was created: a local pre-submit refusal
+     * (thrown before the HTTP request, so provably no POST) and a definitive broker rejection (the
+     * broker itself said the order does not exist). Every other rejection — a transport fault, a
+     * database failure while recording, an error type nobody has thought of yet — leaves the outcome
+     * unproven, and unproven must mean uncertain.
+     */
+    const provenNoExposure = (reason: unknown): boolean =>
+      reason instanceof BrokerPreSubmitRefusedError || reason instanceof BrokerOrderRejectedError;
+    const uncertain = settled.some((item) => item.status === "rejected" && !provenNoExposure(item.reason)) ||
+      settled.some((item) => item.status === "rejected" &&
       (item.reason instanceof OrderPersistenceAfterFillError ||
         /*
          * DECIDED BY TYPE, NOT BY THE WORDS IN A MESSAGE.
