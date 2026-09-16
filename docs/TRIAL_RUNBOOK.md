@@ -63,7 +63,7 @@ BOX_ONE_ACTIVE_BOX_PER_UNDERLYING=true
 BOX_LIVE_REQUIRE_MARGIN_EVIDENCE=true
 BOX_LIVE_REQUIRE_STAGE_FUNDING=true
 BOX_LIVE_REQUIRE_FUNDS_COVER=true      # implied by stage funding, but set it explicitly
-BOX_LIVE_RECOVERY_RESERVE_RUPEES=<reserve held back for recovery>
+# BOX_LIVE_RECOVERY_RESERVE_RUPEES=  # set a real rupee figure; a placeholder is NaN and now refuses at boot
 
 # ── Order streams: observe fills on the fast path ────────────────────────────
 DHAN_ORDER_STREAM_ENABLED=true         # or ZERODHA_ORDER_STREAM_ENABLED

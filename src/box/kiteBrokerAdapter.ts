@@ -678,7 +678,23 @@ export class KiteBrokerAdapter implements BrokerAdapter {
       // registry's `unknown_order_state` blocker) wedge logout and broker switching. This catch-all
       // used to swallow it and quarantine anyway, reintroducing the wedge the error type prevents.
       if (error instanceof BrokerCancelNotTransmittedError) throw error;
-      // A LOCAL BUDGET REFUSAL IS ALSO A PROVEN NO-REQUEST. `reserveRecoveryBudgetOrThrow` throws at
+      /*
+       * A LOCAL BUDGET REFUSAL, TRANSLATED — not re-raised bare.
+       *
+       * `reserveRecoveryBudgetOrThrow` throws at the dispatch boundary, so nothing was sent. But
+       * `BrokerPreSubmitRefusedError` means "no broker request was made" to every consumer, and the
+       * manager writes that TERMINALLY REJECTED with `no_broker_post: true` — a falsified terminal
+       * record for an entry order that has already POSTed and is working. The honest statement is the
+       * cancel-specific one: the cancellation did not go out, and the order is unchanged.
+       */
+      if (error instanceof BrokerPreSubmitRefusedError) {
+        throw new BrokerCancelNotTransmittedError(
+          clientOrderId,
+          brokerOrderId,
+          clone(this.orders.get(clientOrderId) ?? order),
+        );
+      }
+      // (retained for reference: the outer catches also guard these types) `reserveRecoveryBudgetOrThrow` throws at
       // the dispatch boundary -- when the recovery reserve is spent or a 429 cooldown is active --
       // BEFORE the transport is touched. Falling through to `quarantine()` turned a healthy working leg
       // into RECONCILIATION_REQUIRED because OUR OWN budget said no, which is uncertainty we invented.
@@ -851,10 +867,21 @@ export class KiteBrokerAdapter implements BrokerAdapter {
           // cancel-vs-fill race window. The race starts when the DELETE goes out.
           this.mark(clientOrderId, "cancel_requested");
         }
-        // Latched at DISPATCH and never cleared: this is what makes the idempotence guards survive a
-        // later quarantine that overwrites the CANCEL_REQUESTED state.
-        this.cancelDispatched.add(clientOrderId);
-        return this.transport.cancelOrder(brokerOrderId);
+        /*
+         * LATCHED ON ACKNOWLEDGEMENT, NOT ON DISPATCH.
+         *
+         * Setting this before the transport call recorded "we handed a DELETE over", so a DELETE that
+         * was dispatched and then definitively REFUSED — a 429 (the expected case in exactly the cancel
+         * storm this queue was tuned for), a 5xx, a reset — left the latch set on an order that was
+         * still working. Every later cancel then short-circuited to `confirmTerminalAfterCancel`, which
+         * polls for a terminal state that never arrives, so the order could never be cancelled again by
+         * this process: the sweep and `engine.flatten` both route through here, leaving the Kite console
+         * as the only way out. Preventing a duplicate DELETE must not cost the ability to cancel at all.
+         */
+        return this.transport.cancelOrder(brokerOrderId).then((result) => {
+          this.cancelDispatched.add(clientOrderId);
+          return result;
+        });
       },
       "order_cancel",
       { deadline },
