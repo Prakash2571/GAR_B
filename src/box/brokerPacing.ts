@@ -60,6 +60,7 @@
  */
 
 import type { BrokerId } from "./latencyModel.js";
+import type { Deadline } from "../brokers/deadline.js";
 
 /**
  * Which rate-limit bucket a transport operation belongs to.
@@ -279,7 +280,166 @@ export interface TransportPacerStats {
   /** Times the ABSOLUTE floor (not the class interval) was the binding constraint. */
   readonly absoluteFloorBinds: number;
   readonly maxObservedWaitMs: number;
+  /** Operations that expired or were withdrawn while QUEUED and so never reached the wire. */
+  readonly abandonedBeforeDispatch: number;
+  /** Operations a dispatch-time admission check (e.g. the order budget) refused before sending. */
+  readonly refusedAtDispatch: number;
+  /** High-water mark of the dispatch queue, so a starving queue is visible. */
+  readonly maxObservedQueueDepth: number;
+  /** High-water mark of concurrently in-flight transport calls. */
+  readonly maxObservedInFlight: number;
+  /** Times a risk-reducing operation was dispatched ahead of an older, less urgent one. */
+  readonly priorityOvertakes: number;
 }
+
+/**
+ * DISPATCH URGENCY — which operation goes first when several are waiting.
+ *
+ * The manager has always had a priority order (`executionSchedulingPolicy.ts`:
+ * EMERGENCY_RESIDUAL → PROTECTIVE_CANCEL → EXIT → ENTRY), but that information was DISCARDED at
+ * the adapter boundary: below it, one FIFO promise chain served whatever arrived first. So a
+ * routine positions poll that entered the chain ahead of a protective cancel was served first, and
+ * the cancel waited out the poll's entire round trip.
+ *
+ *   "recovery"  — reduces or resolves risk: cancel, modify, and protective (EXIT /
+ *                 EMERGENCY_RESIDUAL / PROTECTIVE_CANCEL) placements. Dispatched first, and holds
+ *                 a reserved slice of concurrency no other class may consume.
+ *   "placement" — an ENTRY placement. Takes risk, so it yields to recovery, but it must not sit
+ *                 behind nonurgent reads: a short leg delayed by a positions poll widens the
+ *                 uncovered window.
+ *   "read"      — polls and status reads. Never urgent; always yields.
+ */
+export type TransportUrgency = "recovery" | "placement" | "read";
+
+const URGENCY_RANK: Readonly<Record<TransportUrgency, number>> = Object.freeze({
+  recovery: 0,
+  placement: 1,
+  read: 2,
+});
+
+/**
+ * A queued transport operation that never reached the wire. PROVEN not transmitted.
+ *
+ * This distinction is the whole point of {@link TransportPacer.submit}. A caller that times out
+ * needs to know which of two very different things happened:
+ *
+ *   - the request was still QUEUED and has now been withdrawn — nothing was sent, nothing exists at
+ *     the broker, and the local state should not be quarantined;
+ *   - the request was DISPATCHED and the outcome is unknown — it may well have reached the
+ *     exchange, so it must stay ambiguous and be reconciled.
+ *
+ * Reporting the first as the second manufactures uncertainty; reporting the second as the first is
+ * far worse — it would let a timeout be read as "nothing was sent".
+ */
+export class TransportRequestAbandonedError extends Error {
+  /** Always false, and PROVEN: the pacer never invoked the operation. */
+  readonly transmitted = false;
+
+  constructor(
+    message: string,
+    /** The endpoint class, for diagnostics. */
+    readonly klass: BrokerPacingClass,
+    /** How long it had been queued when it was withdrawn. */
+    readonly queuedMs: number,
+  ) {
+    super(message);
+    this.name = "TransportRequestAbandonedError";
+  }
+}
+
+/** Per-operation dispatch controls. All optional: omitting them reproduces the previous behaviour. */
+export interface TransportRunOptions {
+  /** Dispatch tier. Defaults to `"read"` — the tier that yields to everything. */
+  readonly urgency?: TransportUrgency;
+  /**
+   * An ABSOLUTE deadline for this operation.
+   *
+   * Consulted before admission, after every pacing sleep, and one last time immediately before
+   * dispatch. An operation whose deadline has passed while it was queued is REFUSED, never sent
+   * late — the defect this closes is a cancellation that timed out, was reported to the caller as
+   * timed out, and was then transmitted anyway once the request ahead of it finally returned.
+   */
+  readonly deadline?: Deadline | null;
+  /**
+   * Synchronous admission check, run AT DISPATCH rather than at enqueue.
+   *
+   * Throwing refuses the operation without sending it, so the throw is a proven no-request. This is
+   * where the rate budget is charged: charging at enqueue counted spend for operations that were
+   * later abandoned, which is how a budget drifts away from what the broker actually saw.
+   */
+  readonly beforeDispatch?: () => void;
+}
+
+/** A submitted operation: its settlement, plus the ability to ask about and withdraw it. */
+export interface TransportSubmission<T> {
+  /** Settles with the operation's outcome, or rejects with {@link TransportRequestAbandonedError}. */
+  readonly result: Promise<T>;
+  /** Has the operation been handed to the transport? Once true it can never become false. */
+  dispatched(): boolean;
+  /**
+   * Withdraw the operation if it has not been dispatched.
+   *
+   * Returns true when the withdrawal succeeded, which is a PROOF that nothing was transmitted;
+   * false when the operation was already on the wire and the outcome is therefore ambiguous.
+   */
+  abandon(reason: string): boolean;
+}
+
+interface QueuedOperation {
+  readonly seq: number;
+  readonly klass: BrokerPacingClass;
+  readonly urgency: TransportUrgency;
+  readonly deadline: Deadline | null;
+  readonly beforeDispatch: (() => void) | undefined;
+  readonly operation: () => Promise<unknown>;
+  readonly enqueuedAt: number;
+  readonly settle: (outcome: { ok: true; value: unknown } | { ok: false; error: unknown }) => void;
+  waitedMs: number;
+  state: "queued" | "dispatched" | "settled";
+}
+
+/**
+ * How much of the transport may be in flight at once, and how much is held back for recovery.
+ *
+ * WHY CONCURRENCY EXISTS AT ALL NOW. The pacer used to await each operation's COMPLETION before
+ * even computing the next one's pacing wait, which conflated two unrelated quantities: the rate the
+ * broker permits (a property of time) and how long a request happens to take (a property of the
+ * network). One parked 5-second read therefore blocked every subsequent request — including a
+ * protective cancel — for 5 seconds, even though the broker would have accepted another request
+ * 110ms in.
+ *
+ * THE BROKER SEES NO HIGHER RATE THAN BEFORE. Dispatch spacing is unchanged and still enforced from
+ * the watermarks, and the absolute floor still bounds total dispatch to
+ * `1 / orderMutationMinIntervalMs` (10/s for Zerodha, its published ceiling). Concurrency only
+ * decouples "when may the next request leave" from "has the previous one come back".
+ */
+export interface TransportConcurrencyLimits {
+  /** Total simultaneous transport calls. */
+  readonly maxInFlight: number;
+  /**
+   * Slots only `"recovery"` operations may occupy.
+   *
+   * The same reasoning as `RateBudgetLedger`'s recovery reserve: the moment the transport is
+   * saturated is exactly the moment a cancel is most likely to be needed, so capacity to shed risk
+   * is withheld rather than shared.
+   */
+  readonly reservedForRecovery: number;
+  /**
+   * Simultaneous `"read"` operations. Defaults to 1, deliberately.
+   *
+   * Reads stay serialised with EACH OTHER because nothing is gained by overlapping two status polls
+   * of the same order, and keeping them one-at-a-time preserves the lost-update ordering the
+   * REST/stream merge tests already pin. The defect was never that reads did not overlap — it was
+   * that a read blocked a CANCEL, which the tiers and the reserve now prevent.
+   */
+  readonly maxConcurrentReads: number;
+}
+
+export const DEFAULT_TRANSPORT_CONCURRENCY: TransportConcurrencyLimits = Object.freeze({
+  maxInFlight: 4,
+  reservedForRecovery: 1,
+  maxConcurrentReads: 1,
+});
 
 /**
  * The transport pacer both live adapters share.
@@ -309,8 +469,21 @@ export class TransportPacer {
   private lastOrderMutationAt = Number.NEGATIVE_INFINITY;
   private lastGeneralAt = Number.NEGATIVE_INFINITY;
   private lastAnyCallAt = Number.NEGATIVE_INFINITY;
-  /** FIFO chain: one transport call at a time, so waiters space out instead of colliding. */
-  private tail: Promise<void> = Promise.resolve();
+
+  /**
+   * Operations waiting for a dispatch slot, in arrival order.
+   *
+   * THIS REPLACES A PROMISE CHAIN (`tail`), and the replacement is the fix. A chain can only be
+   * appended to: it has no priority, nothing can be removed from it, and — the actual defect — each
+   * link resolved only when the previous operation's HTTP call SETTLED, so the successor's pacing
+   * arithmetic did not even begin until the predecessor returned. A real queue can be reordered by
+   * urgency and, critically, entries can be WITHDRAWN before they reach the wire.
+   */
+  private readonly queue: QueuedOperation[] = [];
+  private inFlight = 0;
+  private readsInFlight = 0;
+  private scheduling = false;
+  private seq = 0;
 
   private orderMutations = 0;
   private generalCalls = 0;
@@ -319,11 +492,40 @@ export class TransportPacer {
   private generalWaitMs = 0;
   private absoluteFloorBinds = 0;
   private maxObservedWaitMs = 0;
+  private abandonedBeforeDispatch = 0;
+  private refusedAtDispatch = 0;
+  private maxObservedQueueDepth = 0;
+  private maxObservedInFlight = 0;
+  private priorityOvertakes = 0;
+
+  private readonly limits: TransportConcurrencyLimits;
 
   constructor(
     private pacing: EffectiveBrokerPacing,
     private readonly clock: { now: () => number; wait: (ms: number) => Promise<void> },
-  ) {}
+    limits: Partial<TransportConcurrencyLimits> = {},
+  ) {
+    this.limits = {
+      maxInFlight: Math.max(1, Math.floor(limits.maxInFlight ?? DEFAULT_TRANSPORT_CONCURRENCY.maxInFlight)),
+      // Never reserve so much that a non-recovery operation can never run at all.
+      reservedForRecovery: Math.max(
+        0,
+        Math.min(
+          Math.max(1, Math.floor(limits.maxInFlight ?? DEFAULT_TRANSPORT_CONCURRENCY.maxInFlight)) - 1,
+          Math.floor(limits.reservedForRecovery ?? DEFAULT_TRANSPORT_CONCURRENCY.reservedForRecovery),
+        ),
+      ),
+      maxConcurrentReads: Math.max(
+        1,
+        Math.floor(limits.maxConcurrentReads ?? DEFAULT_TRANSPORT_CONCURRENCY.maxConcurrentReads),
+      ),
+    };
+  }
+
+  /** The concurrency bounds in force, for diagnostics. */
+  concurrencyLimits(): TransportConcurrencyLimits {
+    return this.limits;
+  }
 
   /** The pacing currently in force. */
   effective(): EffectiveBrokerPacing {
@@ -349,7 +551,17 @@ export class TransportPacer {
       generalWaitMs: this.generalWaitMs,
       absoluteFloorBinds: this.absoluteFloorBinds,
       maxObservedWaitMs: this.maxObservedWaitMs,
+      abandonedBeforeDispatch: this.abandonedBeforeDispatch,
+      refusedAtDispatch: this.refusedAtDispatch,
+      maxObservedQueueDepth: this.maxObservedQueueDepth,
+      maxObservedInFlight: this.maxObservedInFlight,
+      priorityOvertakes: this.priorityOvertakes,
     };
+  }
+
+  /** How many operations are waiting for a dispatch slot right now. */
+  queueDepth(): number {
+    return this.queue.length;
   }
 
   /**
@@ -359,13 +571,134 @@ export class TransportPacer {
    * paced by the SLOWER interval. Defaulting the other way would silently grant an
    * unclassified call the order-mutation rate.
    */
-  run<T>(operation: () => Promise<T>, klass: BrokerPacingClass = "general"): Promise<T> {
-    const run = this.tail.then(async () => {
+  run<T>(
+    operation: () => Promise<T>,
+    klass: BrokerPacingClass = "general",
+    options: TransportRunOptions = {},
+  ): Promise<T> {
+    return this.submit(operation, klass, options).result;
+  }
+
+  /**
+   * Enqueue `operation` and return a handle that can report on and WITHDRAW it.
+   *
+   * The handle is what makes a deadline honest. `run()` alone can only tell a caller "this
+   * rejected"; it cannot say whether anything was transmitted. A caller that raced its own timeout
+   * calls `abandon()`, and a `true` return is proof that the request never left.
+   */
+  submit<T>(
+    operation: () => Promise<T>,
+    klass: BrokerPacingClass = "general",
+    options: TransportRunOptions = {},
+  ): TransportSubmission<T> {
+    const urgency = options.urgency ?? "read";
+    const deadline = options.deadline ?? null;
+    let settled = false;
+    let resolveOuter: (value: T) => void = () => undefined;
+    let rejectOuter: (error: unknown) => void = () => undefined;
+    const result = new Promise<T>((resolve, reject) => {
+      resolveOuter = resolve;
+      rejectOuter = reject;
+    });
+
+    const entry: QueuedOperation = {
+      seq: this.seq++,
+      klass,
+      urgency,
+      deadline,
+      beforeDispatch: options.beforeDispatch,
+      operation: operation as () => Promise<unknown>,
+      enqueuedAt: this.clock.now(),
+      waitedMs: 0,
+      state: "queued",
+      settle: (outcome) => {
+        if (settled) return;
+        settled = true;
+        entry.state = "settled";
+        if (outcome.ok) resolveOuter(outcome.value as T);
+        else rejectOuter(outcome.error);
+      },
+    };
+
+    // PRE-ADMISSION. An operation whose budget is already spent must not even take a queue slot,
+    // let alone a dispatch slot ahead of something still viable.
+    if (deadline?.expired()) {
+      this.abandonedBeforeDispatch++;
+      entry.settle({
+        ok: false,
+        error: new TransportRequestAbandonedError(
+          "The request deadline had already expired before it could be dispatched; nothing was transmitted.",
+          klass,
+          0,
+        ),
+      });
+      return this.handleFor(entry, result);
+    }
+
+    this.queue.push(entry);
+    if (this.queue.length > this.maxObservedQueueDepth) this.maxObservedQueueDepth = this.queue.length;
+    this.startScheduling();
+    return this.handleFor(entry, result);
+  }
+
+  private handleFor<T>(entry: QueuedOperation, result: Promise<T>): TransportSubmission<T> {
+    return {
+      result,
+      dispatched: () => entry.state !== "queued",
+      abandon: (reason: string): boolean => {
+        // Already on the wire (or already finished): the outcome is the broker's to decide and this
+        // caller may not claim otherwise.
+        if (entry.state !== "queued") return false;
+        const index = this.queue.indexOf(entry);
+        if (index >= 0) this.queue.splice(index, 1);
+        this.abandonedBeforeDispatch++;
+        entry.settle({
+          ok: false,
+          error: new TransportRequestAbandonedError(
+            `${reason} The request was still queued and has been withdrawn; nothing was transmitted.`,
+            entry.klass,
+            Math.max(0, this.clock.now() - entry.enqueuedAt),
+          ),
+        });
+        // A freed queue slot may let something else go now.
+        this.startScheduling();
+        return true;
+      },
+    };
+  }
+
+  private startScheduling(): void {
+    if (this.scheduling) return;
+    this.scheduling = true;
+    void this.drainQueue().finally(() => {
+      this.scheduling = false;
+      // A late arrival during the final await would otherwise sit until the next `submit`.
+      if (this.queue.length > 0 && this.canDispatchSomething()) this.startScheduling();
+    });
+  }
+
+  private canDispatchSomething(): boolean {
+    return this.pickNext() !== null;
+  }
+
+  /**
+   * The dispatch loop.
+   *
+   * Note what it does NOT do: it never awaits `operation()`. It awaits only the PACING interval, so
+   * the queue advances on the schedule the broker permits rather than on however long the previous
+   * response happens to take. That single change is the fix for a slow read blocking a cancel.
+   */
+  private async drainQueue(): Promise<void> {
+    for (;;) {
+      this.refuseExpiredQueueEntries();
+      const next = this.pickNext();
+      if (!next) return;
+
       const now = this.clock.now();
       const classWait = pacingWaitMs({
         pacing: this.pacing,
-        klass,
-        lastCallAt: klass === "order_mutation" ? this.lastOrderMutationAt : this.lastGeneralAt,
+        klass: next.klass,
+        lastCallAt: next.klass === "order_mutation" ? this.lastOrderMutationAt : this.lastGeneralAt,
         now,
       });
       // The absolute floor uses the order-mutation interval as the tightest permissible gap
@@ -377,27 +710,154 @@ export class TransportPacer {
         now,
       });
       const wait = Math.max(classWait, absoluteWait);
-      if (absoluteWait > classWait) this.absoluteFloorBinds++;
-      if (wait > 0) await this.clock.wait(wait);
 
-      const at = this.clock.now();
-      this.lastAnyCallAt = at;
-      if (klass === "order_mutation") {
-        this.lastOrderMutationAt = at;
-        this.orderMutations++;
-        this.orderMutationWaitMs += wait;
-      } else {
-        this.lastGeneralAt = at;
-        this.generalCalls++;
-        this.generalWaitMs += wait;
+      if (wait > 0) {
+        if (absoluteWait > classWait) this.absoluteFloorBinds++;
+        // The sleep itself is bounded by the operation's own deadline, so a request cannot spend
+        // its entire budget waiting for a slot and then be transmitted anyway.
+        const slice = next.deadline ? Math.min(wait, Math.max(1, next.deadline.timerMs())) : wait;
+        const before = this.clock.now();
+        await this.clock.wait(slice);
+        next.waitedMs += slice;
+        const after = this.clock.now();
+        // A clock that does not advance across a wait cannot express pacing at all (several suites
+        // inject `wait: () => Promise.resolve()`). Dispatching is what the previous implementation
+        // did in that case; re-evaluating instead would spin forever.
+        if (after > before) continue;
       }
-      this.totalWaitMs += wait;
-      if (wait > this.maxObservedWaitMs) this.maxObservedWaitMs = wait;
-      return operation();
+
+      if (next.deadline?.expired()) {
+        this.refuseExpired(next);
+        continue;
+      }
+      this.dispatch(next, next.waitedMs);
+    }
+  }
+
+  /**
+   * The most urgent operation that may run right now, or null.
+   *
+   * Ties break on arrival order, so within a tier the queue is still FIFO and nothing starves.
+   */
+  private pickNext(): QueuedOperation | null {
+    if (this.queue.length === 0) return null;
+    if (this.inFlight >= this.limits.maxInFlight) return null;
+
+    const ordered = [...this.queue].sort((a, b) => {
+      const byUrgency = URGENCY_RANK[a.urgency] - URGENCY_RANK[b.urgency];
+      return byUrgency !== 0 ? byUrgency : a.seq - b.seq;
     });
-    // Keep the pacing chain alive after failures without swallowing the caller's error.
-    this.tail = run.then(() => undefined, () => undefined);
-    return run;
+
+    for (const candidate of ordered) {
+      if (candidate.state !== "queued") continue;
+      if (candidate.urgency === "read" && this.readsInFlight >= this.limits.maxConcurrentReads) continue;
+      // Everything except recovery must leave the reserve alone.
+      if (
+        candidate.urgency !== "recovery" &&
+        this.limits.maxInFlight - this.inFlight <= this.limits.reservedForRecovery
+      ) {
+        continue;
+      }
+      // Diagnostics: did urgency let this jump an older entry?
+      const oldestQueued = ordered.reduce<QueuedOperation | null>(
+        (best, item) => (item.state === "queued" && (best === null || item.seq < best.seq) ? item : best),
+        null,
+      );
+      if (oldestQueued && oldestQueued !== candidate) this.priorityOvertakes++;
+      return candidate;
+    }
+    return null;
+  }
+
+  private refuseExpiredQueueEntries(): void {
+    // Iterate over a copy: `refuseExpired` mutates the queue.
+    for (const entry of [...this.queue]) {
+      if (entry.state === "queued" && entry.deadline?.expired()) this.refuseExpired(entry);
+    }
+  }
+
+  /**
+   * Refuse an operation whose deadline passed while it was QUEUED.
+   *
+   * It is removed rather than left in place, and `operation()` is never called. The watermarks are
+   * NOT stamped and no budget is charged, because nothing was sent — an abandoned operation
+   * consumed none of the broker's capacity and must not be accounted as if it had.
+   */
+  private refuseExpired(entry: QueuedOperation): void {
+    const index = this.queue.indexOf(entry);
+    if (index >= 0) this.queue.splice(index, 1);
+    this.abandonedBeforeDispatch++;
+    entry.settle({
+      ok: false,
+      error: new TransportRequestAbandonedError(
+        "The request deadline expired while it was queued behind broker pacing; nothing was transmitted.",
+        entry.klass,
+        Math.max(0, this.clock.now() - entry.enqueuedAt),
+      ),
+    });
+  }
+
+  private dispatch(entry: QueuedOperation, wait: number): void {
+    const index = this.queue.indexOf(entry);
+    if (index >= 0) this.queue.splice(index, 1);
+
+    // DISPATCH-TIME ADMISSION (the rate budget). A throw here is a proven no-request, so — exactly
+    // as for an expired entry — no watermark is stamped and no spend is recorded.
+    if (entry.beforeDispatch) {
+      try {
+        entry.beforeDispatch();
+      } catch (error) {
+        this.refusedAtDispatch++;
+        entry.settle({ ok: false, error });
+        return;
+      }
+    }
+
+    entry.state = "dispatched";
+    const at = this.clock.now();
+    this.lastAnyCallAt = at;
+    if (entry.klass === "order_mutation") {
+      this.lastOrderMutationAt = at;
+      this.orderMutations++;
+      this.orderMutationWaitMs += wait;
+    } else {
+      this.lastGeneralAt = at;
+      this.generalCalls++;
+      this.generalWaitMs += wait;
+    }
+    this.totalWaitMs += wait;
+    if (wait > this.maxObservedWaitMs) this.maxObservedWaitMs = wait;
+
+    this.inFlight++;
+    if (entry.urgency === "read") this.readsInFlight++;
+    if (this.inFlight > this.maxObservedInFlight) this.maxObservedInFlight = this.inFlight;
+
+    const release = (): void => {
+      this.inFlight = Math.max(0, this.inFlight - 1);
+      if (entry.urgency === "read") this.readsInFlight = Math.max(0, this.readsInFlight - 1);
+      // A completed call frees a slot; something may now be dispatchable.
+      this.startScheduling();
+    };
+
+    let running: Promise<unknown>;
+    try {
+      running = entry.operation();
+    } catch (error) {
+      // A synchronous throw from the operation itself. It was invoked, so it counts as dispatched.
+      entry.settle({ ok: false, error });
+      release();
+      return;
+    }
+    Promise.resolve(running).then(
+      (value) => {
+        entry.settle({ ok: true, value });
+        release();
+      },
+      (error: unknown) => {
+        entry.settle({ ok: false, error });
+        release();
+      },
+    );
   }
 }
 

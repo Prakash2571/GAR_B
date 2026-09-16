@@ -481,6 +481,20 @@ const RECONCILE_STATES: ReadonlySet<BrokerOrderState> = new Set([
   "RECONCILIATION_REQUIRED",
 ]);
 
+/**
+ * A broker account identity reduced to "a name" or "unproven" — the ONLY two states worth comparing.
+ *
+ * Every account comparison in this file routes through here so that the several ways of saying
+ * "we do not know" (`undefined`, `null`, `""`, `"   "`) collapse to ONE value. Without this, a guard
+ * could compare `""` against `null` and conclude the accounts differ, which would refuse a
+ * cancellation on the strength of two pieces of missing information.
+ */
+function normalizedAccount(account: string | null | undefined): string | null {
+  if (typeof account !== "string") return null;
+  const trimmed = account.trim();
+  return trimmed === "" ? null : trimmed;
+}
+
 function queuePriority(action: QueueAction): number {
   return action.kind === "cancel" ? PRIORITY.PROTECTIVE_CANCEL : PRIORITY[action.request.purpose];
 }
@@ -590,6 +604,13 @@ export class BoxOrderManager {
   private staleReconcilePasses = 0;
   private tradingDay: string;
   private readonly attributedBoxPositions = new Map<string, number>();
+  /**
+   * The broker account {@link attributedBoxPositions} was reconciled under, or null when unproven.
+   *
+   * Attribution without an owner is how one account's flatten reaches another account's positions —
+   * see {@link BoxOrderManager.attributedAccountDriftReason}.
+   */
+  private attributedPositionsAccount: string | null = null;
   private feedHealthy = false;
   private feedWarmUntil = Number.POSITIVE_INFINITY;
   private breakerReason: string | null = null;
@@ -892,6 +913,7 @@ export class BoxOrderManager {
    */
   setAttributedBoxPositions(
     positions: Awaited<ReturnType<BrokerAdapter["listPositions"]>>,
+    opts: { account?: string | null } = {},
   ): void {
     this.attributedBoxPositions.clear();
     for (const position of positions) {
@@ -900,7 +922,54 @@ export class BoxOrderManager {
         position.net_quantity,
       );
     }
+    /*
+     * THE SNAPSHOT IS STAMPED WITH THE ACCOUNT IT WAS BUILT UNDER.
+     *
+     * THE P0 THIS CLOSES (second reproduction in the audit). This map was keyed by
+     * `exchange:tradingsymbol` alone, with no account component anywhere — and it is the sole
+     * authority for whether a reduction is permitted (`quantityLimitBlockReason` requires the
+     * correct side and refuses any overshoot of the attributed net). So a long opened under account
+     * A stayed in this map verbatim across a re-login to account B, the side and size checks passed,
+     * and an EXIT SELL was authorised against a position the new session does not hold.
+     *
+     * That SELL does not close A's long. Sent on B's credential it OPENS A SHORT in B.
+     *
+     * Recording the account for the SNAPSHOT rather than per position is deliberate and sufficient:
+     * this method's contract is a set of positions already attributed to durable BOX trades for ONE
+     * session, rebuilt in full on every reconciliation pass. There is no legitimate way for one
+     * snapshot to span two accounts, so one stamp describes it exactly.
+     *
+     * Defaulted from the live provider when the caller does not name an account, so the production
+     * seam (`engine.syncManagerExposure`) is stamped correctly without every call site restating it.
+     */
+    this.attributedPositionsAccount = normalizedAccount(
+      opts.account !== undefined ? opts.account : this.deps.brokerAccount?.() ?? null,
+    );
     this.recalculateGrossAttributedQuantity();
+  }
+
+  /**
+   * WHY A REDUCTION AGAINST THIS ATTRIBUTED SNAPSHOT MUST BE REFUSED, or null when it may proceed.
+   *
+   * Blocks ONLY on positive proof that the snapshot belongs to a different account than the one now
+   * signed in. Every other case — an unstamped snapshot, an unnameable session — is "cannot tell",
+   * and consistent with `exposureReductionBlockReason` and `accountConsistencyBlockReason` that must
+   * never refuse: a blocked exit guarantees exposure stays, whereas the broker itself will reject a
+   * cancel or exit aimed at an account we are not authenticated for.
+   *
+   * A KNOWN-different account is the exception, and the only one, because there the request would
+   * NOT fail harmlessly at the broker: it would succeed, against the wrong positions.
+   */
+  private attributedAccountDriftReason(): string | null {
+    const owner = this.attributedPositionsAccount;
+    if (owner === null) return null;
+    const current = normalizedAccount(this.deps.brokerAccount?.() ?? null);
+    if (current === null || current === owner) return null;
+    return (
+      `The attributed position map was reconciled under broker account ${owner}, but this session is ` +
+      `signed in as ${current}. A reduction derived from another account's exposure would not close ` +
+      `it — it would open NEW exposure here. Sign back into ${owner}, or reconcile explicitly.`
+    );
   }
 
   /**
@@ -1188,6 +1257,61 @@ export class BoxOrderManager {
    *     it is reported, and counted by the projection's `unverifiedAccount`, rather than being
    *     resolved into a claim.
    */
+  /**
+   * IS THE CREDENTIAL ABOUT TO SIGN THIS ORDER STILL THE ACCOUNT IT WAS STAMPED UNDER?
+   *
+   * THE P0 THIS CLOSES. The account was read ONCE, at dequeue, and stamped onto the durable intent
+   * before persistence — and then nothing ever checked it again. Between that stamp and the POST the
+   * order still had to survive two database round trips, a priority-queue wait, the hedge-first
+   * barrier and lazy per-call token resolution. A re-login during ANY of those windows installs a
+   * replacement credential synchronously (see `registry.completeZerodhaLogin`), so the request would
+   * be signed by account B while the durable row, the attribution and every report said account A.
+   *
+   * The registry now refuses a different-account login while exposure is unresolved, which removes
+   * the ordinary route into this state. This is the second, independent fence: the one that holds at
+   * the instant of dispatch, for whatever route remains — a first login with no prior session, a
+   * provider-mode token install, a recovery path.
+   *
+   * TWO INDEPENDENT WITNESSES ARE COMPARED:
+   *
+   *   - `adapter.dispatchAccount()` — the account behind the credential that will actually sign the
+   *     request, read from the same object the token comes from. This is the authoritative one.
+   *   - `deps.brokerAccount()` — the session account the rest of the process believes it is. Checked
+   *     too, because a disagreement between these two is itself evidence of a mid-flight change.
+   *
+   * IT BLOCKS ONLY ON POSITIVE PROOF OF DIFFERENCE, matching `accountConsistencyBlockReason` and
+   * `exposureReductionBlockReason`. An unproven row, an adapter that cannot name its credential, or
+   * an unnameable session are all "cannot tell" — and "cannot tell" must never strand exposure,
+   * because a refused EXIT guarantees the position stays. Only a KNOWN-different account refuses.
+   */
+  private dispatchAccountBlockReason(
+    intent: Pick<IBoxOrderIntent, "client_order_id" | "broker_account">,
+  ): string | null {
+    const stamped = normalizedAccount(intent.broker_account);
+    // An unproven row carries no claim that a credential could contradict.
+    if (stamped === null) return null;
+
+    const dispatch = normalizedAccount(this.deps.adapter.dispatchAccount?.() ?? null);
+    if (dispatch !== null && dispatch !== stamped) {
+      return (
+        `Order ${intent.client_order_id} was authorised under broker account ${stamped}, but the ` +
+        `credential that would send it now belongs to account ${dispatch}. The account changed after ` +
+        `this order was authorised, so it must not be transmitted: an order sent to a different ` +
+        `account does not act on the exposure it was planned against.`
+      );
+    }
+
+    const session = normalizedAccount(this.deps.brokerAccount?.() ?? null);
+    if (session !== null && session !== stamped) {
+      return (
+        `Order ${intent.client_order_id} was authorised under broker account ${stamped}, but the ` +
+        `active session is now signed in as ${session}. The account changed after this order was ` +
+        `authorised, so it must not be transmitted.`
+      );
+    }
+    return null;
+  }
+
   accountConsistencyBlockReason(intent: Pick<IBoxOrderIntent, "client_order_id" | "broker_account">): string | null {
     // Account binding not wired at all (paper / pre-binding construction): there is no account claim
     // to contradict, so ownership rests on the durable BOX client-order-id prefix as it did before.
@@ -2362,6 +2486,10 @@ export class BoxOrderManager {
       return `Exposure reduction could not be sent: ${reductionBlocked}`;
     }
     if (request.purpose === "PROTECTIVE_CANCEL") return null;
+    // Re-checked at dequeue too: an account change while this reduction sat in the priority queue is
+    // one of the windows the audit reproduced.
+    const queuedAccountDrift = this.attributedAccountDriftReason();
+    if (queuedAccountDrift !== null) return queuedAccountDrift;
     const symbol = `${request.exchange}:${request.tradingsymbol}`;
     const net = this.attributedBoxPositions.get(symbol) ?? 0;
     const correctSide = (net > 0 && request.side === "SELL") || (net < 0 && request.side === "BUY");
@@ -2430,6 +2558,7 @@ export class BoxOrderManager {
       // guard are asked again here, because an unbounded amount of wall-clock time may have passed
       // while this leg sat in the priority queue behind its siblings.
       const dequeueReason = this.checkedFeedBlockReason(request, action.checkedFeed) ??
+        this.dispatchAccountBlockReason(intent) ??
         (entryGuard ? this.entryGuardBlockReason(action.request, entryGuard, "dequeue") : null);
       if (dequeueReason) {
         const refusal = new BrokerPreSubmitRefusedError(
@@ -2479,6 +2608,26 @@ export class BoxOrderManager {
       // The identity is durably spent and CAS-owned by this process, and still nothing has been
       // transmitted. This is the cheapest possible place to discover that entry was disarmed or
       // ownership was lost during the two Mongo round trips.
+      // The account is checked for EVERY purpose, not only ENTRY: the second reproduction in the
+      // audit was an EXIT. Placed outside the `entryGuard` block below for exactly that reason.
+      const persistedAccountReason = this.dispatchAccountBlockReason(intent);
+      if (persistedAccountReason) {
+        const refusal = new BrokerPreSubmitRefusedError(
+          request.client_order_id,
+          "post_persist",
+          true,
+          persistedAccountReason,
+        );
+        hedgeFailureReason = persistedAccountReason;
+        const terminalized = await this.persistLocalPreSubmitRefusal(intent, refusal);
+        if (!terminalized) {
+          await this.resolveConcurrentSubmissionOwner(action, this.knownIntents.get(intent.client_order_id) ?? intent);
+          return;
+        }
+        action.reject(refusal);
+        return;
+      }
+
       if (entryGuard) {
         const persistedReason = this.entryGuardBlockReason(action.request, entryGuard, "post_persist");
         if (persistedReason) {
@@ -2510,6 +2659,12 @@ export class BoxOrderManager {
           // Adapter pacing is done; the next instruction after this callback returns is the HTTP
           // POST. Throwing here PROVES no broker mutation was attempted.
           const reason = this.checkedFeedBlockReason(request, action.checkedFeed) ??
+            // THE LAST POSSIBLE INSTANT to notice the account changed. Checked here — not merely at
+            // dequeue and post-persist — because the hedge-first barrier immediately above can park
+            // an uncovered SELL for an unbounded time, and the credential is resolved lazily AFTER
+            // this callback returns. This is the only check that can prove the credential about to
+            // sign the request is still the account the order was authorised under.
+            this.dispatchAccountBlockReason(intent) ??
             this.entryAuthorizationBlockReason(request) ??
             (entryGuard ? this.entryGuardBlockReason(action.request, entryGuard, "pre_post") : null);
           if (reason) {
@@ -3400,6 +3555,11 @@ export class BoxOrderManager {
       );
     }
     if (request.purpose === "PROTECTIVE_CANCEL") return null;
+
+    // ATTRIBUTION IS ONLY EVIDENCE IF IT BELONGS TO THIS ACCOUNT. Checked before the side/size
+    // arithmetic below, because that arithmetic is exactly what a foreign snapshot would satisfy.
+    const accountDrift = this.attributedAccountDriftReason();
+    if (accountDrift !== null) return accountDrift;
 
     // A REDUCTION may only ever shrink a position this process is attributed, and only from the side
     // that shrinks it. Anything else would be new exposure wearing an exit's label.

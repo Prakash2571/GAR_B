@@ -398,6 +398,13 @@ export class KiteError extends Error {
 export class KiteClient {
   private apiKey: string;
   private accessToken: string | null = null;
+  /**
+   * The account (Kite `user_id`) that owns {@link accessToken}, or null when unproven.
+   *
+   * Deliberately adjacent to the token and only ever written together with it — see
+   * {@link installProvidedToken}.
+   */
+  private accountId: string | null = null;
 
   constructor(config: KiteConfig) {
     // NO OAUTH IN STRIKEEDGE. The api key and access token are installed by the
@@ -413,9 +420,33 @@ export class KiteClient {
    * service. This REPLACES the Zerodha OAuth login flow: This backend never exchanges
    * a request token itself.
    */
-  installProvidedToken(apiKey: string, accessToken: string): void {
+  installProvidedToken(apiKey: string, accessToken: string, account?: string | null): void {
     if (apiKey) this.apiKey = apiKey;
     this.accessToken = accessToken;
+    // THE ACCOUNT IS INSTALLED WITH THE TOKEN, IN ONE SYNCHRONOUS STEP.
+    //
+    // This is the binding that makes an account check at the send boundary mean anything. The
+    // execution path resolves the credential LAZILY, per HTTP call, from this object — so the token
+    // used for a POST is read from mutable process state AFTER the order was already authorised. If
+    // the account identity lived anywhere else (a separate session-metadata field updated a moment
+    // later, say), then between those two writes the process would be holding account B's
+    // credential while still believing it was acting as account A, and no guard downstream could
+    // detect it. Writing both here, with no await in between, makes that window structurally
+    // impossible: whoever reads the token can read the account that owns it.
+    //
+    // `undefined` means the caller did not name an account — the identity is UNPROVEN, which is
+    // recorded as null rather than silently inheriting the previous account's name.
+    this.accountId = typeof account === "string" && account.trim() !== "" ? account.trim() : null;
+  }
+
+  /**
+   * The broker account the CURRENTLY INSTALLED access token belongs to, or null when unproven.
+   *
+   * Read at the send boundary to confirm that the credential about to be used still belongs to the
+   * account an order was authorised under. Null is honest and must never be treated as a match.
+   */
+  getSessionAccount(): string | null {
+    return this.accountId;
   }
 
   /**
@@ -495,9 +526,17 @@ export class KiteClient {
     );
   }
 
-  /** Allow restoring a previously obtained access token (e.g. from a store). */
+  /**
+   * Allow restoring a previously obtained access token (e.g. from a store).
+   *
+   * The account is CLEARED rather than left in place: this seam takes a bare token with no identity,
+   * so retaining the previous account's name would attach a stale claim to a new credential — the
+   * exact confusion the account/token binding exists to prevent. Callers that know the account
+   * should use {@link installProvidedToken} instead.
+   */
   setAccessToken(token: string): void {
     this.accessToken = token;
+    this.accountId = null;
   }
 
   hasSession(): boolean {
@@ -517,6 +556,9 @@ export class KiteClient {
   /** Forget the current session (logout). Subsequent calls require re-login. */
   clearSession(): void {
     this.accessToken = null;
+    // The account goes with the token. A cleared session that still named an account would let a
+    // send-boundary check "match" against an identity backed by no credential at all.
+    this.accountId = null;
   }
 
   private authHeader(): Record<string, string> {

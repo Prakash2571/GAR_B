@@ -1,5 +1,6 @@
 import {
   BrokerAmbiguousSubmitError,
+  BrokerCancelNotTransmittedError,
   BrokerDisabledError,
   BrokerOrderRejectedError,
   BrokerPreSubmitRefusedError,
@@ -25,8 +26,13 @@ import {
   RateBudgetLedger,
   resolveBrokerPacing,
   TransportPacer,
+  type TransportConcurrencyLimits,
   type TransportPacerStats,
+  TransportRequestAbandonedError,
+  type TransportSubmission,
+  type TransportUrgency,
 } from "./brokerPacing.js";
+import { Deadline } from "../brokers/deadline.js";
 import type { BoxConfig } from "./config.js";
 import {
   evaluateExecutionEvidence,
@@ -34,6 +40,7 @@ import {
   readPositivePrice,
 } from "./brokerExecutionEvidence.js";
 import { cloneBrokerOrder, mergeBrokerOrderSnapshot, type BrokerOrderMergeOptions } from "./brokerOrderMerge.js";
+import { parseIstBrokerTimestamp } from "./brokerTimestamps.js";
 import type { ExternalOrderUpdate } from "./brokerAdapter.js";
 import type { ExecutionTimingRecorder } from "./executionTiming.js";
 import type { BoxOrderPurpose, ExecutionMode, IBoxOrderIntent, OrderSide } from "./types.js";
@@ -93,10 +100,98 @@ export class KiteHttpError extends Error {
     readonly status: number,
     message: string,
     readonly body: unknown,
+    /**
+     * The response's VERBATIM `Retry-After` header, or null when it carried none.
+     *
+     * Previously this class carried no header at all, so the only place left to look for a backoff
+     * hint was the JSON body — which Kite's 429 does not contain. The broker's actual instruction
+     * was therefore discarded on every rate limit, and the cooldown fell back to a conservative
+     * one-second default instead of the 30 seconds it had asked for. Kept as the raw string so
+     * `parseRetryAfterMs` can handle BOTH documented forms (delta-seconds and an HTTP date).
+     */
+    readonly retryAfter: string | null = null,
   ) {
     super(message);
     this.name = "KiteHttpError";
   }
+}
+
+/**
+ * The subset of `Response` this transport needs.
+ *
+ * Declared structurally, and with `text`/`headers` OPTIONAL, because the suites inject hand-written
+ * response literals (`{ ok, status, json }`) rather than real `Response` objects. Reading the body
+ * has to work for both without pretending a fake carries headers it does not.
+ */
+type KiteResponseLike = {
+  readonly ok: boolean;
+  readonly status: number;
+  readonly headers?: { get(name: string): string | null } | undefined;
+  text?: () => Promise<string>;
+  json?: () => Promise<unknown>;
+};
+
+/** The `Retry-After` header, read defensively — a fake response may expose no headers at all. */
+function retryAfterHeaderOf(response: KiteResponseLike): string | null {
+  try {
+    return response.headers?.get("retry-after") ?? null;
+  } catch {
+    // A header bag that throws must not be able to convert a 429 into a transport fault.
+    return null;
+  }
+}
+
+/**
+ * Read a response body WITHOUT letting a non-JSON payload destroy the HTTP status.
+ *
+ * The old code called `await response.json()` unconditionally, and did it BEFORE checking
+ * `response.ok`. An error status served with an HTML or empty body — routine from an edge gateway,
+ * and exactly what a throttling proxy returns — made `json()` throw, so no `KiteHttpError` was ever
+ * constructed and the 429 was lost entirely: the adapter saw an opaque `SyntaxError` and could
+ * neither cool down nor classify it.
+ *
+ * `readFailure` distinguishes "the body could not be read" from "the body was not JSON", because
+ * only the former is a genuine transport fault (an aborted body read). A non-JSON body on an error
+ * status is not a fault at all — the status IS the information.
+ */
+async function readKiteResponseBody(
+  response: KiteResponseLike,
+): Promise<{ parsed: unknown; raw: string | null; readFailure: unknown }> {
+  if (typeof response.text === "function") {
+    let raw: string;
+    try {
+      raw = await response.text();
+    } catch (error) {
+      // An aborted/severed body read. Real fault — surfaced, not swallowed.
+      return { parsed: null, raw: null, readFailure: error };
+    }
+    if (raw === "") return { parsed: null, raw: "", readFailure: null };
+    try {
+      return { parsed: JSON.parse(raw) as unknown, raw, readFailure: null };
+    } catch {
+      return { parsed: null, raw, readFailure: null };
+    }
+  }
+  if (typeof response.json === "function") {
+    try {
+      return { parsed: await response.json(), raw: null, readFailure: null };
+    } catch (error) {
+      return { parsed: null, raw: null, readFailure: error };
+    }
+  }
+  return { parsed: null, raw: null, readFailure: null };
+}
+
+/** Kite's error envelope, when the body was JSON at all. */
+function kiteErrorMessage(parsed: unknown, raw: string | null, status: number): string {
+  if (parsed && typeof parsed === "object") {
+    const record = parsed as { message?: unknown; error_type?: unknown };
+    if (typeof record.message === "string" && record.message !== "") return record.message;
+    if (typeof record.error_type === "string" && record.error_type !== "") return record.error_type;
+  }
+  // Non-JSON body: keep a BOUNDED excerpt. It is often the only clue about which proxy answered.
+  if (raw !== null && raw.trim() !== "") return `Kite HTTP ${status}: ${raw.trim().slice(0, 200)}`;
+  return `Kite HTTP ${status}`;
 }
 
 /**
@@ -240,16 +335,31 @@ export class KiteHttpTransport implements KiteBrokerTransport {
       // request was transmitted, so the refusal stays a proven local no-POST and never an
       // ambiguous broker submission. Only placement passes it; reads/cancels leave it undefined.
       beforeSend?.();
-      const response = await fetchImpl(url, init);
-      const payload = await response.json() as { data?: T; message?: string; error_type?: string };
+      const response = (await fetchImpl(url, init)) as unknown as KiteResponseLike;
+      // Read the header BEFORE the body: a body read can fail, and the broker's backoff
+      // instruction must survive that.
+      const retryAfter = retryAfterHeaderOf(response);
+      const { parsed, raw, readFailure } = await readKiteResponseBody(response);
       if (!response.ok) {
+        // The STATUS is the information, and it now survives a non-JSON body. This is what makes a
+        // real 429 (often served with an HTML error page) reach `penalizeIfRateLimited` at all.
         throw new KiteHttpError(
           response.status,
-          payload.message ?? payload.error_type ?? `Kite HTTP ${response.status}`,
-          payload,
+          kiteErrorMessage(parsed, raw, response.status),
+          parsed ?? (raw === null ? null : { message: raw.slice(0, 500) }),
+          retryAfter,
         );
       }
-      return payload.data as T;
+      // A 2xx whose body could not be READ is a genuine transport fault (an aborted body read):
+      // surface it so the placement path still classifies the submission as ambiguous.
+      if (readFailure !== null) throw readFailure;
+      if (!parsed || typeof parsed !== "object") {
+        throw new Error(
+          `Kite ${method} ${path} returned HTTP ${response.status} with a body that was not JSON; ` +
+            "the outcome cannot be read from it.",
+        );
+      }
+      return (parsed as { data?: T }).data as T;
     } catch (error) {
       // A LOCAL REFUSAL is not a broker outcome: it must propagate untouched, never be dressed
       // up as an ambiguous submission (which would quarantine an order that was never sent).
@@ -300,6 +410,24 @@ export interface KiteBrokerAdapterConfig {
    * broker's published order limit.
    */
   pacing?: EffectiveBrokerPacing;
+  /**
+   * Concurrency bounds for the transport queue. Optional; the module default is used when absent.
+   *
+   * Exposed so a deployment can pin the transport to a single in-flight call if it needs to, without
+   * losing the priority ordering that keeps a cancel from queueing behind a poll.
+   */
+  concurrency?: Partial<TransportConcurrencyLimits>;
+  /**
+   * THE ACCOUNT THAT OWNS THE CREDENTIAL THIS ADAPTER SIGNS WITH — read fresh, every time.
+   *
+   * Wired in production to the same object the access token is resolved from, so the two cannot
+   * describe different accounts. Read fresh rather than captured at construction precisely because a
+   * re-login REPLACES the credential in place on a long-lived adapter.
+   *
+   * Optional: absent means the deployment cannot prove which account it signs as, which is reported
+   * as null (unproven) and never as a match.
+   */
+  credentialAccount?: () => string | null;
   /**
    * The SHARED, application-owned multi-window order budget for this broker ACCOUNT (Task 8).
    *
@@ -358,6 +486,19 @@ function isProtectivePurpose(purpose: BoxOrderPurpose | undefined): boolean {
 }
 
 /**
+ * Map the broker-metered endpoint class onto a DISPATCH TIER.
+ *
+ * Cancels and modifies reduce risk, so they outrank everything. A placement outranks a read: an
+ * entry leg delayed behind a routine positions poll widens the very window the hedge-first ordering
+ * exists to close. Reads always yield.
+ */
+function urgencyForEndpoint(klass: BrokerEndpointClass): TransportUrgency {
+  if (klass === "order_cancel" || klass === "order_modify") return "recovery";
+  if (klass === "order_place") return "placement";
+  return "read";
+}
+
+/**
  * Find a {@link KiteHttpError} anywhere in an error's cause chain.
  *
  * Wrapping is not optional on the placement path — an ambiguous 429'd POST must be reported as
@@ -365,22 +506,29 @@ function isProtectivePurpose(purpose: BoxOrderPurpose | undefined): boolean {
  * be at the top. Depth-bounded so a self-referential `cause` cannot spin.
  */
 function findKiteHttpError(error: unknown): KiteHttpError | null {
-  let current: unknown = error;
-  for (let depth = 0; depth < 8 && current; depth += 1) {
-    if (current instanceof KiteHttpError) return current;
-    const cause: unknown = current instanceof Error ? (current as { cause?: unknown }).cause : undefined;
-    if (cause === current) return null;
-    current = cause;
-  }
-  return null;
-}
-
-function readRetryAfterHeader(body: unknown): string | null {
-  if (body && typeof body === "object") {
-    const record = body as Record<string, unknown>;
-    const raw = record["retry_after"] ?? record["Retry-After"] ?? record["retryAfter"];
-    if (typeof raw === "string") return raw;
-    if (typeof raw === "number" && Number.isFinite(raw)) return String(raw);
+  // BOTH cause properties are traversed. This walked `.cause` only, while the wrappers that
+  // actually appear on the placement path (`BrokerAmbiguousSubmitError`, `BrokerOrderRejectedError`)
+  // stored the nested error in `causeValue` — so this function returned null for precisely the case
+  // its doc comment says it exists to handle, and a 429'd POST produced no cooldown. The wrappers
+  // now populate `.cause` too, but both are read here so the recovery does not depend on every
+  // wrapper in the tree having been updated.
+  //
+  // Breadth-first over a bounded frontier with an identity set, so a cycle or a diamond (the
+  // placement path wraps TWICE) can neither spin nor re-walk.
+  const seen = new Set<unknown>();
+  let frontier: unknown[] = [error];
+  for (let depth = 0; depth < 8 && frontier.length > 0; depth += 1) {
+    const next: unknown[] = [];
+    for (const node of frontier) {
+      if (node === null || node === undefined) continue;
+      if (node instanceof KiteHttpError) return node;
+      if (typeof node !== "object") continue;
+      if (seen.has(node)) continue;
+      seen.add(node);
+      const record = node as { cause?: unknown; causeValue?: unknown };
+      next.push(record.cause, record.causeValue);
+    }
+    frontier = next;
   }
   return null;
 }
@@ -396,6 +544,13 @@ export class KiteBrokerAdapter implements BrokerAdapter {
   private readonly clientByBroker = new Map<string, string>();
   private readonly modifications = new Map<string, number>();
   private readonly pacer: TransportPacer;
+  /**
+   * Rate-limit responses already charged to the budget, so one 429 costs exactly one penalty.
+   *
+   * A `WeakSet` keyed on the error instance: several layers may catch the same rejection, and the
+   * entry disappears with the error itself, so this can never grow.
+   */
+  private readonly penalizedRateLimits = new WeakSet<object>();
 
   constructor(
     private readonly transport: KiteBrokerTransport,
@@ -412,7 +567,24 @@ export class KiteBrokerAdapter implements BrokerAdapter {
       this.config.pacing ??
         resolveBrokerPacing("zerodha", this.config.brokerMinIntervalMs, 0),
       this.clock,
+      this.config.concurrency ?? {},
     );
+  }
+
+  /**
+   * The account behind the credential this adapter would sign the NEXT request with.
+   *
+   * Resolved from the credential holder itself, so it cannot drift from the token in use. Fail-safe:
+   * any fault reading it is reported as "unproven" (null) rather than as a match, because a guard
+   * that treats an error as agreement is worse than no guard at all.
+   */
+  dispatchAccount(): string | null {
+    try {
+      const account = this.config.credentialAccount?.() ?? null;
+      return typeof account === "string" && account.trim() !== "" ? account.trim() : null;
+    } catch {
+      return null;
+    }
   }
 
   /** The pacing actually in force, for diagnostics. Never a configured-but-unused value. */
@@ -487,7 +659,11 @@ export class KiteBrokerAdapter implements BrokerAdapter {
           price: req.pricing.limit_price,
           tag: order.tag as string,
         }, { beforeSend });
-      }, "order_place");
+        // A PROTECTIVE placement (EXIT / EMERGENCY_RESIDUAL / PROTECTIVE_CANCEL) reduces risk, so it
+        // rides the recovery tier alongside cancels rather than queueing behind routine reads like
+        // an entry does. Same test `isProtectivePurpose` already uses for the budget reserve, so the
+        // two cannot disagree about what counts as risk-reducing.
+      }, "order_place", { urgency: isProtectivePurpose(req.purpose) ? "recovery" : "placement" });
       this.mark(req.client_order_id, "http_response");
     } catch (error) {
       if (error instanceof BrokerPreSubmitRefusedError) {
@@ -583,27 +759,91 @@ export class KiteBrokerAdapter implements BrokerAdapter {
       return clone(this.quarantine(clientOrderId, order));
     }
     const brokerOrderId = order.broker_order_id;
-    // Written THROUGH the map rather than mutated in place: if a stream observation replaces the map
-    // entry during the DELETE below, an in-place mutation would apply to a detached object and the
-    // confirmation loop would then write that orphan lineage back over the merged fill.
-    this.commit(clientOrderId, { ...cloneBrokerOrder(order), state: "CANCEL_REQUESTED", updated_at: this.clock.now() });
-    // CANCEL REQUESTED. This opens cancel_request_to_terminal_ms — the measured span that sizes
-    // paper's cancel-vs-fill race window. It is deliberately marked BEFORE the DELETE is sent,
-    // because the race starts the moment we commit to cancelling.
-    this.mark(clientOrderId, "cancel_requested");
-    await withDeadline(
-      this.call(() => this.transport.cancelOrder(brokerOrderId), "order_cancel"),
-      this.config.cancelTimeoutMs,
-      "Kite cancellation timed out; reconciliation is required.",
-    ).catch((error) => {
-      this.penalizeIfRateLimited(error);
-      this.quarantine(clientOrderId, order);
-      throw error;
-    });
+    await this.sendCancelWithinDeadline(clientOrderId, brokerOrderId, order);
     // The broker accepted the cancel REQUEST. It is not yet a cancellation: the order may still
     // be filling right now, which is why confirmTerminalAfterCancel re-reads until terminal.
     this.mark(clientOrderId, "cancel_acknowledged");
     return clone(await this.confirmTerminalAfterCancel(clientOrderId));
+  }
+
+  /**
+   * Put a cancellation on the wire under ONE absolute deadline that governs BOTH the queue and the
+   * network — or prove that it never left.
+   *
+   * THE DEFECT THIS REPLACES. The old code raced `withDeadline` against a promise that had already
+   * been appended to the pacer's FIFO chain. Losing that race rejected the CALLER but did nothing
+   * whatsoever to the queued work, so the sequence was:
+   *
+   *     a slow read occupies the transport
+   *       → this cancel is queued behind it
+   *       → the caller is told the cancellation TIMED OUT
+   *       → the read finally returns
+   *       → the DELETE is transmitted, long after everyone stopped waiting for it
+   *
+   * The reported lifecycle and the actual broker activity disagreed, and a timeout could be read as
+   * "nothing was sent" while a cancellation was in fact still pending on the wire.
+   *
+   * Now there are three OUTCOMES, not two, and they are distinguished by evidence rather than
+   * guessed:
+   *
+   *   1. Acknowledged — the broker accepted the cancel request.
+   *   2. WITHDRAWN BEFORE DISPATCH — the deadline expired while it was queued. `abandon()` returning
+   *      true is PROOF the request never reached the transport, so the order is left exactly as it
+   *      was (still working, not quarantined) and the caller is told plainly that nothing was sent.
+   *      Manufacturing a RECONCILIATION_REQUIRED here would invent uncertainty and, via the
+   *      registry's `unknown_order_state` blocker, would also wedge logout and broker switching.
+   *   3. Dispatched, then failed or timed out — genuinely AMBIGUOUS. The DELETE may have reached the
+   *      exchange, so the order is quarantined for reconciliation exactly as before.
+   *
+   * `CANCEL_REQUESTED` is committed from inside the dispatched closure, so that state now means "the
+   * DELETE is on the wire" rather than "we intend to send one".
+   */
+  private async sendCancelWithinDeadline(
+    clientOrderId: string,
+    brokerOrderId: string,
+    priorOrder: BrokerOrder,
+  ): Promise<void> {
+    const deadline = this.deadlineIn(this.config.cancelTimeoutMs);
+    const submission = this.submitPaced(
+      () => {
+        // AT DISPATCH. Written THROUGH the map rather than mutated in place: if a stream observation
+        // replaces the map entry during the DELETE, an in-place mutation would apply to a detached
+        // object and the confirmation loop would write that orphan lineage back over the merged fill.
+        const latest = this.orders.get(clientOrderId) ?? priorOrder;
+        if (!isBrokerOrderTerminal(latest.state)) {
+          this.commit(clientOrderId, {
+            ...cloneBrokerOrder(latest),
+            state: "CANCEL_REQUESTED",
+            updated_at: this.clock.now(),
+          });
+          // Opens cancel_request_to_terminal_ms — the measured span that sizes paper's
+          // cancel-vs-fill race window. The race starts when the DELETE goes out.
+          this.mark(clientOrderId, "cancel_requested");
+        }
+        return this.transport.cancelOrder(brokerOrderId);
+      },
+      "order_cancel",
+      { deadline },
+    );
+
+    try {
+      await withDeadline(
+        submission.result,
+        this.config.cancelTimeoutMs,
+        "Kite cancellation timed out; reconciliation is required.",
+      );
+    } catch (error) {
+      this.penalizeIfRateLimited(error);
+      // Withdraw it if it is STILL QUEUED. A true return proves no request was transmitted.
+      if (submission.abandon("The cancellation deadline expired.") || error instanceof TransportRequestAbandonedError) {
+        throw new BrokerCancelNotTransmittedError(clientOrderId, brokerOrderId);
+      }
+      this.quarantine(clientOrderId, priorOrder);
+      throw error;
+    }
+    // The broker accepted the cancel REQUEST. It is not yet a cancellation: the order may still
+    // be filling right now, which is why confirmTerminalAfterCancel re-reads until terminal.
+    this.mark(clientOrderId, "cancel_acknowledged");
   }
 
   async modifyOrder(clientOrderId: string, request: BrokerModifyRequest): Promise<BrokerOrder> {
@@ -904,6 +1144,82 @@ export class KiteBrokerAdapter implements BrokerAdapter {
   }
 
   /**
+   * Re-read this order over REST, but let AUTHORITATIVE TERMINAL STREAM EVIDENCE end the wait early.
+   *
+   * THE DEFECT THIS CLOSES. `waitForResolution` had two suspension points and only the first was
+   * wakeable. `waitOrObservation` races the poll interval against a stream wake, so an event that
+   * arrives while we are sleeping is picked up at once — that path already worked. But the very next
+   * line was a bare `await this.refresh(order)`, and `waitOrObservation`'s `finally` has by then
+   * already removed the waiter. So during the REST round trip there was nothing registered to wake,
+   * and `wakeOrderWaiters` could only set the `pendingObservation` latch — which is not consulted
+   * until the TOP OF THE NEXT ITERATION, i.e. after REST returns.
+   *
+   * The consequence was pure latency, but on the worst possible path. A `COMPLETE` postback for a
+   * hedge BUY was merged into the session snapshot immediately and yet `submitOrder` stayed pending
+   * until the outstanding poll came back — and the hedge-first barrier holds every dependent
+   * uncovered SELL until `submitOrder` RESOLVES. So every millisecond spent waiting on a read whose
+   * answer we already had was added directly to the naked-short window.
+   *
+   * WHAT IS PRESERVED. The abandoned read is not cancelled and its result is not discarded: handlers
+   * stay attached, so it still lands in `commit()` and merges under the monotonic cumulative floor
+   * and the terminal guard. A late REST payload describing a SMALLER fill therefore still cannot
+   * rewind the stream's terminal state, and no rejection is left unhandled. Only a TERMINAL
+   * observation short-circuits; a partial one is not sufficient evidence to stop polling, so the
+   * read remains the plan.
+   */
+  private async refreshOrTerminalObservation(order: BrokerOrder): Promise<BrokerOrder> {
+    const clientOrderId = order.client_order_id;
+
+    // Registered BEFORE the read starts, and synchronously, so an event delivered during the round
+    // trip cannot fall between the two. (`applyOrderUpdate` is synchronous, so there is no
+    // interleaving point here.)
+    let waiters = this.orderWaiters.get(clientOrderId);
+    if (!waiters) {
+      waiters = new Set();
+      this.orderWaiters.set(clientOrderId, waiters);
+    }
+    let wake: () => void = () => {};
+    const observed = new Promise<"observed">((resolve) => {
+      wake = () => resolve("observed");
+    });
+    waiters.add(wake);
+
+    // If an edge was already latched, consume it: the snapshot may ALREADY be terminal.
+    if (this.pendingObservation.delete(clientOrderId)) {
+      const latched = this.orders.get(clientOrderId);
+      if (latched && isBrokerOrderTerminal(latched.state)) {
+        waiters.delete(wake);
+        if (waiters.size === 0) this.orderWaiters.delete(clientOrderId);
+        return latched;
+      }
+    }
+
+    // Never let the caller's rejection escape unhandled just because we stopped awaiting it.
+    const reading = this.refresh(order).then(
+      (refreshed) => ({ ok: true as const, order: refreshed }),
+      (error: unknown) => ({ ok: false as const, error }),
+    );
+
+    try {
+      const winner = await Promise.race([reading, observed]);
+      if (winner === "observed") {
+        const snapshot = this.orders.get(clientOrderId);
+        // TERMINAL evidence only. Anything less and the read is still the authority.
+        if (snapshot && isBrokerOrderTerminal(snapshot.state)) return snapshot;
+      }
+    } finally {
+      waiters.delete(wake);
+      if (waiters.size === 0) this.orderWaiters.delete(clientOrderId);
+    }
+
+    const outcome = await reading;
+    if (!outcome.ok) throw outcome.error;
+    // Prefer whatever the map holds now: `refresh` commits through it, and a stream observation that
+    // landed during the read has already been merged in.
+    return this.orders.get(clientOrderId) ?? outcome.order;
+  }
+
+  /**
    * APPLY ONE EXTERNAL ORDER OBSERVATION (a Kite order postback text frame).
    *
    * Same contract as the Dhan adapter's: already attributed by the projection, re-validated through
@@ -1003,7 +1319,8 @@ export class KiteBrokerAdapter implements BrokerAdapter {
         order = observed;
         if (isBrokerOrderTerminal(order.state)) break;
       }
-      order = await this.refresh(order);
+      order = await this.refreshOrTerminalObservation(order);
+      if (isBrokerOrderTerminal(order.state)) break;
       if (order.state === "PARTIALLY_FILLED" && partialAt === null) partialAt = this.clock.now();
     }
     return clone(order);
@@ -1013,18 +1330,18 @@ export class KiteBrokerAdapter implements BrokerAdapter {
     if (!order.broker_order_id || isBrokerOrderTerminal(order.state)) return order;
     const clientOrderId = order.client_order_id;
     const brokerOrderId = order.broker_order_id;
-    this.commit(clientOrderId, { ...cloneBrokerOrder(order), state: "CANCEL_REQUESTED", updated_at: this.clock.now() });
-    this.mark(clientOrderId, "cancel_requested");
     try {
-      await withDeadline(
-        this.call(() => this.transport.cancelOrder(brokerOrderId), "order_cancel"),
-        this.config.cancelTimeoutMs,
-        "Protective cancellation timed out.",
-      );
-      this.mark(clientOrderId, "cancel_acknowledged");
+      // Same deadline discipline as the public cancel: one absolute budget governing the queue AND
+      // the wire, and a withdrawal that PROVES nothing was transmitted rather than inferring it.
+      await this.sendCancelWithinDeadline(clientOrderId, brokerOrderId, order);
       return await this.confirmTerminalAfterCancel(clientOrderId);
     } catch (error) {
       this.penalizeIfRateLimited(error);
+      // PROVEN NO-REQUEST. The protective cancel never left, so this order is still working exactly
+      // as it was and there is no broker uncertainty to reconcile. Report it as the un-sent refusal
+      // it is; dressing it up as ambiguous would quarantine an order the broker never heard about
+      // and would tell the operator to reconcile something that never happened.
+      if (error instanceof BrokerCancelNotTransmittedError) throw error;
       // Quarantine the LATEST accepted state, not the pre-await snapshot: a fill observed while the
       // cancel was in flight is real exposure and must travel with the quarantine.
       const quarantined = this.quarantine(clientOrderId, order);
@@ -1050,7 +1367,9 @@ export class KiteBrokerAdapter implements BrokerAdapter {
     while (this.clock.now() <= deadline) {
       const known = this.orders.get(clientOrderId);
       if (!known) break;
-      const refreshed = await this.refresh(known);
+      // Same fast path as the resolution loop: this read used to be a bare await, so a fill that
+      // raced the cancel had to wait out the whole round trip before it could be seen.
+      const refreshed = await this.refreshOrTerminalObservation(known);
       if (isBrokerOrderTerminal(refreshed.state)) return refreshed;
       await this.waitOrObservation(Math.max(1, this.config.brokerMinIntervalMs), clientOrderId);
       const observed = this.orders.get(clientOrderId);
@@ -1207,11 +1526,53 @@ export class KiteBrokerAdapter implements BrokerAdapter {
    * before the transport call — if refused (only possible when even the reserve is spent), it
    * throws before any request leaves.
    */
-  private call<T>(operation: () => Promise<T>, klass: BrokerEndpointClass = "data_read"): Promise<T> {
-    if (klass === "order_cancel" || klass === "order_modify") {
-      this.reserveRecoveryBudgetOrThrow(klass);
-    }
-    return this.pacer.run(operation, pacingClassFor(klass));
+  private call<T>(
+    operation: () => Promise<T>,
+    klass: BrokerEndpointClass = "data_read",
+    opts: { deadline?: Deadline | null; urgency?: TransportUrgency } = {},
+  ): Promise<T> {
+    // EVERY paced broker touch now feeds a 429 to the budget, not just the three mutation call
+    // sites that used to do it by hand. A rate-limited STATUS POLL is the same signal as a rate
+    // limited placement — the account is over budget in a way our own count did not predict — and
+    // ignoring it meant we kept polling straight into a throttle the broker had already announced.
+    // `penalizeIfRateLimited` is identity-deduplicated, so a caller that also catches and penalizes
+    // the same error cannot double-charge it.
+    return this.submitPaced(operation, klass, opts).result.catch((error: unknown) => {
+      this.penalizeIfRateLimited(error);
+      throw error;
+    });
+  }
+
+  /**
+   * As {@link call}, but returns the pacer handle so a caller can withdraw a still-queued request.
+   *
+   * The recovery budget is now charged through `beforeDispatch` — i.e. at ACTUAL DISPATCH — rather
+   * than synchronously at enqueue. Charging at enqueue recorded spend against the broker's budget
+   * for cancels that were later abandoned in the queue and never sent, which made our count of
+   * consumed capacity drift permanently above what the broker had actually seen.
+   */
+  private submitPaced<T>(
+    operation: () => Promise<T>,
+    klass: BrokerEndpointClass = "data_read",
+    opts: { deadline?: Deadline | null; urgency?: TransportUrgency } = {},
+  ): TransportSubmission<T> {
+    const recovery = klass === "order_cancel" || klass === "order_modify";
+    return this.pacer.submit(operation, pacingClassFor(klass), {
+      urgency: opts.urgency ?? urgencyForEndpoint(klass),
+      ...(opts.deadline ? { deadline: opts.deadline } : {}),
+      ...(recovery ? { beforeDispatch: () => this.reserveRecoveryBudgetOrThrow(klass) } : {}),
+    });
+  }
+
+  /**
+   * A deadline anchored to this adapter's OWN clock.
+   *
+   * The adapters inject a virtual clock in tests, so a deadline built on `performance.now()` would
+   * be unrelated to the time the test is driving. `Deadline.at` exists precisely for this.
+   */
+  private deadlineIn(budgetMs: number): Deadline {
+    const budget = Number.isFinite(budgetMs) && budgetMs > 0 ? budgetMs : 1;
+    return Deadline.at(this.clock.now() + budget, budget, () => this.clock.now());
   }
 
   /**
@@ -1310,7 +1671,16 @@ export class KiteBrokerAdapter implements BrokerAdapter {
     if (!ledger) return;
     const http = findKiteHttpError(error);
     if (!http || !isRateLimited(http.status)) return;
-    ledger.penalize(this.clock.now(), parseRetryAfterMs(readRetryAfterHeader(http.body), this.clock.now()));
+    // ONE 429 RESPONSE MUST COST ONE PENALTY. Several layers may legitimately see the same error
+    // (the paced `call()` wrapper and the caller's own catch), and `penalize` extends a cooldown
+    // rather than replacing it, so a double call would not shorten the backoff — but it would
+    // double-count `penalties`, which operators read as "how often did the broker throttle us".
+    // Identity-keyed on the error instance, so two genuinely separate 429s still count twice.
+    if (this.penalizedRateLimits.has(http)) return;
+    this.penalizedRateLimits.add(http);
+    // The broker's OWN instruction, from the response header it actually sent. `parseRetryAfterMs`
+    // already understands both documented forms; it was simply never given a header before.
+    ledger.penalize(this.clock.now(), parseRetryAfterMs(http.retryAfter, this.clock.now()));
   }
 }
 
@@ -1558,10 +1928,16 @@ function numericPath(input: Record<string, unknown>, parent: string, child: stri
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
+/**
+ * Epoch ms for a Kite order timestamp — an IST wall clock with NO zone suffix.
+ *
+ * This used to be a bare `Date.parse`, which reads a zone-less date-time as HOST-LOCAL. On a UTC
+ * host (every deployment target in `deploy/`) that placed every Kite stamp 5h30m in the future and
+ * silently inflated the latency figures derived from it. Delegated to the shared IST parser so both
+ * live adapters cannot drift; see `brokerTimestamps.ts` for the full rationale.
+ */
 function parseTime(value: string | null): number | null {
-  if (!value) return null;
-  const time = Date.parse(value);
-  return Number.isFinite(time) ? time : null;
+  return parseIstBrokerTimestamp(value);
 }
 
 function errorMessage(error: unknown): string {

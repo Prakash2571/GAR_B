@@ -1053,3 +1053,228 @@ test("D2: an unnameable session account does NOT disable exposure reduction", as
   assert.equal(manager.canEnter(request()), false);
   assert.match(manager.entryBlockReason(request()) ?? "", /account could not be identified/);
 });
+
+
+/* ════════════════════════════════════════════════════════════════════════════════════════════════
+ * SUITE P0 — ACCOUNT CHANGES MUST BE FENCED ACROSS THE WHOLE OF EXECUTION.
+ *
+ * Every assertion below describes DESIRED behaviour and FAILS on the audited baseline (978b813).
+ *
+ * The baseline stamped the account onto the durable intent BEFORE persistence and then never checked
+ * it again. Between that stamp and the POST an order still has to survive two database round trips, a
+ * priority-queue wait, the hedge-first barrier, and lazy per-call token resolution — and a re-login
+ * installs a replacement credential SYNCHRONOUSLY. The audit reproduced two consequences:
+ *
+ *   1. The account changes A → B during persistence. The intent records A; submission proceeds while
+ *      B is current, so the POST is signed by B.
+ *   2. A long is attributed under A. After switching to B, an EXIT SELL is accepted using A's
+ *      attributed quantity. That SELL does not close A's long — it opens a SHORT in B.
+ *
+ * The fences are independent on purpose. `dispatchAccountBlockReason` compares the stamped account
+ * against the credential that will actually sign the request; the attributed-position stamp refuses a
+ * reduction derived from another account's exposure. Neither is sufficient alone: (1) needs the first,
+ * (2) needs the second.
+ * ════════════════════════════════════════════════════════════════════════════════════════════════ */
+
+/** A manager whose adapter reports a credential account that the test can move underneath it. */
+function accountFencedManager({ credential, session, positions = [] } = {}) {
+  const adapter = fakeAdapter({ positions });
+  // THE ACCOUNT BEHIND THE CREDENTIAL. On the baseline the adapter exposed only `mode`, so no guard
+  // could ever ask this question.
+  adapter.dispatchAccount = () => credential();
+  return makeManager({ adapter, brokerAccount: () => session() });
+}
+
+test("P0-1: an account change DURING PERSISTENCE stops the POST at the send boundary", async () => {
+  let account = "ZD-AAA";
+  const persistence = new MemoryPersistence();
+  const adapter = fakeAdapter({});
+  adapter.dispatchAccount = () => account;
+
+  // The re-login lands while the durable row is being written — the exact window the audit named.
+  const create = persistence.create.bind(persistence);
+  persistence.create = async (intent) => {
+    const row = await create(intent);
+    account = "ZD-BBB";
+    return row;
+  };
+
+  const h = await ready(makeManager({ adapter, persistence, brokerAccount: () => account }));
+  h.manager.setAttributedBoxPositions([], { account: "ZD-AAA" });
+
+  await assert.rejects(
+    () => h.manager.submit(request({ purpose: "ENTRY" })),
+    (err) => {
+      assert.match(err.message, /account changed after this order was authorised/i);
+      return true;
+    },
+    "an order stamped under ZD-AAA must not be transmitted on ZD-BBB's credential",
+  );
+
+  // THE HEADLINE ASSERTION: nothing reached the broker at all.
+  assert.equal(
+    adapter.calls.filter(([name]) => name === "submitOrder").length,
+    0,
+    "no POST may be attempted once the account has changed",
+  );
+});
+
+test("P0-2: a long attributed under account A cannot authorise an EXIT SELL under account B", async () => {
+  let session = "ZD-AAA";
+  const h = await ready(accountFencedManager({
+    credential: () => session,
+    session: () => session,
+  }));
+
+  // Reconciled while signed in as A: a real long of 75.
+  h.manager.setAttributedBoxPositions(
+    [{ exchange: "NFO", tradingsymbol: "SYM-k1_ce", net_quantity: 75 }],
+    { account: "ZD-AAA" },
+  );
+  // Sanity: under A the exit is permitted, so the refusal below is about the ACCOUNT and nothing else.
+  assert.equal(
+    h.manager.exposureReductionBlockReason(),
+    null,
+    "under the owning account, reduction is available",
+  );
+
+  // The operator signs in as a DIFFERENT account.
+  session = "ZD-BBB";
+
+  const exit = request({ purpose: "EXIT", role: "k1_ce", side: "SELL", quantity: 75 });
+  await assert.rejects(
+    () => h.manager.submit(exit),
+    (err) => {
+      assert.match(err.message, /reconciled under broker account ZD-AAA/i);
+      assert.match(err.message, /open NEW exposure/i);
+      return true;
+    },
+    "a SELL against A's long would open a SHORT in B and must be refused",
+  );
+  assert.equal(h.adapter.cancelled.length, 0);
+  assert.equal(
+    h.adapter.calls.filter(([name]) => name === "submitOrder").length,
+    0,
+    "the exit must not reach the broker",
+  );
+});
+
+test("P0-3: a SAME-account token refresh changes nothing — entry and exit both still work", async () => {
+  // The fix must fence REPLACEMENT, not refresh. A refresh re-installs a credential for the SAME
+  // account, which is routine and must stay completely transparent.
+  let account = "ZD-AAA";
+  const h = await ready(accountFencedManager({
+    credential: () => account,
+    session: () => account,
+  }));
+  h.manager.setAttributedBoxPositions(
+    [{ exchange: "NFO", tradingsymbol: "SYM-k1_ce", net_quantity: 75 }],
+    { account: "ZD-AAA" },
+  );
+
+  // A refresh: same account, new token. The account provider still answers ZD-AAA.
+  account = "ZD-AAA";
+
+  const exit = request({ purpose: "EXIT", role: "k1_ce", side: "SELL", quantity: 75 });
+  const order = await h.manager.submit(exit);
+  assert.equal(order.client_order_id, exit.client_order_id, "a refresh must not block an exit");
+  assert.equal(h.manager.entryBlockReason(request()), null, "nor new entry");
+});
+
+test("P0-4: an UNNAMEABLE session never strands exposure", async () => {
+  // The asymmetry the file already establishes: refusing a reduction on weak evidence GUARANTEES the
+  // exposure stays, while an exit aimed at an account we are not authenticated for simply fails at
+  // the broker. Only a KNOWN-DIFFERENT account is refused.
+  let session = "ZD-AAA";
+  const h = await ready(accountFencedManager({
+    credential: () => null,
+    session: () => session,
+  }));
+  h.manager.setAttributedBoxPositions(
+    [{ exchange: "NFO", tradingsymbol: "SYM-k1_ce", net_quantity: 75 }],
+    { account: "ZD-AAA" },
+  );
+
+  session = null; // the process can no longer name itself
+  assert.equal(
+    h.manager.exposureReductionBlockReason(),
+    null,
+    "an unnameable session must not disable the panic button",
+  );
+  const exit = request({ purpose: "EXIT", role: "k1_ce", side: "SELL", quantity: 75 });
+  const order = await h.manager.submit(exit);
+  assert.equal(order.client_order_id, exit.client_order_id, "the exit is still attempted");
+});
+
+test("P0-5: an UNSTAMPED attributed snapshot is not proof of foreignness", async () => {
+  // Rows and snapshots predating the account binding are UNPROVEN, not foreign. "Probably ours" must
+  // never authorise NEW exposure, but it is ample reason to try to reduce.
+  const h = await ready(accountFencedManager({
+    credential: () => "ZD-BBB",
+    session: () => "ZD-BBB",
+  }));
+  h.manager.setAttributedBoxPositions(
+    [{ exchange: "NFO", tradingsymbol: "SYM-k1_ce", net_quantity: 75 }],
+    { account: null },
+  );
+  const exit = request({ purpose: "EXIT", role: "k1_ce", side: "SELL", quantity: 75 });
+  const order = await h.manager.submit(exit);
+  assert.equal(order.client_order_id, exit.client_order_id, "unproven attribution still permits a reduction");
+});
+
+test("P0-6: the credential is checked even when the SESSION provider still agrees", async () => {
+  // The two witnesses are independent, and the credential is the authoritative one: a re-login
+  // installs the token FIRST and only then updates everything derived from it, so there is a real
+  // window in which the session provider is stale and only the adapter knows the truth.
+  const h = await ready(accountFencedManager({
+    credential: () => "ZD-BBB", // the token actually installed
+    session: () => "ZD-AAA",    // what the rest of the process still believes
+  }));
+  h.manager.setAttributedBoxPositions([], { account: "ZD-AAA" });
+
+  await assert.rejects(
+    () => h.manager.submit(request({ purpose: "ENTRY" })),
+    (err) => {
+      assert.match(err.message, /credential that would send it now belongs to account ZD-BBB/i);
+      return true;
+    },
+    "the credential's account is authoritative and must be compared, not just the session's",
+  );
+  assert.equal(h.adapter.calls.filter(([name]) => name === "submitOrder").length, 0);
+});
+
+test("P0-7: the attributed snapshot defaults its stamp from the live provider", async () => {
+  // The production seam (`engine.syncManagerExposure`) passes the account explicitly, but a caller
+  // that omits it must not silently produce an UNSTAMPED — and therefore unfenced — snapshot.
+  let session = "ZD-AAA";
+  const h = await ready(accountFencedManager({
+    credential: () => session,
+    session: () => session,
+  }));
+  h.manager.setAttributedBoxPositions([
+    { exchange: "NFO", tradingsymbol: "SYM-k1_ce", net_quantity: 75 },
+  ]); // no explicit account
+
+  session = "ZD-BBB";
+  await assert.rejects(
+    () => h.manager.submit(request({ purpose: "EXIT", role: "k1_ce", side: "SELL", quantity: 75 })),
+    /reconciled under broker account ZD-AAA/i,
+    "an omitted stamp must default to the account that was live at reconciliation",
+  );
+});
+
+test("P0-8: an adapter with NO dispatchAccount at all behaves exactly as before", async () => {
+  // Optionality is load-bearing: paper adapters and every pre-existing test construct adapters with
+  // no credential to describe, and that must remain "cannot prove" rather than "mismatch".
+  const adapter = fakeAdapter({});
+  assert.equal(adapter.dispatchAccount, undefined);
+  const h = await ready(makeManager({ adapter, brokerAccount: () => "ZD1234" }));
+  h.manager.setAttributedBoxPositions(
+    [{ exchange: "NFO", tradingsymbol: "SYM-k1_ce", net_quantity: 75 }],
+    { account: "ZD1234" },
+  );
+  const exit = request({ purpose: "EXIT", role: "k1_ce", side: "SELL", quantity: 75 });
+  const order = await h.manager.submit(exit);
+  assert.equal(order.client_order_id, exit.client_order_id);
+  assert.equal(h.manager.entryBlockReason(request()), null);
+});

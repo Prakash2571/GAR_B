@@ -251,8 +251,45 @@ export interface BrokerAdapter {
    * Optional so the paper adapter and every existing test are unchanged.
    */
   applyOrderUpdate?(update: ExternalOrderUpdate): BrokerOrder | undefined;
+
+  /**
+   * THE ACCOUNT BEHIND THE CREDENTIAL THIS ADAPTER WOULD USE RIGHT NOW, or null when unproven.
+   *
+   * WHY THIS IS ON THE ADAPTER AND NOT READ FROM THE SESSION. Until this existed, the only identity
+   * an adapter exposed was `mode` ("live" / "paper"), and the manager's idea of "the current
+   * account" came from a completely separate provider threaded down from the broker registry. Those
+   * two can disagree, and the window in which they disagree is precisely the dangerous one: a
+   * re-login installs a replacement credential SYNCHRONOUSLY, then awaits session persistence and
+   * resets feeds. An order authorised a moment before that install would be transmitted on the new
+   * account's credential while every other signal still described the old one.
+   *
+   * Asking the adapter closes that gap, because the adapter resolves its credential from the same
+   * object that answers this question. A guard can therefore compare the account an order was
+   * STAMPED with against the account whose credential is about to sign it.
+   *
+   * Optional: paper adapters and existing tests have no credential to describe, and `undefined`
+   * (like a null return) means "cannot prove", which callers must never read as "matches".
+   */
+  dispatchAccount?(): string | null;
 }
 
+/**
+ * A submission whose outcome at the broker is UNKNOWN. The order may or may not exist.
+ *
+ * WHY `Error.cause` IS SET AS WELL AS `causeValue`. This class stored the underlying error only in
+ * its own `causeValue` property and called `super(message)` with no options bag, so `.cause` stayed
+ * undefined. Meanwhile the code that has to recover the HTTP status from inside the wrapper —
+ * `findKiteHttpError` — walked the standard `.cause` chain. The two never met, so a rate-limited
+ * placement (which is CORRECTLY wrapped as ambiguous, because a 429'd POST may still have reached
+ * the exchange) reported no status at all: `Retry-After: 30` produced zero penalty and zero
+ * cooldown, and the next request walked straight back into a budget the broker had just told us to
+ * back off from.
+ *
+ * `causeValue` is retained because it is load-bearing elsewhere in the tree and is part of this
+ * repo's error convention; `cause` is now populated with the same value so standard traversal —
+ * including Node's own error formatting and `--test` diff output — can see it too. They are always
+ * the same object, never two different causes.
+ */
 export class BrokerAmbiguousSubmitError extends Error {
   readonly clientOrderId: string;
   readonly causeValue: unknown;
@@ -264,7 +301,7 @@ export class BrokerAmbiguousSubmitError extends Error {
     causeValue?: unknown,
     order?: BrokerOrder,
   ) {
-    super(message);
+    super(message, { cause: causeValue });
     this.name = "BrokerAmbiguousSubmitError";
     this.clientOrderId = clientOrderId;
     this.causeValue = causeValue;
@@ -277,7 +314,9 @@ export class BrokerOrderRejectedError extends Error {
     readonly order: BrokerOrder,
     readonly causeValue?: unknown,
   ) {
-    super(order.reject_reason ?? "Broker rejected order.");
+    // As above: keep `causeValue` (the repo convention) and mirror it onto the standard `.cause`
+    // so a nested transport error is reachable by ordinary cause-chain traversal.
+    super(order.reject_reason ?? "Broker rejected order.", { cause: causeValue });
     this.name = "BrokerOrderRejectedError";
   }
 }
@@ -286,6 +325,35 @@ export class BrokerDisabledError extends Error {
   constructor(message = "Live broker adapter is disabled.") {
     super(message);
     this.name = "BrokerDisabledError";
+  }
+}
+
+/**
+ * A cancellation that was NEVER TRANSMITTED — proven, not assumed.
+ *
+ * Raised only when the request was withdrawn while still queued behind broker pacing, so the
+ * transport was never invoked. That makes it categorically different from
+ * {@link BrokerAmbiguousSubmitError}: there is nothing to reconcile, because nothing was sent.
+ *
+ * WHAT A CALLER MUST CONCLUDE. The order is UNCHANGED and, if it was working before, it is working
+ * still — the exposure has NOT been reduced. So this is a reason to try again (or to escalate),
+ * never a reason to believe the order is gone. The two failure directions are not symmetric: wrongly
+ * believing a cancel succeeded leaves live exposure that nobody is watching.
+ */
+export class BrokerCancelNotTransmittedError extends Error {
+  /** Always false, and proven by the transport queue rather than inferred from a timeout. */
+  readonly transmitted = false;
+
+  constructor(
+    readonly clientOrderId: string,
+    readonly brokerOrderId: string,
+  ) {
+    super(
+      `The cancellation for ${clientOrderId} (broker order ${brokerOrderId}) exceeded its deadline while ` +
+        "still queued behind broker pacing, so it was withdrawn and NO request was sent. The order is " +
+        "unchanged and may still be working — cancellation must be retried.",
+    );
+    this.name = "BrokerCancelNotTransmittedError";
   }
 }
 
