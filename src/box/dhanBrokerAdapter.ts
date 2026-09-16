@@ -325,6 +325,28 @@ export class DhanBrokerAdapter implements BrokerAdapter {
   }
 
   /**
+   * The account behind the credential this adapter would sign the NEXT request with.
+   *
+   * WITHOUT THIS THE SEND-BOUNDARY ACCOUNT FENCE WAS A NO-OP FOR DHAN. The manager compares the
+   * account an order was stamped under against `adapter.dispatchAccount()`, and an adapter that does
+   * not implement it reports "cannot prove" — which, correctly, never refuses. So the P0 fence
+   * silently protected Zerodha only.
+   *
+   * `dhanClientId` is read fresh from the same provider the request body is built from
+   * (`buildOrderRequest` uses `this.cfg.dhanClientId()`), so the identity checked here and the
+   * identity sent to Dhan cannot diverge. Fail-safe: any fault is reported as unproven (null), never
+   * as a match.
+   */
+  dispatchAccount(): string | null {
+    try {
+      const account = this.cfg.dhanClientId();
+      return typeof account === "string" && account.trim() !== "" ? account.trim() : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Both gates, exactly like the Kite adapter: a disabled instance makes ZERO
    * broker calls, including reads.
    */

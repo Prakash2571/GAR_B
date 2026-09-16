@@ -290,6 +290,18 @@ export interface TransportPacerStats {
   readonly maxObservedInFlight: number;
   /** Times a risk-reducing operation was dispatched ahead of an older, less urgent one. */
   readonly priorityOvertakes: number;
+  /**
+   * Times the dispatch loop itself faulted (a throwing clock or deadline).
+   *
+   * Non-zero means queued operations were failed rather than dispatched. It must be zero; anything
+   * else is a bug in an injected dependency, and it is surfaced rather than swallowed because the
+   * previous behaviour was an unhandled rejection that took the process down.
+   */
+  readonly schedulerFaults: number;
+  /** The most recent scheduler fault message, for diagnostics. Bounded, low-cardinality. */
+  readonly lastSchedulerFault: string | null;
+  /** Longest time any operation has currently spent QUEUED, so a starved entry is visible. */
+  readonly oldestQueuedAgeMs: number;
 }
 
 /**
@@ -394,7 +406,20 @@ interface QueuedOperation {
   readonly operation: () => Promise<unknown>;
   readonly enqueuedAt: number;
   readonly settle: (outcome: { ok: true; value: unknown } | { ok: false; error: unknown }) => void;
-  waitedMs: number;
+  /**
+   * Whether `operation()` was actually invoked.
+   *
+   * SEPARATE FROM `state`, deliberately. `state` becomes `"settled"` for every outcome INCLUDING the
+   * ones where nothing was sent (pre-admission expiry, withdrawal, expiry in the queue, a
+   * dispatch-time budget refusal), so `state !== "queued"` cannot answer "did this reach the wire?".
+   * Reporting those as dispatched inverted the answer for exactly the middle case of the
+   * three-valued acknowledged / proven-unsent / ambiguous decision this module exists to serve.
+   */
+  reachedTransport: boolean;
+  /** Whether the ABSOLUTE floor bound the last pacing evaluation. Counted at dispatch. */
+  floorBound: boolean;
+  /** Whether urgency let this jump an older queued entry. Counted at dispatch. */
+  overtookOlder: boolean;
   state: "queued" | "dispatched" | "settled";
 }
 
@@ -440,6 +465,20 @@ export const DEFAULT_TRANSPORT_CONCURRENCY: TransportConcurrencyLimits = Object.
   reservedForRecovery: 1,
   maxConcurrentReads: 1,
 });
+
+/** A finite integer >= 1, or the fallback. NaN/Infinity/garbage fall back rather than uncapping. */
+function positiveIntOr(value: number | undefined, fallback: number): number {
+  if (value === undefined || !Number.isFinite(value)) return fallback;
+  const floored = Math.floor(value);
+  return floored >= 1 ? floored : fallback;
+}
+
+/** A finite integer >= 0, or the fallback. */
+function nonNegativeIntOr(value: number | undefined, fallback: number): number {
+  if (value === undefined || !Number.isFinite(value)) return fallback;
+  const floored = Math.floor(value);
+  return floored >= 0 ? floored : fallback;
+}
 
 /**
  * The transport pacer both live adapters share.
@@ -497,6 +536,16 @@ export class TransportPacer {
   private maxObservedQueueDepth = 0;
   private maxObservedInFlight = 0;
   private priorityOvertakes = 0;
+  private schedulerFaults = 0;
+  private lastSchedulerFault: string | null = null;
+  /**
+   * Pacing sleep served but not yet attributed to a dispatch.
+   *
+   * Held here rather than on the queue entry because a sleep can be served while one entry is picked
+   * and a different, more urgent one dispatched — charging it to the picked entry meant the time was
+   * either lost from the totals or attributed to an operation that never ran.
+   */
+  private pendingPacingWaitMs = 0;
 
   private readonly limits: TransportConcurrencyLimits;
 
@@ -505,19 +554,29 @@ export class TransportPacer {
     private readonly clock: { now: () => number; wait: (ms: number) => Promise<void> },
     limits: Partial<TransportConcurrencyLimits> = {},
   ) {
+    /*
+     * SANITISED WITH `Number.isFinite`, NOT JUST `??`.
+     *
+     * `??` only catches null/undefined, and `Math.max(1, Math.floor(NaN))` is NaN. A NaN bound is
+     * not a large bound — it is NO bound: `inFlight >= NaN` is false and the reserve comparison is
+     * false, so the concurrency cap and the recovery reserve both silently disappear. `NaN` is
+     * trivially produced by `Number(process.env.…)` on a typo, so this must fail SAFE (fall back to
+     * the conservative default) rather than fail open.
+     */
+    const maxInFlight = positiveIntOr(limits.maxInFlight, DEFAULT_TRANSPORT_CONCURRENCY.maxInFlight);
+    const requestedReserve = nonNegativeIntOr(
+      limits.reservedForRecovery,
+      DEFAULT_TRANSPORT_CONCURRENCY.reservedForRecovery,
+    );
     this.limits = {
-      maxInFlight: Math.max(1, Math.floor(limits.maxInFlight ?? DEFAULT_TRANSPORT_CONCURRENCY.maxInFlight)),
+      maxInFlight,
       // Never reserve so much that a non-recovery operation can never run at all.
-      reservedForRecovery: Math.max(
-        0,
-        Math.min(
-          Math.max(1, Math.floor(limits.maxInFlight ?? DEFAULT_TRANSPORT_CONCURRENCY.maxInFlight)) - 1,
-          Math.floor(limits.reservedForRecovery ?? DEFAULT_TRANSPORT_CONCURRENCY.reservedForRecovery),
-        ),
-      ),
-      maxConcurrentReads: Math.max(
-        1,
-        Math.floor(limits.maxConcurrentReads ?? DEFAULT_TRANSPORT_CONCURRENCY.maxConcurrentReads),
+      reservedForRecovery: Math.min(maxInFlight - 1, requestedReserve),
+      // Capped at the total: a read limit above `maxInFlight` is meaningless and would only mislead
+      // whoever reads the diagnostics.
+      maxConcurrentReads: Math.min(
+        maxInFlight,
+        positiveIntOr(limits.maxConcurrentReads, DEFAULT_TRANSPORT_CONCURRENCY.maxConcurrentReads),
       ),
     };
   }
@@ -556,7 +615,27 @@ export class TransportPacer {
       maxObservedQueueDepth: this.maxObservedQueueDepth,
       maxObservedInFlight: this.maxObservedInFlight,
       priorityOvertakes: this.priorityOvertakes,
+      schedulerFaults: this.schedulerFaults,
+      lastSchedulerFault: this.lastSchedulerFault,
+      oldestQueuedAgeMs: this.oldestQueuedAgeMs(),
     };
+  }
+
+  /**
+   * How long the longest-waiting queued operation has been waiting.
+   *
+   * Queue DEPTH alone hides the case that matters: one starved entry behind a saturated tier reads
+   * as depth 1, which looks healthy. Age does not.
+   */
+  private oldestQueuedAgeMs(): number {
+    const now = this.clock.now();
+    let oldest = 0;
+    for (const entry of this.queue) {
+      if (entry.state !== "queued") continue;
+      const age = now - entry.enqueuedAt;
+      if (age > oldest) oldest = age;
+    }
+    return oldest;
   }
 
   /** How many operations are waiting for a dispatch slot right now. */
@@ -609,7 +688,9 @@ export class TransportPacer {
       beforeDispatch: options.beforeDispatch,
       operation: operation as () => Promise<unknown>,
       enqueuedAt: this.clock.now(),
-      waitedMs: 0,
+      reachedTransport: false,
+      floorBound: false,
+      overtookOlder: false,
       state: "queued",
       settle: (outcome) => {
         if (settled) return;
@@ -644,7 +725,11 @@ export class TransportPacer {
   private handleFor<T>(entry: QueuedOperation, result: Promise<T>): TransportSubmission<T> {
     return {
       result,
-      dispatched: () => entry.state !== "queued",
+      // `reachedTransport`, NOT `state !== "queued"`. See the field's own comment: a withdrawn,
+      // expired or budget-refused entry is settled but was never handed to the transport, and
+      // reporting it as dispatched is precisely the "a timeout means it was sent" confusion this
+      // whole mechanism exists to remove.
+      dispatched: () => entry.reachedTransport,
       abandon: (reason: string): boolean => {
         // Already on the wire (or already finished): the outcome is the broker's to decide and this
         // caller may not claim otherwise.
@@ -677,8 +762,12 @@ export class TransportPacer {
     });
   }
 
+  /** A genuinely READ-ONLY predicate: it must not touch the diagnostics counters. */
   private canDispatchSomething(): boolean {
-    return this.pickNext() !== null;
+    for (const entry of this.queue) {
+      if (entry.state === "queued" && this.admissible(entry)) return true;
+    }
+    return false;
   }
 
   /**
@@ -690,47 +779,128 @@ export class TransportPacer {
    */
   private async drainQueue(): Promise<void> {
     for (;;) {
-      this.refuseExpiredQueueEntries();
-      const next = this.pickNext();
-      if (!next) return;
-
-      const now = this.clock.now();
-      const classWait = pacingWaitMs({
-        pacing: this.pacing,
-        klass: next.klass,
-        lastCallAt: next.klass === "order_mutation" ? this.lastOrderMutationAt : this.lastGeneralAt,
-        now,
-      });
-      // The absolute floor uses the order-mutation interval as the tightest permissible gap
-      // between ANY two transport calls, bounding total request rate.
-      const absoluteWait = pacingWaitMs({
-        pacing: this.pacing,
-        klass: "order_mutation",
-        lastCallAt: this.lastAnyCallAt,
-        now,
-      });
-      const wait = Math.max(classWait, absoluteWait);
-
-      if (wait > 0) {
-        if (absoluteWait > classWait) this.absoluteFloorBinds++;
-        // The sleep itself is bounded by the operation's own deadline, so a request cannot spend
-        // its entire budget waiting for a slot and then be transmitted anyway.
-        const slice = next.deadline ? Math.min(wait, Math.max(1, next.deadline.timerMs())) : wait;
-        const before = this.clock.now();
-        await this.clock.wait(slice);
-        next.waitedMs += slice;
-        const after = this.clock.now();
-        // A clock that does not advance across a wait cannot express pacing at all (several suites
-        // inject `wait: () => Promise.resolve()`). Dispatching is what the previous implementation
-        // did in that case; re-evaluating instead would spin forever.
-        if (after > before) continue;
+      // A THROW HERE MUST NOT KILL THE SCHEDULER — OR THE PROCESS. `startScheduling` voids this
+      // promise, so an exception escaping the loop became an unhandled rejection (process exit on
+      // modern Node) and left every queued operation unsettled. The clock and the deadline are both
+      // caller-supplied closures, so neither is beyond throwing.
+      let progressed: boolean;
+      try {
+        progressed = await this.drainStep();
+      } catch (error) {
+        this.schedulerFaults++;
+        this.lastSchedulerFault = error instanceof Error ? error.message : String(error);
+        // Fail the whole queue rather than strand it: an unsettled caller waits forever, which on
+        // the order path means a protective action that never reports either way.
+        this.failQueue(error);
+        return;
       }
+      if (!progressed) return;
+    }
+  }
 
-      if (next.deadline?.expired()) {
-        this.refuseExpired(next);
-        continue;
-      }
-      this.dispatch(next, next.waitedMs);
+  /**
+   * One scheduling decision. Returns false when there is nothing dispatchable right now.
+   *
+   * Split out of the loop so a fault can be contained per step (see {@link drainQueue}).
+   */
+  private async drainStep(): Promise<boolean> {
+    this.refuseExpiredQueueEntries();
+    const next = this.pickNext();
+    if (!next) return false;
+
+    const now = this.clock.now();
+    const classWait = pacingWaitMs({
+      pacing: this.pacing,
+      klass: next.klass,
+      lastCallAt: next.klass === "order_mutation" ? this.lastOrderMutationAt : this.lastGeneralAt,
+      now,
+    });
+    // The absolute floor uses the order-mutation interval as the tightest permissible gap
+    // between ANY two transport calls, bounding total request rate.
+    const absoluteWait = pacingWaitMs({
+      pacing: this.pacing,
+      klass: "order_mutation",
+      lastCallAt: this.lastAnyCallAt,
+      now,
+    });
+    const wait = Math.max(classWait, absoluteWait);
+    // Recomputed every pass, so the flag describes the constraint that actually bound the DISPATCH
+    // rather than whichever pass happened to observe it first.
+    next.floorBound = absoluteWait > classWait;
+
+    if (wait > 0) {
+      /*
+       * SLEEP IN BOUNDED SLICES, NOT IN ONE GO.
+       *
+       * There is exactly one drain loop and its sleep is not interruptible, so a single long sleep
+       * is a head-of-line block: a poll that owes a 250ms general interval would hold a protective
+       * cancel that becomes dispatchable at the 110ms absolute floor. Nothing can dispatch closer
+       * together than that floor anyway, so re-evaluating on it costs nothing and lets an operation
+       * that arrives DURING the sleep be reconsidered on its own merits.
+       */
+      const quantum = Math.max(1, this.pacing.orderMutationMinIntervalMs);
+      let slice = Math.min(wait, quantum);
+      // Bounded by this operation's own deadline too, so it cannot spend its entire budget waiting
+      // for a slot and then be transmitted anyway.
+      if (next.deadline) slice = Math.min(slice, next.deadline.timerMs());
+
+      const before = this.clock.now();
+      await this.clock.wait(slice);
+      const after = this.clock.now();
+      // Charge the time ACTUALLY observed. Charging the requested slice let a clock that advances
+      // less than asked (or not at all) inflate the pacing statistics without the broker ever
+      // having been given the gap those statistics claimed.
+      const served = after - before;
+      if (served > 0) this.pendingPacingWaitMs += served;
+
+      /*
+       * WITHDRAWN OR SETTLED WHILE WE SLEPT — RE-CHECK BEFORE DISPATCHING.
+       *
+       * THIS IS THE DEFECT THAT RE-OPENED AUDIT FINDING 4. The await is a real yield point, and
+       * `abandon()` is called from an independent timer (the adapter races its own deadline). So an
+       * entry could be withdrawn here — with `abandon()` returning true, i.e. telling the caller
+       * "PROVEN nothing was transmitted" — and then be dispatched anyway on the fall-through below,
+       * charging its budget, stamping the watermarks and putting the DELETE on the wire.
+       */
+      if (next.state !== "queued") return true;
+
+      // The clock advanced: re-evaluate from scratch. The remaining wait may be shorter, or
+      // something more urgent may have arrived.
+      if (served > 0) return true;
+      // A clock that does not advance across a wait cannot express pacing at all (several suites
+      // inject `wait: () => Promise.resolve()`). Fall through and dispatch rather than spin — but
+      // only AFTER the state re-check above.
+    }
+
+    if (next.deadline?.expired()) {
+      this.refuseExpired(next);
+      return true;
+    }
+    this.dispatch(next);
+    return true;
+  }
+
+  /**
+   * Settle every queued operation with a scheduler fault.
+   *
+   * Nothing was dispatched, so these are proven no-requests. Reporting them is strictly better than
+   * leaving them pending: an unsettled protective cancel is a caller that never learns either way.
+   */
+  private failQueue(error: unknown): void {
+    const message = error instanceof Error ? error.message : String(error);
+    for (const entry of [...this.queue]) {
+      if (entry.state !== "queued") continue;
+      const index = this.queue.indexOf(entry);
+      if (index >= 0) this.queue.splice(index, 1);
+      this.abandonedBeforeDispatch++;
+      entry.settle({
+        ok: false,
+        error: new TransportRequestAbandonedError(
+          `The transport scheduler faulted (${message}); nothing was transmitted.`,
+          entry.klass,
+          Math.max(0, this.clock.now() - entry.enqueuedAt),
+        ),
+      });
     }
   }
 
@@ -743,30 +913,58 @@ export class TransportPacer {
     if (this.queue.length === 0) return null;
     if (this.inFlight >= this.limits.maxInFlight) return null;
 
-    const ordered = [...this.queue].sort((a, b) => {
-      const byUrgency = URGENCY_RANK[a.urgency] - URGENCY_RANK[b.urgency];
-      return byUrgency !== 0 ? byUrgency : a.seq - b.seq;
-    });
-
-    for (const candidate of ordered) {
+    /*
+     * A SINGLE LINEAR SCAN, NOT A SORT.
+     *
+     * This used to copy and sort the whole queue on every call, and it is called several times per
+     * dispatch (each pacing slice, each release, each idle re-check), so draining n operations cost
+     * O(n² log n) and allocated n arrays. One pass keeping the best candidate is equivalent — the
+     * ordering is a total order on (urgency rank, arrival sequence) — and allocates nothing.
+     *
+     * `seq` is a monotonic counter that is never reset, so ties within a tier resolve to arrival
+     * order deterministically and FIFO-within-tier holds without relying on sort stability.
+     */
+    let best: QueuedOperation | null = null;
+    let oldestQueued: QueuedOperation | null = null;
+    for (const candidate of this.queue) {
       if (candidate.state !== "queued") continue;
-      if (candidate.urgency === "read" && this.readsInFlight >= this.limits.maxConcurrentReads) continue;
-      // Everything except recovery must leave the reserve alone.
+      if (oldestQueued === null || candidate.seq < oldestQueued.seq) oldestQueued = candidate;
+      if (!this.admissible(candidate)) continue;
       if (
-        candidate.urgency !== "recovery" &&
-        this.limits.maxInFlight - this.inFlight <= this.limits.reservedForRecovery
+        best === null ||
+        URGENCY_RANK[candidate.urgency] < URGENCY_RANK[best.urgency] ||
+        (candidate.urgency === best.urgency && candidate.seq < best.seq)
       ) {
-        continue;
+        best = candidate;
       }
-      // Diagnostics: did urgency let this jump an older entry?
-      const oldestQueued = ordered.reduce<QueuedOperation | null>(
-        (best, item) => (item.state === "queued" && (best === null || item.seq < best.seq) ? item : best),
-        null,
-      );
-      if (oldestQueued && oldestQueued !== candidate) this.priorityOvertakes++;
-      return candidate;
     }
-    return null;
+    if (best !== null && oldestQueued !== null && oldestQueued !== best) {
+      // Recorded on the entry and counted at DISPATCH, not here. Counting here inflated the figure
+      // several-fold: `pickNext` runs on every pacing slice and every idle re-check, and it also
+      // counted candidates that were subsequently refused and never dispatched at all.
+      best.overtookOlder = true;
+    }
+    return best;
+  }
+
+  /**
+   * Is there capacity for this operation right now, ignoring pacing?
+   *
+   * Extracted so {@link pickNext} and {@link canDispatchSomething} cannot drift — the second used to
+   * call the first purely as a predicate, which also meant a "read-only" check mutated the
+   * diagnostics counters.
+   */
+  private admissible(candidate: QueuedOperation): boolean {
+    if (this.inFlight >= this.limits.maxInFlight) return false;
+    if (candidate.urgency === "read" && this.readsInFlight >= this.limits.maxConcurrentReads) return false;
+    // Everything except recovery must leave the reserve alone.
+    if (
+      candidate.urgency !== "recovery" &&
+      this.limits.maxInFlight - this.inFlight <= this.limits.reservedForRecovery
+    ) {
+      return false;
+    }
+    return true;
   }
 
   private refuseExpiredQueueEntries(): void {
@@ -784,6 +982,10 @@ export class TransportPacer {
    * consumed none of the broker's capacity and must not be accounted as if it had.
    */
   private refuseExpired(entry: QueuedOperation): void {
+    // Guarded: an entry the caller already withdrew is settled and counted. Without this an
+    // abandon-then-expire sequence counted `abandonedBeforeDispatch` twice for one operation, which
+    // an operator reads as two withheld requests.
+    if (entry.state !== "queued") return;
     const index = this.queue.indexOf(entry);
     if (index >= 0) this.queue.splice(index, 1);
     this.abandonedBeforeDispatch++;
@@ -797,7 +999,11 @@ export class TransportPacer {
     });
   }
 
-  private dispatch(entry: QueuedOperation, wait: number): void {
+  private dispatch(entry: QueuedOperation): void {
+    // LAST LINE OF DEFENCE. Every caller re-checks before reaching here, but this method is what
+    // actually puts a request on the wire, so it refuses to act on an entry that is no longer
+    // queued rather than trusting its callers to have checked.
+    if (entry.state !== "queued") return;
     const index = this.queue.indexOf(entry);
     if (index >= 0) this.queue.splice(index, 1);
 
@@ -813,7 +1019,16 @@ export class TransportPacer {
       }
     }
 
+    // The pacing sleep served since the last dispatch belongs to THIS dispatch — it is the gap the
+    // broker was given before this request. Held on the pacer rather than per entry, because a
+    // sleep can be served while one entry is picked and a different (more urgent) one dispatched.
+    const wait = this.pendingPacingWaitMs;
+    this.pendingPacingWaitMs = 0;
+    if (entry.floorBound) this.absoluteFloorBinds++;
+    if (entry.overtookOlder) this.priorityOvertakes++;
+
     entry.state = "dispatched";
+    entry.reachedTransport = true;
     const at = this.clock.now();
     this.lastAnyCallAt = at;
     if (entry.klass === "order_mutation") {

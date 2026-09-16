@@ -1758,11 +1758,44 @@ export class BoxOrderManager {
       if (!verdict.admit) return;
       this.queue.shift();
 
-      const blocked = this.queuedActionBlockReason(action);
+      /*
+       * THE DEQUEUE REFUSAL IS THE ONE EXIT THAT BYPASSES `execute()` ENTIRELY.
+       *
+       * `execute()`'s `finally` releases the hedge-first rank on every path out of it, and
+       * `releaseOnReject` covers the synchronous refusals in `submit()`. This path was covered by
+       * neither, so an ENTRY leg refused HERE never decided its rank. Two consequences:
+       *
+       *   - `entryAllRanksDecided` could never become true, so the `EntryTransportGate` and its
+       *     `HedgeCoverageLedger` leaked, one per affected attempt, for the life of the process;
+       *   - if the refused rank was a HEDGE and a dependent uncovered SELL was already parked in
+       *     `awaitEntryTransportTurn`, `entryHedgesDecided` could never become true either, so the
+       *     SELL was never woken. Its `execute()` never returns, so the scheduling slot,
+       *     `entryAttemptInFlight`, its reservation and its `activeClientIds` entry are all held
+       *     forever, the pump can admit nothing further, and the gateway's `Promise.allSettled`
+       *     never settles — leaving a filled BUY hedge unattended with no legging record and no
+       *     partial-entry recovery.
+       *
+       * The block is also wrapped, because `queuedActionBlockReason` consults injected providers
+       * (`brokerAccount()`, the capital authority). A throw here previously dropped an already
+       * SHIFTED action with neither resolve nor reject — a caller that waits forever, a permanently
+       * leaked reservation, and an unhandled rejection out of the `finally`-driven re-entry that
+       * STOPPED the pump, parking every queued EXIT and EMERGENCY_RESIDUAL behind it. A guard that
+       * asks "may I proceed?" must fail closed, not fail silent.
+       */
+      let blocked: string | null;
+      try {
+        blocked = this.queuedActionBlockReason(action);
+      } catch (error) {
+        blocked = `the dequeue re-check could not be evaluated: ${errorMessage(error)}`;
+      }
       if (blocked) {
         if (action.kind === "submit") {
           this.activeClientIds.delete(action.request.client_order_id);
           this.releaseReservation(action.request.client_order_id);
+          // Release the hedge-first rank so a dependent sibling cannot park on it forever.
+          if (action.entry) {
+            this.decideEntryTransportRank(action.request, action.entry, "no_post", blocked, null);
+          }
         }
         action.reject(new Error(blocked));
         continue;

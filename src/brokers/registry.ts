@@ -1387,6 +1387,35 @@ export class ActiveBrokerManager {
       this.dhanProblems = this.computeDhanProblems();
       throw err;
     });
+    /*
+     * ACCOUNT REPLACEMENT IS FENCED HERE TOO — the mirror of `completeZerodhaLogin`.
+     *
+     * Fencing only the Zerodha path would have left the identical P0 open on Dhan: a sign-in as a
+     * different `dhanClientId` while exposure is unresolved reaches the same end state as a broker
+     * switch, with every position, working order and durable intent belonging to an account this
+     * session must not act on. The two login paths are deliberately kept symmetrical, because a gap
+     * in one of two near-identical fences is how the defect comes back by the other route.
+     *
+     * A same-account token refresh, and a first sign-in with no prior session, are untouched.
+     */
+    const previousDhanAccount = this.dhanSessionMeta?.clientId?.trim() ?? null;
+    const incomingDhanAccount = session.dhanClientId?.trim() ?? null;
+    if (
+      previousDhanAccount !== null &&
+      incomingDhanAccount !== null &&
+      previousDhanAccount !== incomingDhanAccount
+    ) {
+      const blockers = await this.accountReplacementBlockers("dhan", previousDhanAccount, incomingDhanAccount);
+      if (blockers.length > 0) {
+        const detail = blockers.map((blocker) => blocker.detail).join(" ");
+        this.loginErrors.dhan =
+          `Refused to replace the signed-in Dhan account (${previousDhanAccount} → ${incomingDhanAccount}) ` +
+          `while exposure is unresolved. ${detail}`;
+        this.dhanProblems = this.computeDhanProblems();
+        throw new DhanError(this.loginErrors.dhan, 409, "ACCOUNT_REPLACEMENT_BLOCKED");
+      }
+    }
+
     this.loginErrors.dhan = null;
 
     this.dhanAccessToken = session.accessToken;

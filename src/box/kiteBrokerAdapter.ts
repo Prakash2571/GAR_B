@@ -672,6 +672,12 @@ export class KiteBrokerAdapter implements BrokerAdapter {
         this.orders.delete(req.client_order_id);
         throw error;
       }
+      // A PROVEN NO-REQUEST propagates untouched, exactly like a pre-submit refusal. A protective
+      // cancellation that was withdrawn while still queued means the order is UNCHANGED and still
+      // working at the broker; quarantining it here would both invent uncertainty and (via the
+      // registry's `unknown_order_state` blocker) wedge logout and broker switching. This catch-all
+      // used to swallow it and quarantine anyway, reintroducing the wedge the error type prevents.
+      if (error instanceof BrokerCancelNotTransmittedError) throw error;
       // A 429 feeds the shared budget a cooldown (never a resend). Done before any classification
       // so the cooldown is recorded even on the ambiguous path below.
       this.penalizeIfRateLimited(error);
@@ -758,6 +764,11 @@ export class KiteBrokerAdapter implements BrokerAdapter {
     if (!order.broker_order_id) {
       return clone(this.quarantine(clientOrderId, order));
     }
+    // Idempotent: a cancellation already on the wire is awaited, not duplicated. See the same guard
+    // in `protectiveCancelAndConfirm` for why a second DELETE is actively harmful.
+    if (order.state === "CANCEL_REQUESTED") {
+      return clone(await this.confirmTerminalAfterCancel(clientOrderId));
+    }
     const brokerOrderId = order.broker_order_id;
     await this.sendCancelWithinDeadline(clientOrderId, brokerOrderId, order);
     // The broker accepted the cancel REQUEST. It is not yet a cancellation: the order may still
@@ -834,6 +845,11 @@ export class KiteBrokerAdapter implements BrokerAdapter {
       );
     } catch (error) {
       this.penalizeIfRateLimited(error);
+      // A LOCAL BUDGET REFUSAL IS ALSO A PROVEN NO-REQUEST. `reserveRecoveryBudgetOrThrow` runs at
+      // the dispatch boundary and throws BEFORE the transport is touched, so quarantining here would
+      // invent uncertainty about a request that demonstrably never left — and, via the registry's
+      // `unknown_order_state` blocker, would additionally wedge logout and broker switching.
+      if (error instanceof BrokerPreSubmitRefusedError) throw error;
       // Withdraw it if it is STILL QUEUED. A true return proves no request was transmitted.
       if (submission.abandon("The cancellation deadline expired.") || error instanceof TransportRequestAbandonedError) {
         throw new BrokerCancelNotTransmittedError(clientOrderId, brokerOrderId);
@@ -1300,11 +1316,29 @@ export class KiteBrokerAdapter implements BrokerAdapter {
   private async waitForResolution(order: BrokerOrder): Promise<BrokerOrder> {
     const started = this.clock.now();
     let partialAt: number | null = null;
+    /*
+     * THE ACK PHASE IS LATCHED, AND ONLY EXITED ONCE.
+     *
+     * THE DEFECT THIS FIXES. The deadline used to be re-derived on every pass from `order.state`,
+     * while `elapsed` was always measured from `started`. But `kiteState` maps every transient
+     * `*PENDING` label — `VALIDATION PENDING`, `OPEN PENDING`, `MODIFY PENDING`,
+     * `MODIFY VALIDATION PENDING`, `PUT ORDER REQ RECEIVED` — back to `ACKNOWLEDGED`. So a healthy
+     * order resting for 4s under the 30s working budget would, the moment one poll happened to
+     * report a pending label, be judged against the 3s ACK budget instead: `4000 >= 3000` and it was
+     * protectively CANCELLED. Cancelling a live entry leg turns a four-leg box into a partial entry;
+     * if the leg was a BUY hedge it also records zero proven coverage, so the dependent SELL is
+     * refused and the partial is guaranteed.
+     *
+     * Once the broker has been seen WORKING, the order has demonstrably been accepted and can never
+     * legitimately return to "waiting for acknowledgement". Latching that is what makes the budget
+     * monotonic; the inverse error is also removed, because a genuinely stuck ACK can no longer be
+     * granted the 30s budget just because one poll read `OPEN`.
+     */
+    let ackPhase = order.state === "ACKNOWLEDGED" || order.state === "SUBMITTING";
     while (!isBrokerOrderTerminal(order.state)) {
+      if (ackPhase && order.state !== "ACKNOWLEDGED" && order.state !== "SUBMITTING") ackPhase = false;
       const elapsed = this.clock.now() - started;
-      const deadline = order.state === "ACKNOWLEDGED"
-        ? this.config.ackTimeoutMs
-        : this.config.workingTimeoutMs;
+      const deadline = ackPhase ? this.config.ackTimeoutMs : this.config.workingTimeoutMs;
       if (elapsed >= deadline || (partialAt !== null && this.clock.now() - partialAt >= this.config.partialTimeoutMs)) {
         return clone(await this.protectiveCancelAndConfirm(order));
       }
@@ -1328,6 +1362,22 @@ export class KiteBrokerAdapter implements BrokerAdapter {
 
   private async protectiveCancelAndConfirm(order: BrokerOrder): Promise<BrokerOrder> {
     if (!order.broker_order_id || isBrokerOrderTerminal(order.state)) return order;
+    /*
+     * A CANCELLATION IS ALREADY IN FLIGHT — DO NOT SEND A SECOND ONE.
+     *
+     * `CANCEL_REQUESTED` is deliberately NOT terminal (the order can still be filling), so the
+     * terminality check above does not cover it. Without this guard a second DELETE went out
+     * whenever a cancel was already pending — our own earlier cancel whose confirmation timed out,
+     * an operator cancelling from the Kite console, or this loop coming round again because
+     * `CANCEL_REQUESTED` never satisfies the `while` condition. Kite answers a DELETE on an order
+     * already in `CANCEL PENDING` with a definitive 400, which the catch below then converts into a
+     * forced quarantine — so a perfectly resolvable order became `RECONCILIATION_REQUIRED`, and one
+     * such leg makes the whole entry `uncertain` in the gateway, which returns BEFORE partial-entry
+     * recovery and so leaves the other legs' confirmed fills un-unwound.
+     *
+     * Waiting for the outcome we already asked for is strictly better than asking twice.
+     */
+    if (order.state === "CANCEL_REQUESTED") return this.confirmTerminalAfterCancel(order.client_order_id);
     const clientOrderId = order.client_order_id;
     const brokerOrderId = order.broker_order_id;
     try {
