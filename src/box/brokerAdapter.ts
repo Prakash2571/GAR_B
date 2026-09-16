@@ -407,6 +407,15 @@ export class BrokerCancelNotTransmittedError extends Error {
   constructor(
     readonly clientOrderId: string,
     readonly brokerOrderId: string,
+    /**
+     * The order's latest known snapshot.
+     *
+     * Carried because every caller of the submit path needs A SNAPSHOT EITHER WAY — it is how the
+     * manager learns the durable quantity and whether a hedge is still needed. Before this, re-raising
+     * a proven-unsent cancellation instead of quarantining it satisfied the safety property but
+     * silently dropped the payload, so callers saw an error with no order at all.
+     */
+    readonly order?: BrokerOrder,
   ) {
     super(
       `The cancellation for ${clientOrderId} (broker order ${brokerOrderId}) exceeded its deadline while ` +

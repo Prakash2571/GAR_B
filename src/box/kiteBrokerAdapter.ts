@@ -678,6 +678,11 @@ export class KiteBrokerAdapter implements BrokerAdapter {
       // registry's `unknown_order_state` blocker) wedge logout and broker switching. This catch-all
       // used to swallow it and quarantine anyway, reintroducing the wedge the error type prevents.
       if (error instanceof BrokerCancelNotTransmittedError) throw error;
+      // A LOCAL BUDGET REFUSAL IS ALSO A PROVEN NO-REQUEST. `reserveRecoveryBudgetOrThrow` throws at
+      // the dispatch boundary -- when the recovery reserve is spent or a 429 cooldown is active --
+      // BEFORE the transport is touched. Falling through to `quarantine()` turned a healthy working leg
+      // into RECONCILIATION_REQUIRED because OUR OWN budget said no, which is uncertainty we invented.
+      if (error instanceof BrokerPreSubmitRefusedError) throw error;
       // A 429 feeds the shared budget a cooldown (never a resend). Done before any classification
       // so the cooldown is recorded even on the ambiguous path below.
       this.penalizeIfRateLimited(error);
@@ -746,6 +751,21 @@ export class KiteBrokerAdapter implements BrokerAdapter {
     try {
       return await this.waitForResolution(acknowledged);
     } catch (error) {
+      /*
+       * A PROVEN NO-REQUEST IS NOT AMBIGUITY — AND THIS IS THE PATH THAT RAISES IT.
+       *
+       * `waitForResolution` calls `protectiveCancelAndConfirm` on ack/working/partial timeout, so this
+       * catch is the PRIMARY path on which a withdrawn-while-queued cancellation surfaces. Quarantining
+       * it here re-created exactly the wedge those error types exist to prevent: the order is untouched
+       * and still working, but it was reported RECONCILIATION_REQUIRED, which the gateway reads as an
+       * uncertain entry (returning BEFORE partial-entry recovery, so sibling fills go un-unwound) and
+       * the registry reads as `unknown_order_state`, refusing logout and broker switching.
+       *
+       * The identical guard exists in the catch around the POST itself, where a cancellation error can
+       * never appear. It was missing from the one place it was needed.
+       */
+      if (error instanceof BrokerCancelNotTransmittedError) throw error;
+      if (error instanceof BrokerPreSubmitRefusedError) throw error;
       const quarantined = this.quarantine(req.client_order_id, acknowledged);
       throw new BrokerAmbiguousSubmitError(
         req.client_order_id,
@@ -766,7 +786,7 @@ export class KiteBrokerAdapter implements BrokerAdapter {
     }
     // Idempotent: a cancellation already on the wire is awaited, not duplicated. See the same guard
     // in `protectiveCancelAndConfirm` for why a second DELETE is actively harmful.
-    if (order.state === "CANCEL_REQUESTED") {
+    if (order.state === "CANCEL_REQUESTED" || this.cancelAlreadyDispatched(clientOrderId)) {
       return clone(await this.confirmTerminalAfterCancel(clientOrderId));
     }
     const brokerOrderId = order.broker_order_id;
@@ -831,6 +851,9 @@ export class KiteBrokerAdapter implements BrokerAdapter {
           // cancel-vs-fill race window. The race starts when the DELETE goes out.
           this.mark(clientOrderId, "cancel_requested");
         }
+        // Latched at DISPATCH and never cleared: this is what makes the idempotence guards survive a
+        // later quarantine that overwrites the CANCEL_REQUESTED state.
+        this.cancelDispatched.add(clientOrderId);
         return this.transport.cancelOrder(brokerOrderId);
       },
       "order_cancel",
@@ -852,7 +875,13 @@ export class KiteBrokerAdapter implements BrokerAdapter {
       if (error instanceof BrokerPreSubmitRefusedError) throw error;
       // Withdraw it if it is STILL QUEUED. A true return proves no request was transmitted.
       if (submission.abandon("The cancellation deadline expired.") || error instanceof TransportRequestAbandonedError) {
-        throw new BrokerCancelNotTransmittedError(clientOrderId, brokerOrderId);
+        throw new BrokerCancelNotTransmittedError(
+          clientOrderId,
+          brokerOrderId,
+          // The LATEST accepted snapshot, not the pre-cancel one: a fill observed while the
+          // cancellation sat queued is real exposure and must travel with the refusal.
+          clone(this.orders.get(clientOrderId) ?? priorOrder),
+        );
       }
       this.quarantine(clientOrderId, priorOrder);
       throw error;
@@ -1387,8 +1416,8 @@ export class KiteBrokerAdapter implements BrokerAdapter {
      *
      * Once the broker has been seen WORKING, the order has demonstrably been accepted and can never
      * legitimately return to "waiting for acknowledgement". Latching that is what makes the budget
-     * monotonic; the inverse error is also removed, because a genuinely stuck ACK can no longer be
-     * granted the 30s budget just because one poll read `OPEN`.
+     * monotonic; the latch is ONE-WAY: once the broker has been seen working the order keeps the
+     * longer budget, which is correct, because acceptance is not a state an order returns from.
      */
     let ackPhase = order.state === "ACKNOWLEDGED" || order.state === "SUBMITTING";
     while (!isBrokerOrderTerminal(order.state)) {
@@ -1433,7 +1462,9 @@ export class KiteBrokerAdapter implements BrokerAdapter {
      *
      * Waiting for the outcome we already asked for is strictly better than asking twice.
      */
-    if (order.state === "CANCEL_REQUESTED") return this.confirmTerminalAfterCancel(order.client_order_id);
+    if (order.state === "CANCEL_REQUESTED" || this.cancelAlreadyDispatched(order.client_order_id)) {
+      return this.confirmTerminalAfterCancel(order.client_order_id);
+    }
     const clientOrderId = order.client_order_id;
     const brokerOrderId = order.broker_order_id;
     try {
@@ -1496,6 +1527,22 @@ export class KiteBrokerAdapter implements BrokerAdapter {
    * A confirmed TERMINAL state is left alone: quarantining an order the broker has already resolved
    * would manufacture uncertainty and send a settled order back through recovery.
    */
+  /**
+   * Client order ids for which a DELETE was actually dispatched.
+   *
+   * SEPARATE FROM THE `CANCEL_REQUESTED` STATE, because `quarantine` overwrites that state with
+   * `RECONCILIATION_REQUIRED` — which erased the very latch the double-cancel guards key on, so after a
+   * dispatched-then-timed-out cancel a retry sent the second DELETE those guards exist to prevent. Kite
+   * answers a DELETE on an order already in CANCEL PENDING with a definitive 400, which the catch paths
+   * then convert into a forced quarantine of a resolvable order.
+   */
+  private readonly cancelDispatched = new Set<string>();
+
+  /** Has a cancellation for this order already been put on the wire? Survives quarantine. */
+  private cancelAlreadyDispatched(clientOrderId: string): boolean {
+    return this.cancelDispatched.has(clientOrderId);
+  }
+
   private quarantine(clientOrderId: string, fallback: BrokerOrder | undefined): BrokerOrder {
     const current = this.orders.get(clientOrderId) ?? fallback;
     if (!current) {

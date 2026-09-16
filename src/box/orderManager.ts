@@ -964,6 +964,17 @@ export class BoxOrderManager {
   private attributedAccountDriftReason(): string | null {
     const owner = this.attributedPositionsAccount;
     if (owner === null) return null;
+    // BOTH witnesses. The session provider LAGS a credential swap — that lag is the fence's entire
+    // justification — so consulting it alone caught a drift only later, at dispatch, after the reduction
+    // had already been planned and reserved. The credential is the authoritative one.
+    const dispatch = normalizedAccount(this.deps.adapter.dispatchAccount?.() ?? null);
+    if (dispatch !== null && dispatch !== owner) {
+      return (
+        `The attributed position map was reconciled under broker account ${owner}, but the credential ` +
+        `that would send a reduction now belongs to account ${dispatch}. A reduction derived from ` +
+        `another account's exposure would not close it — it would open NEW exposure there.`
+      );
+    }
     const current = normalizedAccount(this.deps.brokerAccount?.() ?? null);
     if (current === null || current === owner) return null;
     return (
@@ -1613,7 +1624,9 @@ export class BoxOrderManager {
         // ELIGIBLE and then reported in NEITHER `cancelled` nor `failures` is exactly the shape that
         // produced a green `ok: true` while nothing was cancelled. If it ever happens again it must
         // be visible, not silent.
-        else {
+        else if (intent.broker_order_id) {
+          // Only an intent that DID reach the broker can be genuinely unresolved. A never-posted row is
+          // resolved by `executeCancel` and deliberately reported as nothing-to-cancel.
           failures.push(
             `${intent.client_order_id}: the cancellation produced no broker outcome, so whether the ` +
               "order is still working is UNKNOWN. Reconcile, or cancel it broker-side.",
@@ -2569,9 +2582,27 @@ export class BoxOrderManager {
         order = await this.adoptThenCancel(action.intent);
       }
       if (!order) {
+        /*
+         * A ROW THAT NEVER REACHED THE BROKER IS "NOTHING TO CANCEL", NOT "UNRESOLVED".
+         *
+         * `broker_order_id === null` is the shape a crash between `persistence.create` and the POST
+         * leaves behind: durable, non-terminal, and provably never transmitted. Reporting it as
+         * unresolved told the operator "the order may still be working" — which is false — and, because
+         * any `failures` entry calls `invariantViolation`, it TRIPPED THE STICKY CIRCUIT BREAKER and
+         * disabled entry. So pressing the panic button after a restart with one stale CREATED row
+         * disarmed the system on the strength of an order that does not exist.
+         *
+         * The distinction this error class exists to draw — "I could not do this" versus "there was
+         * nothing to do" — is exactly what `broker_order_id` tells us, and it was not being used.
+         */
+        if (!action.intent.broker_order_id) {
+          this.markNothingToCancel(action.intent);
+          action.resolve(undefined);
+          return;
+        }
         throw new BrokerCancelUnresolvedError(
           action.intent.client_order_id,
-          action.intent.broker_order_id ?? null,
+          action.intent.broker_order_id,
         );
       }
       const durable = await this.persistOrder(action.intent, order, "protective cancel reconciliation");
@@ -2596,11 +2627,26 @@ export class BoxOrderManager {
    * Every failure path returns undefined so the caller raises a structured unresolved failure rather
    * than a silent success.
    */
+  /**
+   * Record that a durable row needed no cancellation because it never reached the broker.
+   *
+   * Counted rather than silent: "nothing to cancel" is a legitimate outcome, but it must still be
+   * visible, because the same shape would be alarming if it appeared for a row that HAD posted.
+   */
+  private markNothingToCancel(intent: IBoxOrderIntent): void {
+    this.neverPostedCancelSkips++;
+    void intent;
+  }
+
   private async adoptThenCancel(intent: IBoxOrderIntent): Promise<BrokerOrder | undefined> {
     const adapter = this.deps.adapter;
     if (!adapter.adoptOrder || !intent.broker_order_id) return undefined;
     // Ownership must still hold: never adopt (or cancel) another account's order.
     if (this.accountConsistencyBlockReason(intent) !== null) return undefined;
+    // AND the credential witness. Adoption WRITES a broker-sourced snapshot into our durable row and
+    // feeds `attributedBoxPositions`, which authorises further reductions — so the "attempting a cancel
+    // is safer than refusing it" argument that leaves cancels unfenced does not extend to it.
+    if (this.dispatchAccountBlockReason(intent) !== null) return undefined;
     let snapshot: BrokerOrder | undefined;
     try {
       const brokerOrders = await adapter.listOrders();
@@ -3594,6 +3640,10 @@ export class BoxOrderManager {
    * "everything else", which is the distinction it was previously unable to make.
    */
   private readonly reservationAttempts = new Map<string, string>();
+  /**
+   * Durable rows a cancel sweep skipped because they never reached the broker. Diagnostics only.
+   */
+  private neverPostedCancelSkips = 0;
 
   /**
    * Would the FULL four-leg attempt fit the gross cap? Null if it fits, else the reason.

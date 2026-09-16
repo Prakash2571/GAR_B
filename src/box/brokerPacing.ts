@@ -302,6 +302,17 @@ export interface TransportPacerStats {
   readonly lastSchedulerFault: string | null;
   /** Longest time any operation has currently spent QUEUED, so a starved entry is visible. */
   readonly oldestQueuedAgeMs: number;
+  /**
+   * Times the injected clock moved BACKWARDS across a pacing wait.
+   *
+   * Non-zero means the host clock is unstable (NTP correction, leap-second smear, manual change). The
+   * limiter re-serves the full interval in that case rather than dispatching, so this is a WARNING
+   * about the host, not a breach — but a persistently rising value invalidates every wall-clock
+   * duration the process reports.
+   */
+  readonly backwardClockSteps: number;
+  /** Times a long-waiting operation was promoted past a more urgent one to bound starvation. */
+  readonly starvationPromotions: number;
 }
 
 /**
@@ -322,6 +333,15 @@ export interface TransportPacerStats {
  *   "read"      — polls and status reads. Never urgent; always yields.
  */
 export type TransportUrgency = "recovery" | "placement" | "read";
+
+/**
+ * How long an admissible operation may be outranked before it is promoted to the front.
+ *
+ * Bounds starvation without weakening priority: inside this window urgency decides everything, so a
+ * protective cancel still goes ahead of a fresh poll. It only stops "outranked" becoming "never".
+ * Chosen well above the pacing intervals (110-250ms) so ordinary queueing never trips it.
+ */
+const STARVATION_GRACE_MS = 2_000;
 
 const URGENCY_RANK: Readonly<Record<TransportUrgency, number>> = Object.freeze({
   recovery: 0,
@@ -538,6 +558,12 @@ export class TransportPacer {
   private priorityOvertakes = 0;
   private schedulerFaults = 0;
   private lastSchedulerFault: string | null = null;
+  /** Times the clock moved BACKWARDS across a pacing wait. Non-zero means an unstable host clock. */
+  private backwardClockSteps = 0;
+  /** Times an operation was promoted past a more urgent one because it had waited too long. */
+  private starvationPromotions = 0;
+  /** The entry a scheduler fault is attributable to, so the fault can be scoped to it. */
+  private faultingEntry: QueuedOperation | null = null;
   /**
    * Pacing sleep served but not yet attributed to a dispatch.
    *
@@ -563,7 +589,12 @@ export class TransportPacer {
      * trivially produced by `Number(process.env.…)` on a typo, so this must fail SAFE (fall back to
      * the conservative default) rather than fail open.
      */
-    const maxInFlight = positiveIntOr(limits.maxInFlight, DEFAULT_TRANSPORT_CONCURRENCY.maxInFlight);
+    /*
+     * FLOORED AT 2, because `reservedForRecovery` is clamped to `maxInFlight - 1`: at `maxInFlight: 1`
+     * the recovery reserve silently became ZERO and a parked read blocked a cancel again — the exact
+     * defect the reserve exists to prevent, reachable by what looks like a conservative setting.
+     */
+    const maxInFlight = Math.max(2, positiveIntOr(limits.maxInFlight, DEFAULT_TRANSPORT_CONCURRENCY.maxInFlight));
     const requestedReserve = nonNegativeIntOr(
       limits.reservedForRecovery,
       DEFAULT_TRANSPORT_CONCURRENCY.reservedForRecovery,
@@ -617,6 +648,8 @@ export class TransportPacer {
       priorityOvertakes: this.priorityOvertakes,
       schedulerFaults: this.schedulerFaults,
       lastSchedulerFault: this.lastSchedulerFault,
+      backwardClockSteps: this.backwardClockSteps,
+      starvationPromotions: this.starvationPromotions,
       oldestQueuedAgeMs: this.oldestQueuedAgeMs(),
     };
   }
@@ -680,6 +713,37 @@ export class TransportPacer {
       rejectOuter = reject;
     });
 
+    /*
+     * THE DOOR IS INSIDE THE FAULT CONTAINMENT TOO.
+     *
+     * `clock.now()` and `deadline.expired()` are caller-supplied closures — the same reasoning that put
+     * the dispatch loop behind a guard. Uncontained, a throw here escaped `submit()` SYNCHRONOUSLY,
+     * before the caller had a handle to classify against, so `sendCancelWithinDeadline` (which calls
+     * `submitPaced` outside its own `try`) surfaced it as a bare error and the acknowledged /
+     * proven-unsent / ambiguous decision never ran.
+     */
+    let enqueuedAt: number;
+    let alreadyExpired: boolean;
+    try {
+      enqueuedAt = this.clock.now();
+      alreadyExpired = deadline?.expired() === true;
+    } catch (error) {
+      this.schedulerFaults++;
+      this.lastSchedulerFault = error instanceof Error ? error.message : String(error);
+      const failed = new Promise<T>((_resolve, reject) => {
+        reject(new TransportRequestAbandonedError(
+          `The request's clock or deadline faulted on admission (${error instanceof Error ? error.message : String(error)}); nothing was transmitted.`,
+          klass,
+          0,
+        ));
+      });
+      return {
+        result: failed,
+        dispatched: () => false,
+        abandon: () => true,
+      };
+    }
+
     const entry: QueuedOperation = {
       seq: this.seq++,
       klass,
@@ -687,7 +751,7 @@ export class TransportPacer {
       deadline,
       beforeDispatch: options.beforeDispatch,
       operation: operation as () => Promise<unknown>,
-      enqueuedAt: this.clock.now(),
+      enqueuedAt,
       reachedTransport: false,
       floorBound: false,
       overtookOlder: false,
@@ -703,7 +767,7 @@ export class TransportPacer {
 
     // PRE-ADMISSION. An operation whose budget is already spent must not even take a queue slot,
     // let alone a dispatch slot ahead of something still viable.
-    if (deadline?.expired()) {
+    if (alreadyExpired) {
       this.abandonedBeforeDispatch++;
       entry.settle({
         ok: false,
@@ -789,10 +853,19 @@ export class TransportPacer {
       } catch (error) {
         this.schedulerFaults++;
         this.lastSchedulerFault = error instanceof Error ? error.message : String(error);
-        // Fail the whole queue rather than strand it: an unsettled caller waits forever, which on
-        // the order path means a protective action that never reports either way.
-        this.failQueue(error);
-        return;
+        /*
+         * FAIL THE OFFENDING ENTRY, NOT THE QUEUE.
+         *
+         * This used to settle EVERY queued operation on a single fault, so one poisoned deadline
+         * withdrew three healthy cancels alongside it. The errors were honest — nothing was
+         * transmitted — but the blast radius was wrong: a fault in one caller's injected clock is not
+         * evidence about anybody else's request.
+         */
+        const culprit = this.faultingEntry ?? null;
+        this.faultingEntry = null;
+        if (culprit !== null) this.failEntry(culprit, error);
+        else this.failQueue(error);
+        continue;
       }
       if (!progressed) return;
     }
@@ -869,6 +942,23 @@ export class TransportPacer {
       // The clock advanced: re-evaluate from scratch. The remaining wait may be shorter, or
       // something more urgent may have arrived.
       if (served > 0) return true;
+      /*
+       * A BACKWARD STEP IS NOT A FROZEN CLOCK, AND MUST NOT BE A FREE PASS.
+       *
+       * `served < 0` means the clock moved BACKWARDS across the wait — an NTP correction, a leap-second
+       * smear, an operator setting the time. Production injects `Date.now`, which is not monotonic, so
+       * this is a real condition and not a test artefact. Falling through here dispatched without any
+       * gap served, and because each dispatch then stamped a SMALLER watermark the condition sustained
+       * itself: five order mutations left in a single tick against a published ten-per-second ceiling.
+       *
+       * Re-evaluating instead is safe and self-correcting: `pacingWaitMs` deliberately returns the FULL
+       * interval when elapsed time is negative, precisely so a clock step cannot bypass the limiter.
+       * Only an exactly-frozen clock (`served === 0`), which cannot express pacing at all, falls through.
+       */
+      if (served < 0) {
+        this.backwardClockSteps++;
+        return true;
+      }
       // A clock that does not advance across a wait cannot express pacing at all (several suites
       // inject `wait: () => Promise.resolve()`). Fall through and dispatch rather than spin — but
       // only AFTER the state re-check above.
@@ -888,6 +978,22 @@ export class TransportPacer {
    * Nothing was dispatched, so these are proven no-requests. Reporting them is strictly better than
    * leaving them pending: an unsettled protective cancel is a caller that never learns either way.
    */
+  /** Settle ONE queued entry with a scheduler fault. Nothing was dispatched, so this is a no-request. */
+  private failEntry(entry: QueuedOperation, error: unknown): void {
+    if (entry.state !== "queued") return;
+    const index = this.queue.indexOf(entry);
+    if (index >= 0) this.queue.splice(index, 1);
+    this.abandonedBeforeDispatch++;
+    entry.settle({
+      ok: false,
+      error: new TransportRequestAbandonedError(
+        `This request's own deadline or clock faulted (${error instanceof Error ? error.message : String(error)}); nothing was transmitted.`,
+        entry.klass,
+        Math.max(0, this.clock.now() - entry.enqueuedAt),
+      ),
+    });
+  }
+
   private failQueue(error: unknown): void {
     const message = error instanceof Error ? error.message : String(error);
     for (const entry of [...this.queue]) {
@@ -926,12 +1032,31 @@ export class TransportPacer {
      * `seq` is a monotonic counter that is never reset, so ties within a tier resolve to arrival
      * order deterministically and FIFO-within-tier holds without relying on sort stability.
      */
+    /*
+     * AGING, so a lower tier cannot starve for ever.
+     *
+     * Strict tier order alone let a continuously non-empty recovery tier hold a read INDEFINITELY, and
+     * the read tier is where every terminal confirmation lives — `refresh`,
+     * `confirmTerminalAfterCancel`, `waitForResolution`. So cancelling four legs produced four recovery
+     * dispatches whose four confirming polls were starved by the very work they had to confirm, and
+     * `confirmTerminalAfterCancel` quarantines when it cannot prove terminality: a cancel storm became
+     * a quarantine storm, which then wedges logout and broker switching.
+     *
+     * An entry that has waited longer than `STARVATION_GRACE_MS` is promoted to the front regardless of
+     * tier. Urgency still decides everything inside the grace window, so a protective cancel is still
+     * dispatched ahead of a fresh poll — this only bounds how long being outranked can last.
+     */
+    const now = this.clock.now();
     let best: QueuedOperation | null = null;
     let oldestQueued: QueuedOperation | null = null;
+    let starved: QueuedOperation | null = null;
     for (const candidate of this.queue) {
       if (candidate.state !== "queued") continue;
       if (oldestQueued === null || candidate.seq < oldestQueued.seq) oldestQueued = candidate;
       if (!this.admissible(candidate)) continue;
+      if (now - candidate.enqueuedAt >= STARVATION_GRACE_MS) {
+        if (starved === null || candidate.seq < starved.seq) starved = candidate;
+      }
       if (
         best === null ||
         URGENCY_RANK[candidate.urgency] < URGENCY_RANK[best.urgency] ||
@@ -939,6 +1064,10 @@ export class TransportPacer {
       ) {
         best = candidate;
       }
+    }
+    if (starved !== null && starved !== best) {
+      this.starvationPromotions++;
+      best = starved;
     }
     if (best !== null && oldestQueued !== null && oldestQueued !== best) {
       // Recorded on the entry and counted at DISPATCH, not here. Counting here inflated the figure
