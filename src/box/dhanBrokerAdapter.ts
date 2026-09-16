@@ -35,6 +35,7 @@ import {
   resolveBrokerPacing,
   TransportPacer,
   type TransportPacerStats,
+  type TransportUrgency,
 } from "./brokerPacing.js";
 import {
   assertBoundedLimit,
@@ -78,6 +79,7 @@ import {
   isValidDhanCorrelationId,
 } from "../brokers/dhan/correlation.js";
 import { mergeBrokerOrderSnapshot, type BrokerOrderMergeOptions } from "./brokerOrderMerge.js";
+import { parseIstBrokerTimestamp } from "./brokerTimestamps.js";
 import type {
   DhanClient,
   DhanOrder,
@@ -255,20 +257,37 @@ export function classifyDhanReject(code: string | null, description: string | nu
   return "generic";
 }
 
-/** Epoch ms from a Dhan timestamp string, or a fallback. */
+/**
+ * Epoch ms from a Dhan timestamp string, or a fallback.
+ *
+ * THE PREVIOUS VERSION OF THIS FUNCTION LOOKED FIXED BUT WAS NOT. It tried `Date.parse(value)`
+ * first and only appended `+05:30` when that returned NaN — but a space-separated stamp like
+ * `"2026-09-09 10:00:01"` parses PERFECTLY WELL as host-local time, so the naive branch always won
+ * and the IST branch was unreachable dead code. Dhan therefore carried exactly the timezone defect
+ * its own comment claimed to have fixed.
+ *
+ * Now delegated to the shared parser, which builds the instant from the parsed components and never
+ * lets a host-local reading participate. See `brokerTimestamps.ts`.
+ */
 function parseDhanTime(value: string | null | undefined, fallback: number): number {
-  if (!value) return fallback;
-  // Dhan sends local IST timestamps without a zone; assume IST rather than UTC,
-  // otherwise every order looks 5h30m old.
-  const direct = Date.parse(value);
-  if (Number.isFinite(direct)) return direct;
-  const withZone = Date.parse(`${value.replace(" ", "T")}+05:30`);
-  return Number.isFinite(withZone) ? withZone : fallback;
+  return parseIstBrokerTimestamp(value) ?? fallback;
 }
 
 /** Map the broker-metered endpoint class onto the per-second pacing bucket. */
 function dhanPacingClassFor(klass: BrokerEndpointClass): BrokerPacingClass {
   return klass === "data_read" ? "general" : "order_mutation";
+}
+
+/**
+ * Map the broker-metered endpoint class onto a DISPATCH TIER.
+ *
+ * Identical policy to the Kite adapter, deliberately: the pacer is shared, so if the two brokers
+ * classified urgency differently the same queue would apply two different notions of "urgent".
+ */
+function dhanUrgencyFor(klass: BrokerEndpointClass): TransportUrgency {
+  if (klass === "order_cancel" || klass === "order_modify") return "recovery";
+  if (klass === "order_place") return "placement";
+  return "read";
 }
 
 export class DhanBrokerAdapter implements BrokerAdapter {
@@ -520,10 +539,18 @@ export class DhanBrokerAdapter implements BrokerAdapter {
    * no such hook, so they are gated here immediately before the transport call.
    */
   private call<T>(op: () => Promise<T>, klass: BrokerEndpointClass = "data_read"): Promise<T> {
-    if (klass === "order_cancel" || klass === "order_modify") {
-      this.reserveRecoveryBudgetOrThrow(klass);
-    }
-    return this.pacer.run(op, dhanPacingClassFor(klass));
+    return this.pacer.run(op, dhanPacingClassFor(klass), {
+      // SHARED FIX, BOTH BROKERS. The pacer no longer serves a single FIFO chain, so a cancel must
+      // declare itself risk-reducing to be dispatched ahead of routine reads. Dhan is affected by
+      // the same defect for the same reason — the pacer is shared — so it gets the same tiering
+      // rather than being left on the old ordering.
+      urgency: dhanUrgencyFor(klass),
+      // Charged at ACTUAL DISPATCH rather than at enqueue, so a cancel that is abandoned in the
+      // queue does not permanently consume recovery budget the broker never saw spent.
+      ...(klass === "order_cancel" || klass === "order_modify"
+        ? { beforeDispatch: () => this.reserveRecoveryBudgetOrThrow(klass) }
+        : {}),
+    });
   }
 
   /** Fast pre-pacing refusal: throw immediately if the shared placement budget is already spent. */

@@ -5381,7 +5381,13 @@ export class BoxEngine {
         bySymbol.set(key, current);
       }
     }
-    this.orderManager.setAttributedBoxPositions([...bySymbol.values()].filter((position) => position.net_quantity !== 0));
+    // STAMPED WITH THE ACCOUNT THIS SNAPSHOT DESCRIBES. Attribution with no owner is what allowed one
+    // account's positions to authorise a reduction in another's session — see
+    // `BoxOrderManager.attributedAccountDriftReason`.
+    this.orderManager.setAttributedBoxPositions(
+      [...bySymbol.values()].filter((position) => position.net_quantity !== 0),
+      { account: this.liveBrokerAccount() },
+    );
     this.orderManager.setExposure({
       openBoxes: this.positions.size,
       residualLegs: this.residualLegCount(),

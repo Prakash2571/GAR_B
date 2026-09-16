@@ -53,6 +53,13 @@ export function createZerodhaLiveAdapter(
   });
   return new KiteBrokerAdapter(transport, {
     ...kiteAdapterConfigFromBoxConfig(cfg),
+    // THE ACCOUNT BEHIND THE CREDENTIAL, from the SAME object the access token is read from.
+    //
+    // This is what lets the order path verify, at the final boundary before the POST, that the
+    // credential about to sign the request still belongs to the account the order was authorised
+    // and stamped under. Reading it from anywhere else would reintroduce the possibility of the
+    // two disagreeing — which is exactly the window a re-login opens.
+    credentialAccount: () => kite.getSessionAccount(),
     ...(timing ? { timing } : {}),
     ...(rateBudget ? { rateBudget } : {}),
   });

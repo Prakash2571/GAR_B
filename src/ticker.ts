@@ -172,8 +172,20 @@ export function connectTicker(opts: ConnectOptions): TickerHandle {
       opts.onHeartbeat?.();
       return;
     }
-    const ticks = parseBinary(data);
-    if (ticks.length) opts.onTick(ticks);
+    // GUARDED, for the same reason the text-frame branch above is guarded — and it was not.
+    // `parseBinary` is now total over arbitrary bytes, but a defect there (it used to throw a
+    // RangeError on a short packet) or a throwing `onTick` consumer would otherwise propagate into
+    // the WebSocket's event dispatch. That is the worst place for an exception to surface: it does
+    // NOT invoke `onerror`/`onclose`, so the lane's reconnect policy — which is driven entirely
+    // from `onclose` — never runs, and the feed silently stops delivering ticks while every health
+    // signal still reports a live socket. Swallowing here keeps market data degradable rather than
+    // fatal; the tick simply does not arrive, and the existing staleness detectors notice.
+    try {
+      const ticks = parseBinary(data);
+      if (ticks.length) opts.onTick(ticks);
+    } catch (err) {
+      opts.onError?.(`Kite tick frame could not be parsed: ${err instanceof Error ? err.message : String(err)}`);
+    }
   };
 
   // NOT terminal. `onerror` carries no code and fires for every abnormal condition — DNS failure,
@@ -223,24 +235,54 @@ export function connectTicker(opts: ConnectOptions): TickerHandle {
 }
 
 /**
+ * The smallest packet Kite can legitimately send: LTP mode, `token`(4) + `last_price`(4).
+ *
+ * Kite's documented packet sizes are 8 (LTP), 44 (quote) and 184 (full). 8 is therefore the hard
+ * floor for the two fields every packet must carry; anything shorter is malformed by definition.
+ */
+const KITE_MIN_PACKET_BYTES = 8;
+
+/**
  * Parse a Kite binary tick message.
- * Layout (big-endian): [int16 numberOfPackets][ for each: int16 length, bytes ].
+ * Layout (big-endian): [uint16 numberOfPackets][ for each: uint16 length, bytes ].
  * Within a packet: int32 instrument_token, int32 last_price, ... int32 close.
  * Prices for NSE/NFO are in paise → divide by 100.
+ *
+ * TOTAL FUNCTION over arbitrary bytes: this is fed straight from the network, so it must return a
+ * (possibly empty) list for ANY input rather than throw. A malformed frame yields the packets that
+ * were well-formed and stops at the first one that is not — never an exception, because the only
+ * caller is a WebSocket event handler where a throw is unrecoverable and invisible.
  */
 export function parseBinary(buf: ArrayBuffer): Tick[] {
   const dv = new DataView(buf);
   if (dv.byteLength < 2) return []; // heartbeat (single byte) or empty
 
-  const numPackets = dv.getInt16(0, false);
+  // Packet COUNT must be read unsigned and sanity-bounded. A signed read of a hostile/corrupt
+  // frame could yield a negative count (harmless — the loop would not run) but an unsigned read
+  // keeps the intent explicit, and the per-packet guards below are what actually bound the work.
+  const numPackets = dv.getUint16(0, false);
   let offset = 2;
   const ticks: Tick[] = [];
 
   for (let p = 0; p < numPackets; p++) {
     if (offset + 2 > dv.byteLength) break;
-    const len = dv.getInt16(offset, false);
+    // LENGTH must be read UNSIGNED. Read as int16 a length above 32767 came back NEGATIVE, which
+    // passed the `offset + len > byteLength` bounds test below (adding a negative can only shrink
+    // the sum), reached the fixed-field reads with a nonsense length, and then REWOUND `offset` at
+    // the end of the iteration. A length is never negative, so this read makes the guard sound.
+    const len = dv.getUint16(offset, false);
     offset += 2;
     if (offset + len > dv.byteLength) break;
+    // THE MISSING MINIMUM. Every guard here checked that the declared length FITS in the buffer;
+    // none checked it was large enough for the fields about to be read. `token` and `last_price`
+    // are mandatory and occupy the first 8 bytes, so a packet declaring 0..7 bytes sent
+    // `dv.getUint32` past the end of a perfectly well-formed DataView and threw a RangeError out
+    // of this function — e.g. the 5-byte frame [00 01][00 01][00], which declares one 1-byte
+    // packet. That exception escaped into the WebSocket message callback (see `ws.onmessage`),
+    // where no recovery path could see it. A short packet means the frame's self-description is
+    // untrustworthy, so stop parsing it rather than guess at where the next packet starts, and
+    // return the packets already recovered.
+    if (len < KITE_MIN_PACKET_BYTES) break;
 
     // Token MUST be read as UNSIGNED: NFO futures tokens exceed 2^31, and a
     // signed read would make them negative and never match the subscribed token.

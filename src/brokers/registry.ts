@@ -976,7 +976,11 @@ export class ActiveBrokerManager {
     }
 
     const apiKey = session.api_key || (configured.ok ? configured.creds.apiKey : "");
-    this.deps.kite.installProvidedToken(apiKey, session.access_token);
+    // The ACCOUNT travels with the token here too. A restored session that installed a credential
+    // without naming its owner would leave the execution path unable to prove which account it signs
+    // as — and a send-boundary check that cannot prove anything cannot protect anything. This is the
+    // restart path, so it is exactly when exposure from a previous process is most likely to exist.
+    this.deps.kite.installProvidedToken(apiKey, session.access_token, session.user_id);
     this.zerodhaSessionMeta = {
       userId: session.user_id,
       userName: session.user_name,
@@ -1152,10 +1156,56 @@ export class ActiveBrokerManager {
     );
 
     const loginDay = this.deps.istDayKey();
+
+    /*
+     * ACCOUNT REPLACEMENT IS FENCED. TOKEN REFRESH IS NOT.
+     *
+     * Until this check existed, a same-account token refresh and a sign-in as a COMPLETELY DIFFERENT
+     * account executed byte-for-byte the same code. The only distinction the login path drew was
+     * same-broker vs different-broker. That is the P0 hole: a different-account login reaches the
+     * same end state as a broker switch — all durable exposure now belongs to a session that cannot
+     * legitimately act on it — while `switchBroker` and `logoutZerodha` are both fenced by
+     * `exposureBlockers` and this path was fenced by nothing at all.
+     *
+     * The consequences were concrete. A long position attributed under account A survived into
+     * account B's session, and an EXIT SELL derived from A's attributed quantity would be sent on
+     * B's credential — where it does not close A's long, it OPENS A SHORT.
+     *
+     * WHY THE CHECK IS HERE, AFTER THE EXCHANGE. The incoming account is not knowable until the
+     * request token has been exchanged, so this is the earliest point the comparison can be made. It
+     * is placed BEFORE `installProvidedToken` because that call is the instant every in-flight
+     * adapter starts signing with the new credential; refusing after it would be too late.
+     *
+     * COST OF REFUSING: the request token is single-use and is spent by the exchange above, so the
+     * operator must start a fresh sign-in after resolving the exposure. That is the right trade — the
+     * alternative is silently adopting another account's positions.
+     *
+     * A refresh of the SAME account, and a first sign-in with no prior session, are untouched.
+     */
+    const previousAccount = this.zerodhaSessionMeta?.userId?.trim() ?? null;
+    const incomingAccount = session.userId?.trim() ?? null;
+    if (previousAccount !== null && incomingAccount !== null && previousAccount !== incomingAccount) {
+      const blockers = await this.accountReplacementBlockers("zerodha", previousAccount, incomingAccount);
+      if (blockers.length > 0) {
+        const detail = blockers.map((blocker) => blocker.detail).join(" ");
+        this.loginErrors.zerodha =
+          `Refused to replace the signed-in Zerodha account (${previousAccount} → ${incomingAccount}) ` +
+          `while exposure is unresolved. ${detail}`;
+        throw new ZerodhaAuthError(
+          this.loginErrors.zerodha,
+          409,
+          "ACCOUNT_REPLACEMENT_BLOCKED",
+        );
+      }
+    }
+
     // Install BEFORE persisting: the running client is what serves requests, and a
     // PostgreSQL hiccup must not leave the operator signed out of a session Zerodha has
     // already minted. The persist failure is surfaced as a problem, not swallowed.
-    this.deps.kite.installProvidedToken(session.apiKey, session.accessToken);
+    //
+    // The ACCOUNT is installed WITH the token, in the same synchronous call, so the execution path
+    // can never read a credential without being able to read the account that owns it.
+    this.deps.kite.installProvidedToken(session.apiKey, session.accessToken, session.userId);
     this.zerodhaSessionMeta = {
       userId: session.userId,
       userName: session.userName,
@@ -2578,6 +2628,48 @@ export class ActiveBrokerManager {
    * switch refused on it would be a way to reach, by a different route, precisely the state
    * the switch guard exists to prevent. `action` only shapes the operator-facing sentence.
    */
+  /**
+   * May the signed-in account for `broker` be REPLACED by a different one right now?
+   *
+   * Returns the reasons it must not be. Deliberately built from the SAME `exposureBlockers` set that
+   * fences `switchBroker` and `logoutBlockers`, plus the unresolved-durable-intent check
+   * `switchBlockers` uses — because replacing the account behind a live credential has the same
+   * consequence as leaving the broker entirely: every position, working order and durable intent
+   * recorded under the outgoing account becomes something this session must not act on.
+   *
+   * Sharing the set is the point. A guard assembled independently here would drift from the other
+   * two, and a gap in one of three near-identical fences is how the same defect comes back by a
+   * different route.
+   *
+   * PUBLIC so the HTTP layer can PRE-FLIGHT the answer. A Zerodha `request_token` is single-use and
+   * is spent by the exchange that reveals which account is signing in, so a refusal at that point
+   * costs the operator a fresh sign-in. Being able to ask "would replacing the account be refused
+   * right now?" before starting the flow turns that into a warning instead of a wasted round trip.
+   */
+  async accountReplacementBlockers(
+    broker: BrokerId,
+    previousAccount: string,
+    incomingAccount: string,
+  ): Promise<SwitchBlocker[]> {
+    const blockers = this.exposureBlockers(
+      `replacing the signed-in ${broker} account (${previousAccount} → ${incomingAccount})`,
+    );
+    const probe = this.probe;
+    if (probe) {
+      const outstanding = await probe.unresolvedIntentsFor(broker).catch(() => 0);
+      if (outstanding > 0) {
+        blockers.push({
+          reason: "foreign_unresolved_intents",
+          detail:
+            `${outstanding} durable order intent(s) recorded under account ${previousAccount} are still ` +
+            `unresolved. Signing in as ${incomingAccount} would leave them owned by an account this ` +
+            `session cannot act on. Resolve them, or sign back into ${previousAccount}.`,
+        });
+      }
+    }
+    return blockers;
+  }
+
   private exposureBlockers(action: string): SwitchBlocker[] {
     const blockers: SwitchBlocker[] = [];
     const probe = this.probe;

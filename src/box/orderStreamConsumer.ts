@@ -64,7 +64,25 @@ export interface RegisterIntentArgs {
   readonly clientOrderId: string;
   /** Zerodha tag / Dhan correlationId — the stable strategy key echoed on every event. */
   readonly ownerTag: string;
-  /** The trading account (Kite user_id / Dhan ClientId), for foreign-account rejection. */
+  /**
+   * The trading account (Kite user_id / Dhan ClientId), for foreign-account rejection.
+   *
+   * THREE DISTINCT STATES, and the difference between the last two is load-bearing:
+   *
+   *   "ZD1234"  — PROVEN. The caller knows which account owns this order. A frame naming a
+   *               different account is foreign and is dropped.
+   *   null      — UNPROVEN, ASSERTED. The caller has looked and cannot establish ownership (a
+   *               durable row predating migration 011, which deliberately does not backfill).
+   *               The account check is SKIPPED and the event is attributed on the owner tag
+   *               alone, counted as `unverifiedAccount` so the gap stays visible.
+   *   (omitted)  — NO OPINION. The caller has no account context at all, so the consumer may
+   *               supply the current session account as a default.
+   *
+   * An explicit `null` is therefore NEVER upgraded to the session account. Doing so used to
+   * convert "we could not verify" into a hard claim, and the projection would then reject a frame
+   * naming the order's REAL (different) account as `foreign_account` — discarding a fill we own
+   * and leaving real exposure unobserved. See {@link OrderStreamConsumer.registerIntent}.
+   */
   readonly account?: string | null;
   readonly requestedQty: number;
   /** Known only after acknowledgement; a pre-POST registration passes null. */
@@ -363,7 +381,7 @@ export class OrderStreamConsumer {
     this.proj.register({
       clientOrderId: args.clientOrderId,
       ownerTag: args.ownerTag,
-      account: args.account ?? this.opts.account() ?? null,
+      account: this.registeredOwnershipAccount(args),
       requestedQty: args.requestedQty,
       brokerOrderId: args.brokerOrderId ?? null,
     });
@@ -372,6 +390,37 @@ export class OrderStreamConsumer {
     // observed complete or explicitly settled.
     this.requestedQtyOf.set(args.clientOrderId, args.requestedQty);
     if (args.requestedQty > 0) this.workingOrders.add(args.clientOrderId);
+  }
+
+  /**
+   * THE ACCOUNT THIS REGISTRATION ACTUALLY PROVES — never a fabricated one.
+   *
+   * This used to be `args.account ?? this.opts.account() ?? null`, which collapsed two
+   * different claims into one. `??` cannot tell an EXPLICIT null ("I looked; ownership is
+   * unproven") from an OMITTED field ("I have no account context"), so it silently answered both
+   * with the CURRENT SESSION account.
+   *
+   * That substitution is unsound because the session account is the account signed in NOW, not
+   * the account that placed the order. The manager's only production caller
+   * (`registerStreamOwnership`) passes `intent.broker_account ?? null` precisely so an unproven
+   * row stays unproven — and this method used to overwrite that decision. The consequence was
+   * concrete: the projection stores a non-null expected account as a HARD gate, so a later frame
+   * naming the order's real (different) account was rejected as `foreign_account` and an owned
+   * fill was discarded, leaving live exposure unobserved while we waited on REST.
+   *
+   * `in` is the discriminator rather than a `=== undefined` test because `exactOptionalPropertyTypes`
+   * makes "present but undefined" unrepresentable for a caller in TypeScript; a blank/whitespace
+   * string is also treated as unproven rather than as an account named "".
+   */
+  private registeredOwnershipAccount(args: RegisterIntentArgs): string | null {
+    if ("account" in args) {
+      const asserted = typeof args.account === "string" ? args.account.trim() : "";
+      // An explicit null (or blank) is the caller's ASSERTION of unproven ownership. Preserve it.
+      return asserted === "" ? null : asserted;
+    }
+    const session = this.opts.account();
+    const current = typeof session === "string" ? session.trim() : "";
+    return current === "" ? null : current;
   }
 
   /**
