@@ -290,10 +290,13 @@ test("R5-5: legitimately distinct clients still get distinct keys", () => {
   assert.notEqual(one, two, "the limiter must still separate real clients");
 });
 
-test("R5-6: IPv6-mapped IPv4 loopback is recognised as a trusted proxy", () => {
+test("R5-6: only LOOPBACK is trusted by default — a private peer is not", () => {
   assert.equal(isTrustedProxyAddress("::ffff:127.0.0.1"), true);
   assert.equal(isTrustedProxyAddress("127.0.0.1"), true);
-  assert.equal(isTrustedProxyAddress("10.0.0.5"), true);
+  // This originally asserted `true`, which encoded the behaviour rather than the requirement.
+  // Trusting every RFC1918 source unconditionally, on a process that binds every interface, is what
+  // let any in-VPC host forge its own rate-limit key on the passcode endpoint.
+  assert.equal(isTrustedProxyAddress("10.0.0.5"), false, "a private peer is NOT a proxy by default");
   assert.equal(isTrustedProxyAddress("203.0.113.9"), false, "a public peer is never a trusted proxy");
   assert.equal(isTrustedProxyAddress(undefined), false);
 });
