@@ -185,7 +185,11 @@ test("F6-5: a LATE REST response cannot rewind the terminal state the stream est
     status_message: null, tag: "TAG",
   });
   await settle();
-  const after = await adapter.getOrder("BOX-1");
+  // Probed with a DELIBERATELY LOWER update rather than `adapter.getOrder()`, which would start a
+  // fresh REST read this fake never answers. The probe is safe precisely because the merge is
+  // monotonic: applying 25 can never LOWER the accepted quantity, so a 75 here proves the late REST
+  // did not rewind, and a 25 would prove it did.
+  const after = adapter.applyOrderUpdate(streamUpdate({ rawStatus: "OPEN", cumulativeQty: 25 }));
   assert.equal(after.filled_quantity, 75, "a staler REST payload must not rewind a confirmed fill");
   assert.ok(isBrokerOrderTerminal(after.state), "nor reopen a confirmed terminal state");
 });
@@ -204,6 +208,8 @@ test("F6-6: a REJECTED REST read after terminal stream evidence does not surface
 
   transport.gates[0]?.resolve(null); // "the broker has no such order right now"
   await settle();
-  const after = await adapter.getOrder("BOX-1");
+  // Same monotonic probe as F6-5 — no second REST read.
+  const after = adapter.applyOrderUpdate(streamUpdate({ rawStatus: "OPEN", cumulativeQty: 25 }));
   assert.equal(after.filled_quantity, 75, "the confirmed fill survives an unhelpful late read");
+  assert.ok(isBrokerOrderTerminal(after.state), "and the terminal state is not reopened");
 });
