@@ -58,13 +58,17 @@ function scripted({ statuses, cancelError }) {
       calls.push(["get"]);
       const status = state();
       i += 1;
+      // The payload must be SELF-CONSISTENT. The adapter re-validates evidence, so a COMPLETE
+      // carrying zero filled quantity is contradictory and is correctly quarantined as a conflict —
+      // which would make these tests fail for a reason that has nothing to do with what they assert.
+      const filled = status === "COMPLETE" ? 75 : 0;
       return {
         order_id: "BRK-1",
         status,
-        filled_quantity: 0,
-        pending_quantity: 75,
+        filled_quantity: filled,
+        pending_quantity: 75 - filled,
         quantity: 75,
-        average_price: null,
+        average_price: filled > 0 ? 100.1 : null,
         order_timestamp: null,
         exchange_update_timestamp: null,
         status_message: null,

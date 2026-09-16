@@ -824,9 +824,11 @@ export class TransportPacer {
       now,
     });
     const wait = Math.max(classWait, absoluteWait);
-    // Recomputed every pass, so the flag describes the constraint that actually bound the DISPATCH
-    // rather than whichever pass happened to observe it first.
-    next.floorBound = absoluteWait > classWait;
+    // STICKY, not recomputed. The question is "did the absolute floor bind while this operation
+    // waited", and the answer has to survive the final pass — on which the remaining wait is zero
+    // and therefore NEITHER constraint binds. Overwriting the flag each pass cleared it on exactly
+    // the pass that dispatches, so the floor could never be reported as having bound at all.
+    if (absoluteWait > classWait) next.floorBound = true;
 
     if (wait > 0) {
       /*
