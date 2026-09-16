@@ -2189,11 +2189,15 @@ function liveEntryFailure(candidate: BoxCandidate, detectedAt: number, submitted
     if (!unwind || unwind.filled_quantity <= 0) continue;
     leg.unwound_qty = unwind.filled_quantity;
     leg.unwind_price = unwind.average_price;
-    leg.unwind_slippage = unwind.average_price === null
+    // SLIPPAGE IS UNKNOWABLE WITHOUT AN ENTRY PRICE. `leg.fill_price ?? 0` reported the ENTIRE
+    // unwind price as slippage whenever the entry average was unpublished — a fabricated loss that
+    // then fed calibration. An unknown input must produce an unknown output, exactly as a null
+    // unwind price already does.
+    leg.unwind_slippage = unwind.average_price === null || leg.fill_price === null || leg.fill_price === undefined
       ? null
       : leg.side === "BUY"
-        ? round2((leg.fill_price ?? 0) - unwind.average_price)
-        : round2(unwind.average_price - (leg.fill_price ?? 0));
+        ? round2(leg.fill_price - unwind.average_price)
+        : round2(unwind.average_price - leg.fill_price);
   }
   record.failure_reason = reason;
   record.failure_detail = detail;
@@ -2203,7 +2207,22 @@ function liveEntryFailure(candidate: BoxCandidate, detectedAt: number, submitted
     role: order.role,
     side: order.side,
     quantity: order.filled_quantity,
-    average_price: order.average_price ?? 0,
+    /*
+     * NEVER ₹0 FOR A REAL FILL.
+     *
+     * This was `order.average_price ?? 0`. Both adapters take deliberate care to keep an unpublished
+     * average price NULL — "an unpublished average price is absent data, not a free execution" — and
+     * this line then converted that absence into a claim that we acquired real exposure for nothing.
+     * The residual/flatten and P&L arithmetic consume this field as evidence, so a ₹0 entry price
+     * makes an unwind look like pure profit and reports the entire unwind price as slippage.
+     *
+     * `ResidualLegExposure.average_price` is not nullable, so the honest fallback is the price we
+     * AUTHORISED rather than a fabricated zero. It errs conservatively in both directions: for a BUY
+     * the limit is the most we agreed to pay (so cost is never understated), and for a SELL it is the
+     * least we agreed to accept (so proceeds are never overstated). Zero is only reached if the
+     * broker published neither an average nor a limit, which is not a state a filled order can be in.
+     */
+    average_price: order.average_price ?? order.limit_price ?? 0,
     source: "partial_entry",
     created_at: order.updated_at,
   }));
