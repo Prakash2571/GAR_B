@@ -65,7 +65,9 @@ export type ConfigProvenance =
   /** The env var was set but out of range; it was CLAMPED into range. */
   | "env_clamped"
   /** The env var was set but unparseable; the code default is in force. */
-  | "env_invalid_fallback";
+  | "env_invalid_fallback"
+  /** Explicitly set, INVALID, and REFUSED — the loader throws rather than defaulting. */
+  | "env_invalid_refused";
 
 export interface ResolvedConfigValue {
   /** The BoxConfig field name. */
@@ -98,6 +100,12 @@ interface KnobSpec {
   max?: number;
   /** For enum kind. */
   choices?: readonly string[];
+  /**
+   * A CONTAINMENT limit: `loadBoxConfig` refuses an explicitly-set invalid value rather than
+   * clamping or rounding it. Set for the knobs where bad input reaches an "unlimited" sentinel or
+   * widens a bound, so this surface reports the same refusal the loader performs.
+   */
+  strict?: boolean;
 }
 
 /**
@@ -125,22 +133,22 @@ const KNOBS: readonly KnobSpec[] = [
   { key: "liveEntrySubmitConcurrency", envVar: "BOX_LIVE_ENTRY_SUBMIT_CONCURRENCY", kind: "int", default: 1, min: 1, max: 4 },
   { key: "liveMaxResidualLegs", envVar: "BOX_LIVE_MAX_RESIDUAL_LEGS", kind: "int", default: 1, min: 0, max: 4 },
   { key: "oneActiveBoxPerUnderlying", envVar: "BOX_ONE_ACTIVE_BOX_PER_UNDERLYING", kind: "bool", default: false },
-  { key: "sessionMaxCompletedTrades", envVar: "BOX_SESSION_MAX_COMPLETED_TRADES", kind: "int", default: 0, min: 0, max: 10_000 },
+  { key: "sessionMaxCompletedTrades", envVar: "BOX_SESSION_MAX_COMPLETED_TRADES", kind: "int", default: 0, min: 0, max: 10_000, strict: true },
   // The attempt ceiling was MISSING from this table while the trade ceiling beside it was present.
   // This is the operator-facing "what is actually in force, and where did it come from" report, and
   // the attempt ceiling is the only thing that bounds RISK-TAKING as opposed to success — a session
   // configured for one trade can otherwise submit orders indefinitely so long as none completes.
   // Its absence also meant the effective-config drift test could not cover it.
-  { key: "sessionMaxEntryAttempts", envVar: "BOX_SESSION_MAX_ENTRY_ATTEMPTS", kind: "int", default: 0, min: 0, max: 10_000 },
+  { key: "sessionMaxEntryAttempts", envVar: "BOX_SESSION_MAX_ENTRY_ATTEMPTS", kind: "int", default: 0, min: 0, max: 10_000, strict: true },
   { key: "maxConcurrentPerUnderlying", envVar: "BOX_MAX_CONCURRENT_PER_UNDERLYING", kind: "int", default: 2, min: 0, max: 16 },
 
   // ---- Quantity envelope ----
-  { key: "liveMaxOpenLegQuantity", envVar: "BOX_LIVE_MAX_OPEN_LEG_QUANTITY", kind: "int", default: 100, min: 1, max: 1_000_000 },
-  { key: "liveMaxGrossOpenLegQuantity", envVar: "BOX_LIVE_MAX_GROSS_OPEN_LEG_QUANTITY", kind: "int", default: 400, min: 1, max: 4_000_000 },
+  { key: "liveMaxOpenLegQuantity", envVar: "BOX_LIVE_MAX_OPEN_LEG_QUANTITY", kind: "int", default: 100, min: 1, max: 1_000_000, strict: true },
+  { key: "liveMaxGrossOpenLegQuantity", envVar: "BOX_LIVE_MAX_GROSS_OPEN_LEG_QUANTITY", kind: "int", default: 400, min: 1, max: 4_000_000, strict: true },
 
   // ---- Capital / loss breaker ----
-  { key: "liveMaxBoxCapitalRupees", envVar: "BOX_LIVE_MAX_BOX_CAPITAL_RUPEES", kind: "int", default: 0, min: 0, max: 1_000_000_000 },
-  { key: "liveDailyLossLimit", envVar: "BOX_LIVE_DAILY_LOSS_LIMIT", kind: "int", default: 5_000, min: 0, max: 10_000_000 },
+  { key: "liveMaxBoxCapitalRupees", envVar: "BOX_LIVE_MAX_BOX_CAPITAL_RUPEES", kind: "int", default: 0, min: 0, max: 1_000_000_000, strict: true },
+  { key: "liveDailyLossLimit", envVar: "BOX_LIVE_DAILY_LOSS_LIMIT", kind: "int", default: 5_000, min: 0, max: 10_000_000, strict: true },
   { key: "liveRejectLimit", envVar: "BOX_LIVE_REJECT_LIMIT", kind: "int", default: 3, min: 1, max: 100 },
   { key: "liveConsecutiveFailureLimit", envVar: "BOX_LIVE_CONSECUTIVE_FAILURE_LIMIT", kind: "int", default: 3, min: 1, max: 100 },
 
@@ -155,7 +163,7 @@ const KNOBS: readonly KnobSpec[] = [
   { key: "liveRequireFundsCover", envVar: "BOX_LIVE_REQUIRE_FUNDS_COVER", kind: "bool", default: false },
   { key: "liveRequireMarginEvidence", envVar: "BOX_LIVE_REQUIRE_MARGIN_EVIDENCE", kind: "bool", default: false },
   { key: "liveRequireStageFunding", envVar: "BOX_LIVE_REQUIRE_STAGE_FUNDING", kind: "bool", default: false },
-  { key: "liveRecoveryReserveRupees", envVar: "BOX_LIVE_RECOVERY_RESERVE_RUPEES", kind: "int", default: 0, min: 0, max: 100_000_000 },
+  { key: "liveRecoveryReserveRupees", envVar: "BOX_LIVE_RECOVERY_RESERVE_RUPEES", kind: "int", default: 0, min: 0, max: 100_000_000, strict: true },
   { key: "liveFundsFreshnessMaxAgeMs", envVar: "BOX_LIVE_FUNDS_FRESHNESS_MAX_AGE_MS", kind: "int", default: 5_000, min: 250, max: 600_000 },
   { key: "liveMarginFreshnessMaxAgeMs", envVar: "BOX_LIVE_MARGIN_FRESHNESS_MAX_AGE_MS", kind: "int", default: 5_000, min: 250, max: 600_000 },
   { key: "liveEvidenceReadTimeoutMs", envVar: "BOX_LIVE_EVIDENCE_READ_TIMEOUT_MS", kind: "int", default: 2_500, min: 100, max: 60_000 },
@@ -263,6 +271,25 @@ function resolveKnob(spec: KnobSpec, raw: string | null, actual: unknown): Resol
     const lo = spec.kind === "pct" ? 0 : spec.min;
     const hi = spec.kind === "pct" ? 100 : spec.max;
     const requested = spec.kind === "pct" ? n : Math.round(n);
+    /*
+     * A CONTAINMENT LIMIT IS NEVER CLAMPED OR ROUNDED — AND THIS SURFACE MUST SAY THE SAME.
+     *
+     * `loadBoxConfig` REFUSES an explicitly-set invalid value for these knobs (see `strictLimitInt`),
+     * because for them a bad value reaches an "unlimited" sentinel or widens a bound. Without this
+     * branch the two parsers DRIFT: this surface would report a reassuring `env_clamped` for input the
+     * loader rejects outright. The process would not boot, so the drift is not directly dangerous —
+     * but a diagnostics surface that disagrees with the loader is exactly how a wrong belief about
+     * what is in force gets established, and this file's own contract is that it mirrors the loader.
+     */
+    if (spec.strict === true) {
+      if (!Number.isInteger(n) || (lo !== undefined && n < lo) || (hi !== undefined && n > hi)) {
+        return { ...base, value: actual, rawEnv: raw, source: "env_invalid_refused",
+          note: `"${raw}" is refused: this is a safety limit, so it is neither rounded nor clamped ` +
+            `(a bad value here would silently widen or remove the limit). Leave it unset for the ` +
+            `default, or set a whole number in [${String(lo)}, ${String(hi)}].` };
+      }
+      return { ...base, value: actual, rawEnv: raw, source: "env" };
+    }
     if (lo !== undefined && hi !== undefined && (requested < lo || requested > hi)) {
       return { ...base, value: actual, rawEnv: raw, source: "env_clamped",
         note: `requested ${requested} clamped into [${lo}, ${hi}] → ${String(actual)}` };

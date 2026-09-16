@@ -887,17 +887,44 @@ export class KiteBrokerAdapter implements BrokerAdapter {
     }, this.config.maxChaseTicks);
     const count = this.modifications.get(clientOrderId) ?? 0;
     if (count >= this.config.maxModifications) throw new Error("Live order modification limit reached.");
+    /*
+     * THE ATTEMPT IS COUNTED BEFORE THE WIRE, NOT AFTER A SUCCESSFUL RESPONSE.
+     *
+     * THE DEFECT THIS FIXES. The counter used to be incremented only after the PUT RESOLVED, so a
+     * modification that reached Kite but whose response timed out, 5xx'd or 429'd threw before being
+     * counted. The exchange had applied it; our count said it never happened. Repeat that and the
+     * chase issues strictly more modifications than `BOX_LIVE_MAX_MODIFICATIONS` permits, silently
+     * consuming Kite's own per-order modification allowance — and Kite rejects the whole order once
+     * that is exhausted, at the worst possible moment.
+     *
+     * Counting first is the conservative direction: an attempt that provably never left (a synchronous
+     * refusal below the wire) costs one of our own budget slots, which can only ever make us modify
+     * LESS. Over-counting our own budget is recoverable; under-counting the broker's is not.
+     */
+    this.modifications.set(clientOrderId, count + 1);
     await this.call(() => this.transport.modifyOrder(order.broker_order_id as string, {
       price: request.limit_price,
       ...(request.quantity !== undefined ? { quantity: request.quantity } : {}),
     }), "order_modify");
-    this.modifications.set(clientOrderId, count + 1);
-    order.limit_price = request.limit_price;
-    order.pricing = { ...order.pricing, limit_price: request.limit_price };
-    order.quantity = quantity;
-    order.pending_quantity = Math.max(0, quantity - order.filled_quantity);
-    order.updated_at = this.clock.now();
-    return clone(await this.refresh(order));
+    /*
+     * WRITTEN THROUGH `commit`, NEVER MUTATED IN PLACE AFTER AN AWAIT.
+     *
+     * `order` was read BEFORE the PUT. If a stream observation landed during the round trip,
+     * `this.orders` now holds a different, merged object and mutating `order` here edited a DETACHED
+     * ORPHAN: the new limit price and quantity never reached the session projection, and
+     * `pending_quantity` was computed from the orphan's stale `filled_quantity`. That is precisely the
+     * lost-update class `commit()` exists to prevent — this was the one REST path still bypassing it.
+     */
+    const latest = this.orders.get(clientOrderId) ?? order;
+    const merged = this.commit(clientOrderId, {
+      ...cloneBrokerOrder(latest),
+      limit_price: request.limit_price,
+      pricing: { ...latest.pricing, limit_price: request.limit_price },
+      quantity,
+      pending_quantity: Math.max(0, quantity - latest.filled_quantity),
+      updated_at: this.clock.now(),
+    });
+    return clone(await this.refresh(merged));
   }
 
   async getOrder(clientOrderId: string): Promise<BrokerOrder | undefined> {
