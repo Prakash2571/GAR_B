@@ -141,11 +141,17 @@ several places a secret can leak, and no single place that knows which session i
 | Honest freshness | A token is served only while usable; otherwise `409` with a reason, so a caller never receives a dead credential. |
 | Scoped prefix | Not under `/api/broker/*`, so that prefix's no-token invariant remains literally true. |
 
-**What the rate limiter does and does not do.** `rateLimit` keys on the first
-`X-Forwarded-For` value, which a direct caller controls, so a determined attacker can rotate
-it. The **32-character key floor** is what actually makes the shared secret unguessable; the
-limiter bounds accidental hammering and casual probing. Do not read "rate limited" as
-"brute-force proof" — the network restriction below is the second real control.
+**What the rate limiter does and does not do.** `rateLimit` now keys on the **trusted** client
+address (`src/clientIp.ts`): forwarding headers are consulted only when the connection itself
+arrives from a trusted proxy, and then it reads the hop *our* nginx appended — not the leftmost
+entry, which is the value the caller supplies. It previously keyed on the first
+`X-Forwarded-For` value, so a direct caller could rotate it and reset its own budget; that is
+fixed, along with a duplicated-header `TypeError` that let a request escape being counted at all,
+and the limiter map is now bounded.
+
+That closes the trivial bypass. It does **not** make the limiter a brute-force defence on its
+own: the **32-character key floor** is what makes the shared secret unguessable, and the network
+restriction below is the second real control. Do not read "rate limited" as "brute-force proof".
 
 **Sign-out is not revocation.** `POST /api/broker/{broker}/logout` makes THIS deployment forget
 the token and stops serving it here. It does **not** invalidate the token at the broker, so any
