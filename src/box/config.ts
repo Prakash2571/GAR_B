@@ -1373,12 +1373,12 @@ export function loadBoxConfig(): BoxConfig {
     // THE gate: ₹1,200 of expected net profit after every cost.
     minExpectedNetProfit: nonNegativeNum("BOX_MIN_EXPECTED_NET_PROFIT", 1200),
     // Prefilter only.
-    minGrossEdge: num("MIN_BOX_GROSS_EDGE", 1200),
-    minNetEdge: num("MIN_BOX_NET_EDGE", 0),
+    minGrossEdge: nonNegativeNum("MIN_BOX_GROSS_EDGE", 1200),
+    minNetEdge: nonNegativeNum("MIN_BOX_NET_EDGE", 0),
     safetyBuffer: nonNegativeNum("BOX_SAFETY_BUFFER", 150),
     expectedEntrySlippage: nonNegativeNum("BOX_EXPECTED_ENTRY_SLIPPAGE", 250),
     expectedExitSlippage: nonNegativeNum("BOX_EXPECTED_EXIT_SLIPPAGE", 250),
-    prefilterChargeAllowance: num("BOX_PREFILTER_CHARGE_ALLOWANCE", 160),
+    prefilterChargeAllowance: nonNegativeNum("BOX_PREFILTER_CHARGE_ALLOWANCE", 160),
     requirePricedCharges: bool("BOX_REQUIRE_PRICED_CHARGES", true),
 
     reconcileCharges: bool("BOX_RECONCILE_CHARGES", true),
@@ -1402,9 +1402,9 @@ export function loadBoxConfig(): BoxConfig {
     windowMinIntervalMs: num("BOX_WINDOW_MIN_INTERVAL_MS", 15_000),
     enableShortBox: strictBool("BOX_ENABLE_SHORT_BOX", true),
 
-    convergenceFloor: num("BOX_CONVERGENCE_FLOOR", 200),
+    convergenceFloor: nonNegativeNum("BOX_CONVERGENCE_FLOOR", 200),
     convergencePct: num("BOX_CONVERGENCE_PCT", 0.2),
-    minExitNetPnl: num("BOX_MIN_EXIT_NET_PNL", 600),
+    minExitNetPnl: nonNegativeNum("BOX_MIN_EXIT_NET_PNL", 600),
     exitUseRealisableNet: bool("BOX_EXIT_USE_REALISABLE", true),
     profitCapturePct: num("BOX_PROFIT_CAPTURE_PCT", 0.75),
     minCapturedPct: num("BOX_MIN_CAPTURED_PCT", 0.75),

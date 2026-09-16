@@ -289,17 +289,17 @@ validates and clamps each one and fails closed. The full annotated list lives in
 | `BOX_LIVE_MAX_OPEN_BOXES` | `1` | no | Concurrent open boxes (clamp 0..20). | Higher ⇒ more concurrent risk. |
 | `BOX_LIVE_MAX_CONCURRENT_EXECUTIONS` | `1` | no | Concurrent execution pipelines (clamp 1..4). | — |
 | `BOX_ONE_ACTIVE_BOX_PER_UNDERLYING` | `false` | no | One box per underlying, on top of contract exclusion. | Set `true` for the conservative profile. |
-| `BOX_SESSION_MAX_COMPLETED_TRADES` | `0` | no | Completed-box cap for an armed session; `0`=unlimited (clamp 0..10000). | Set `1` to arm a one-shot session. |
-| `BOX_LIVE_MAX_BOX_CAPITAL_RUPEES` | `0` | no | GROSS order notional cap (₹), NOT margin/max-loss; `0`=disabled (clamp 0..1e9). | A placeholder to set, never an approved budget. |
+| `BOX_SESSION_MAX_COMPLETED_TRADES` | `0` | no | Completed-box cap for an armed session; `0`=unlimited (range 0..10000; an explicitly-set invalid value is REFUSED at boot, never clamped). | Set `1` to arm a one-shot session. |
+| `BOX_LIVE_MAX_BOX_CAPITAL_RUPEES` | `0` | no | GROSS order notional cap (₹), NOT margin/max-loss; `0`=disabled (range 0..1e9; an explicitly-set invalid value is REFUSED at boot, never clamped). | A placeholder to set, never an approved budget. |
 | `BOX_LIVE_REQUIRE_FUNDS_COVER` | `false` | no | Refuse entry unless fresh broker funds cover the binding requirement. | `true` recommended for live; blocks on stale/missing funds. |
 | `BOX_LIVE_REQUIRE_MARGIN_EVIDENCE` | `false` | no | Refuse entry without fresh basket-margin evidence. | Wired (Kite basket / Dhan multi). Fails CLOSED on missing/stale/incomplete. |
 | `BOX_LIVE_REQUIRE_STAGE_FUNDING` | `false` | no | Refuse entry unless EVERY hedge-first funding stage has an establishable requirement AND the sequence is genuinely hedge-first. | Strongest funding gate. IMPLIES the funds-cover and margin-evidence checks. **Blocks Dhan by design** (`funding_stage_unknown`): Dhan publishes no INITIAL basket margin. |
-| `BOX_LIVE_RECOVERY_RESERVE_RUPEES` | `0` | no | Funds (₹) held back so a recovery action (cancel / unwind / complete) is not blocked for want of money (clamp 0..1e8). | `0` = nothing reserved. **No safe amount can be derived for you** — see `docs/ECONOMIC_ADMISSION.md` § Sizing the recovery reserve. |
+| `BOX_LIVE_RECOVERY_RESERVE_RUPEES` | `0` | no | Funds (₹) held back so a recovery action (cancel / unwind / complete) is not blocked for want of money (range 0..1e8; an explicitly-set invalid value is REFUSED at boot, never clamped). | `0` = nothing reserved. **No safe amount can be derived for you** — see `docs/ECONOMIC_ADMISSION.md` § Sizing the recovery reserve. |
 | `BOX_LIVE_FUNDS_FRESHNESS_MAX_AGE_MS` | `5000` | no | Max age of a funds observation counted fresh (clamp 250..600000). | — |
 | `BOX_LIVE_MARGIN_FRESHNESS_MAX_AGE_MS` | `5000` | no | Max age of a margin observation counted fresh (clamp 250..600000). | — |
 | `BOX_LIVE_EVIDENCE_READ_TIMEOUT_MS` | `2500` | no | Hard per-read deadline for a funds/margin fetch (clamp 100..60000). | A stalled broker endpoint cannot hold admission open. |
 | `BOX_LIVE_EVIDENCE_CONCURRENT_READS` | `false` | no | Read funds and margin concurrently instead of serially. | Only enable where the broker integration tolerates it. |
-| `BOX_LIVE_DAILY_LOSS_LIMIT` | `5000` | no | Loss breaker: stops NEW entry, not a max loss (clamp 0..1e7). | — |
+| `BOX_LIVE_DAILY_LOSS_LIMIT` | `5000` | no | Loss breaker: stops NEW entry, not a max loss (range 0..1e7; an explicitly-set invalid value is REFUSED at boot, never clamped). | — |
 | `BOX_LIVE_ORDER_MUTATION_DEADLINE_MS` | `4000` | no | ONE end-to-end budget per mutation, started before queue admission (clamp 250..30000). | Too low ⇒ premature abandonment; too high ⇒ slow give-up. |
 | `BOX_LIVE_ENTRY_SUBMIT_CONCURRENCY` | `1` | no | Entry-role submissions in transport at once (1..4). | 4 does NOT make entry atomic. |
 | `BOX_LIVE_BROKER_ORDER_MIN_INTERVAL_MS` | `0` | no | Order-mutation pacing; `0`=derive from broker floor, override clamped UP (clamp 0..5000). | Never goes below the broker's hard floor. |
@@ -390,3 +390,14 @@ An earlier draft listed these as removed Redis knobs. They are read and drive th
 | `BOX_PNL_ARCHIVE_HOUR` | `21` | IST hour the daily P&L archive runs. |
 | `BOX_PNL_ARCHIVE_DRAIN_DELAY_MS` | `50` | Delay (ms) between archive drain steps. |
 | `BOX_PNL_VERIFY_HOURS` | `[22,23]` | IST hours the archive-verification pass runs. |
+
+## Trusted proxy
+
+| Variable | Default | Required | Meaning | Risk if wrong |
+|---|---|---|---|---|
+| `BOX_TRUSTED_PROXY_IPS` | *(empty)* | no | Comma-separated exact addresses or IPv4 CIDR blocks whose forwarding headers may be believed. **Loopback is always trusted; nothing else is.** | Naming an address you do not control lets every client behind it choose its own rate-limit bucket on `POST /api/access/verify` and forge the session's recorded origin IP. Leave empty when nginx runs on the same host. |
+
+Client attribution never reads the first `X-Forwarded-For` value. `deploy/nginx.conf` sets
+`$proxy_add_x_forwarded_for`, which **appends** the real peer, so position 0 is whatever the caller
+sent. The derivation in `src/clientIp.ts` consults forwarding headers only when the connection itself
+arrives from a trusted proxy, and then reads the hop our own proxy added.

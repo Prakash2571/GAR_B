@@ -1,5 +1,6 @@
 import {
   BrokerAmbiguousSubmitError,
+  BrokerCancelNotTransmittedError,
   BrokerCancelUnresolvedError,
   BrokerOrderRejectedError,
   BrokerPreSubmitRefusedError,
@@ -2858,6 +2859,31 @@ export class BoxOrderManager {
           // The reject snapshot is authoritative and terminal — it proves ZERO covering fill,
           // which is exactly what the ledger must record so the dependent SELL fails closed.
           terminalOrder = error.order;
+          action.reject(error);
+          return;
+        }
+        /*
+         * A PROVEN-UNSENT CANCELLATION IS NOT BROKER UNCERTAINTY.
+         *
+         * The adapter now re-raises `BrokerCancelNotTransmittedError` rather than quarantining it, and
+         * without this branch it fell to the catch-all below, which writes RECONCILIATION_REQUIRED and
+         * increments `unknownOrders` — the number the registry turns into its `unknown_order_state`
+         * blocker. So the wedge the error type exists to remove was reproduced one layer up.
+         *
+         * What is actually true: the protective cancel never left, so the ENTRY ORDER IS UNCHANGED and
+         * still working at the broker. That is a known live order, not an unknown one. It is persisted
+         * from the snapshot the error carries (so the durable row keeps the quantity that travelled with
+         * the refusal), left NON-TERMINAL so it can be cancelled again, and counted as an unattended
+         * working order — which already blocks new entry — instead of as an unresolvable mystery.
+         *
+         * The hedge is still treated as failed: an un-cancelled working order is not proof of a fill,
+         * and `hedgeFailureReason` must stay set so no dependent uncovered SELL is authorised.
+         */
+        if (error instanceof BrokerCancelNotTransmittedError) {
+          if (error.order) await this.persistOrder(intent, error.order, error.message);
+          this.unattendedWorkingOrders++;
+          this.noteFailure("protective cancellation was not transmitted");
+          hedgeFailureReason = errorMessage(error);
           action.reject(error);
           return;
         }
