@@ -65,17 +65,56 @@ function canonical(address: string): string {
 export function isTrustedProxyAddress(address: string | undefined): boolean {
   if (!address) return false;
   const ip = canonical(address);
+  /*
+   * LOOPBACK ONLY, BY DEFAULT.
+   *
+   * This used to trust every RFC1918 / link-local / unique-local source unconditionally. Combined with
+   * a process that binds every interface, that meant ANY host able to reach the backend port from a
+   * private address could send its own `X-Real-IP` and choose its own rate-limit bucket on the passcode
+   * endpoint — unlimited brute force against the credential guarding the whole operator surface — and
+   * poison the persisted session origin. On EC2 the private subnet IS that range, so the only thing
+   * standing in the way was a security group enforced nowhere in code.
+   *
+   * The documented topology is nginx terminating on the same host, so loopback is the honest default.
+   * A proxy anywhere else must be named explicitly in `BOX_TRUSTED_PROXY_IPS`, which now accepts CIDR
+   * as well as exact addresses so that a real deployment can express it.
+   */
   if (ip === "127.0.0.1" || ip === "::1" || ip === "localhost") return true;
-  if (/^10\./.test(ip)) return true;
-  if (/^192\.168\./.test(ip)) return true;
-  if (/^172\.(1[6-9]|2\d|3[01])\./.test(ip)) return true;
-  if (/^169\.254\./.test(ip)) return true;
-  if (/^f[cd][0-9a-f]{2}:/.test(ip)) return true;
-  const configured = (process.env.BOX_TRUSTED_PROXY_IPS ?? "")
+  return configuredProxies().some((entry) => matchesProxyEntry(ip, entry));
+}
+
+/** Trusted-proxy entries from the environment: exact addresses or IPv4 CIDR blocks. */
+function configuredProxies(): string[] {
+  return (process.env.BOX_TRUSTED_PROXY_IPS ?? "")
     .split(",")
-    .map((entry) => canonical(entry))
+    .map((entry) => entry.trim().toLowerCase())
     .filter((entry) => entry !== "");
-  return configured.includes(ip);
+}
+
+/** Does `ip` match one configured entry? Supports `a.b.c.d` and `a.b.c.d/nn` (IPv4). */
+function matchesProxyEntry(ip: string, entry: string): boolean {
+  const slash = entry.indexOf("/");
+  if (slash === -1) return canonical(entry) === ip;
+  const network = canonical(entry.slice(0, slash));
+  const bits = Number(entry.slice(slash + 1));
+  if (!Number.isInteger(bits) || bits < 0 || bits > 32) return false;
+  const toLong = (value: string): number | null => {
+    const parts = value.split(".");
+    if (parts.length !== 4) return null;
+    let out = 0;
+    for (const part of parts) {
+      const octet = Number(part);
+      if (!Number.isInteger(octet) || octet < 0 || octet > 255) return null;
+      out = out * 256 + octet;
+    }
+    return out;
+  };
+  const a = toLong(ip);
+  const b = toLong(network);
+  if (a === null || b === null) return false;
+  if (bits === 0) return true;
+  const mask = (0xffffffff << (32 - bits)) >>> 0;
+  return ((a & mask) >>> 0) === ((b & mask) >>> 0);
 }
 
 /**
