@@ -19,6 +19,7 @@ import type { Express, Request, Response } from "express";
 import type { AppConfig } from "../config.js";
 import { clearSessionCookies, csrfCookieName, readCookie, setSessionCookies } from "./cookies.js";
 import { CSRF_HEADER, csrfMatches, normalizeCsrfHeader, originAllowed } from "./csrf.js";
+import { trustedClientIp } from "../clientIp.js";
 import { sendApiError } from "./middleware.js";
 import type { AccessSessionConfig } from "./sessionStore.js";
 import {
@@ -36,10 +37,17 @@ export interface AccessRouteDeps {
   verifyRateLimit: import("express").RequestHandler;
 }
 
-/** Read the client IP the way the ported rate limiter does (nginx X-Forwarded-For). */
+/**
+ * The client IP recorded on a minted session, from the SAME trusted derivation the limiter uses.
+ *
+ * This used to read the first `X-Forwarded-For` element independently of the limiter. Since nginx
+ * APPENDS to that header, position 0 was the caller's own value — so the forged address was persisted
+ * as the session's origin and the audit trail said whatever the client wanted it to say. Fixing only
+ * the limiter would have left that poisoned, which is why both now share one helper.
+ */
 function clientIp(req: Request): string | undefined {
-  const fwd = (req.headers["x-forwarded-for"] as string | undefined)?.split(",")[0]?.trim();
-  return fwd || req.socket.remoteAddress || undefined;
+  const ip = trustedClientIp(req);
+  return ip === "unknown" ? undefined : ip;
 }
 
 export function registerAccessRoutes(app: Express, deps: AccessRouteDeps): void {

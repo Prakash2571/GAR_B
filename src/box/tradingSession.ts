@@ -297,12 +297,36 @@ export function deriveSessionState(record: BoxSessionRecord, activity: BoxSessio
   if (activity.exitInProgress) return "EXIT_IN_PROGRESS";
   if (activity.openBoxes > 0) return "POSITION_OPEN";
   if (activity.entryInProgress) return "ENTRY_IN_PROGRESS";
-  const exhausted = isBudgetExhausted(record);
-  if (exhausted && completedCycles(record) >= consumedCycles(record)) return "COMPLETED";
-  // BLOCKED covers the session's OWN exhausted budget as well as an external gate. Reporting
+  const cyclesExhausted = isBudgetExhausted(record);
+  /*
+   * THE ATTEMPT BUDGET COUNTS TOO — IT DID NOT.
+   *
+   * THE DEFECT THIS FIXES. This consulted only the COMPLETED-CYCLE budget, while
+   * `evaluateSessionEntry` refuses entry on EITHER budget. So after spending
+   * `max_entry_attempts = 1` with nothing established, the same status payload reported
+   * `state: "ARMED"` and `block_reason: "session_attempt_budget_exhausted"` together — the screen
+   * said ready to trade, the engine said no. For a one-attempt supervised trial that is the single
+   * most important thing on the page, and it was wrong in the reassuring direction.
+   *
+   * The two budgets are spent by different events and must stay distinct: a CYCLE is spent by
+   * SUCCEEDING (`recordEstablishedBox`), an ATTEMPT by STARTING (`recordEntryAttemptStarted`, at
+   * admission, before any POST). A failed or unwound attempt therefore consumes an attempt and no
+   * cycle.
+   */
+  const attemptsExhausted = isAttemptBudgetExhausted(record);
+  // COMPLETED stays keyed on the CYCLE budget and flatness ALONE. An attempt-exhausted session with
+  // zero established cycles has completed nothing, and calling it COMPLETED would report a session
+  // that never traded as finished.
+  if (cyclesExhausted && completedCycles(record) >= consumedCycles(record)) return "COMPLETED";
+  // BLOCKED covers the session's OWN exhausted budgets as well as an external gate. Reporting
   // ARMED here would be actively misleading: `evaluateSessionEntry` refuses entry, so a screen
   // saying "ARMED" would tell an operator the session was ready to trade when it was not.
-  if (exhausted || activity.entryBlockedExternally) return "BLOCKED";
+  //
+  // Note the ordering above is load-bearing and unchanged: RECOVERY, EXIT_IN_PROGRESS,
+  // POSITION_OPEN and ENTRY_IN_PROGRESS all still outrank BLOCKED, so an operator can always see
+  // that exposure is open or an exit is in flight even once the budget is spent. Only the otherwise
+  // IDLE-but-armed case becomes BLOCKED.
+  if (cyclesExhausted || attemptsExhausted || activity.entryBlockedExternally) return "BLOCKED";
   return "ARMED";
 }
 
