@@ -3652,7 +3652,7 @@ export class BoxOrderManager {
     if (envelope > this.deps.limits.maxGrossOpenLegQuantity) {
       return (
         `The full ${legs}-leg attempt needs ${quantityPerLeg * legs} unit(s) of gross leg quantity ` +
-        `(already committed elsewhere: ${committedByOthers}), which exceeds ` +
+        `(already committed: ${committedByOthers}), which exceeds ` +
         `BOX_LIVE_MAX_GROSS_OPEN_LEG_QUANTITY=${this.deps.limits.maxGrossOpenLegQuantity}. Refused ` +
         `BEFORE the first leg posts, so no hedge is acquired against a cap the attempt cannot satisfy.`
       );

@@ -168,7 +168,7 @@ test("R1-5: another attempt's reservations and existing exposure are still count
   );
   const reason = stack.manager.entryQuantityEnvelopeBlockReason(75, "A1");
   assert.ok(reason !== null, "a pre-existing 75-unit position must still consume the envelope");
-  assert.match(reason, /already committed elsewhere: 75/);
+  assert.match(reason, /already committed: 75/);
 });
 
 test("R1-6: entry concurrency 1 through 4 all admit the same valid attempt", async () => {

@@ -41,7 +41,13 @@ function withEnv(env, fn) {
   }
 }
 
-/** The containment limits where an invalid value used to mean "no limit". */
+/**
+ * The containment limits where an invalid value used to mean "no limit" or a WIDER limit.
+ *
+ * `BOX_LIVE_MAX_OPEN_BOXES` is deliberately NOT here: clamping 99 to 20 NARROWS the limit, which is
+ * the safe direction, and `effectiveConfig` already reports it as `env_clamped` with the requested
+ * versus effective value. Strictness is for the settings where bad input widens or removes a bound.
+ */
 const CONTAINMENT = [
   "BOX_SESSION_MAX_ENTRY_ATTEMPTS",
   "BOX_SESSION_MAX_COMPLETED_TRADES",
@@ -49,7 +55,6 @@ const CONTAINMENT = [
   "BOX_LIVE_RECOVERY_RESERVE_RUPEES",
   "BOX_LIVE_MAX_OPEN_LEG_QUANTITY",
   "BOX_LIVE_MAX_GROSS_OPEN_LEG_QUANTITY",
-  "BOX_LIVE_MAX_OPEN_BOXES",
   "BOX_LIVE_DAILY_LOSS_LIMIT",
 ];
 

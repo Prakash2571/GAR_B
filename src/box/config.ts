@@ -1231,7 +1231,7 @@ export function loadBoxConfig(): BoxConfig {
     liveTradingEnabled,
     liveReconcileIntervalMs: clampInt("BOX_LIVE_RECONCILE_INTERVAL_MS", 60_000, 5_000, 15 * 60_000),
     liveFeedReconnectWarmupMs: clampInt("BOX_LIVE_FEED_RECONNECT_WARMUP_MS", 5_000, 0, 5 * 60_000),
-    liveMaxOpenBoxes: strictLimitInt("BOX_LIVE_MAX_OPEN_BOXES", 1, 0, 20),
+    liveMaxOpenBoxes: clampInt("BOX_LIVE_MAX_OPEN_BOXES", 1, 0, 20),
     liveMaxConcurrentExecutions: clampInt("BOX_LIVE_MAX_CONCURRENT_EXECUTIONS", 1, 1, 4),
     liveMaxResidualLegs: clampInt("BOX_LIVE_MAX_RESIDUAL_LEGS", 1, 0, 4),
     liveDailyLossLimit: strictLimitInt("BOX_LIVE_DAILY_LOSS_LIMIT", 5_000, 0, 10_000_000),
