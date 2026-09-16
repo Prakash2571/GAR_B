@@ -167,6 +167,58 @@ function strictLimitInt(name: string, fallback: number, min: number, max: number
   return value;
 }
 
+
+/**
+ * A NON-NEGATIVE economic figure. An explicitly-set negative value is FATAL.
+ *
+ * THE FAIL-OPEN PATH THIS CLOSES. `num()` applies no floor whatsoever, so a finite negative passed
+ * straight through. `BOX_MIN_EXPECTED_NET_PROFIT=-5000` loaded verbatim and became the ENTRY GATE —
+ * i.e. "enter at a known loss of up to 5000". The codebase already knows this is illegitimate:
+ * `BOX_TUNING_LIMITS` pins the same knob to `{min: 0}` and `validateTuning` REFUSES rather than
+ * clamps, with the comment that a negative one "would mean 'enter at a known loss', which is never
+ * intended". But that floor only guarded the runtime admin API; the env path had none, so the two
+ * entry points disagreed about what was acceptable. A negative `BOX_SAFETY_BUFFER` or slippage
+ * estimate is the same defect wearing different units — it makes expected profit look larger.
+ */
+function nonNegativeNum(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const text = raw.trim();
+  const value = Number(text);
+  if (!Number.isFinite(value)) return fallback;
+  if (value < 0) {
+    throw new Error(
+      `[BoxConfig] ${name}="${text}" is negative. This figure feeds the entry/exit economics, and a ` +
+        `negative value LOOSENS the gate rather than tightening it (for the profit floor it means ` +
+        `"enter at a known loss"). Refused rather than clamped, so the mistake is visible. Leave it ` +
+        `unset for the default (${fallback}), or set a value >= 0.`,
+    );
+  }
+  return value;
+}
+
+/**
+ * A boolean where an UNRECOGNISED value is FATAL rather than silently the fallback.
+ *
+ * `bool()` returns the FALLBACK on an unrecognised value. For the eleven knobs whose default is
+ * `true` that is the protective direction — a typo re-enables a guard. `BOX_ENABLE_SHORT_BOX` is the
+ * exception: its default `true` DOUBLES the tradeable direction set, so `=off`, `=no thanks`,
+ * `=disabled` or `=flase` silently re-enabled short boxes an operator believed were off. Refusing is
+ * the only answer that cannot be wrong in the dangerous direction.
+ */
+function strictBool(name: string, fallback: boolean): boolean {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const value = raw.trim().toLowerCase();
+  if (value === "1" || value === "true" || value === "yes") return true;
+  if (value === "0" || value === "false" || value === "no") return false;
+  throw new Error(
+    `[BoxConfig] ${name}="${raw.trim()}" is not a recognised boolean. This switch changes what the ` +
+      `system is willing to trade, so an unrecognised value is refused rather than resolved to the ` +
+      `default (${fallback}) — a typo must never widen it. Use true/false (or 1/0, yes/no).`,
+  );
+}
+
 /** Clamp a percentage to [0, 100]. */
 function clampPct(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -1319,13 +1371,13 @@ export function loadBoxConfig(): BoxConfig {
     coherenceZeroDispersionDisablesInLive: bool("BOX_COHERENCE_ZERO_DISPERSION_DISABLES_IN_LIVE", false),
 
     // THE gate: ₹1,200 of expected net profit after every cost.
-    minExpectedNetProfit: num("BOX_MIN_EXPECTED_NET_PROFIT", 1200),
+    minExpectedNetProfit: nonNegativeNum("BOX_MIN_EXPECTED_NET_PROFIT", 1200),
     // Prefilter only.
     minGrossEdge: num("MIN_BOX_GROSS_EDGE", 1200),
     minNetEdge: num("MIN_BOX_NET_EDGE", 0),
-    safetyBuffer: num("BOX_SAFETY_BUFFER", 150),
-    expectedEntrySlippage: num("BOX_EXPECTED_ENTRY_SLIPPAGE", 250),
-    expectedExitSlippage: num("BOX_EXPECTED_EXIT_SLIPPAGE", 250),
+    safetyBuffer: nonNegativeNum("BOX_SAFETY_BUFFER", 150),
+    expectedEntrySlippage: nonNegativeNum("BOX_EXPECTED_ENTRY_SLIPPAGE", 250),
+    expectedExitSlippage: nonNegativeNum("BOX_EXPECTED_EXIT_SLIPPAGE", 250),
     prefilterChargeAllowance: num("BOX_PREFILTER_CHARGE_ALLOWANCE", 160),
     requirePricedCharges: bool("BOX_REQUIRE_PRICED_CHARGES", true),
 
@@ -1348,7 +1400,7 @@ export function loadBoxConfig(): BoxConfig {
     defaultStrikeLevel: clampStrikeLevel(num("BOX_STRIKE_LEVEL", 3)),
     atmHysteresis: num("BOX_ATM_HYSTERESIS", 0.15),
     windowMinIntervalMs: num("BOX_WINDOW_MIN_INTERVAL_MS", 15_000),
-    enableShortBox: bool("BOX_ENABLE_SHORT_BOX", true),
+    enableShortBox: strictBool("BOX_ENABLE_SHORT_BOX", true),
 
     convergenceFloor: num("BOX_CONVERGENCE_FLOOR", 200),
     convergencePct: num("BOX_CONVERGENCE_PCT", 0.2),
@@ -1357,7 +1409,7 @@ export function loadBoxConfig(): BoxConfig {
     profitCapturePct: num("BOX_PROFIT_CAPTURE_PCT", 0.75),
     minCapturedPct: num("BOX_MIN_CAPTURED_PCT", 0.75),
 
-    expirySafetyMinutesBeforeClose: num("BOX_EXPIRY_SAFETY_MINUTES", 45),
+    expirySafetyMinutesBeforeClose: nonNegativeNum("BOX_EXPIRY_SAFETY_MINUTES", 45),
 
     monitorIntervalMs: periodMs("BOX_MONITOR_INTERVAL_MS", 1000),
     persistIntervalMs: periodMs("BOX_PERSIST_INTERVAL_MS", 30_000),
