@@ -287,9 +287,19 @@ test("B1: a cancel whose deadline expires while QUEUED is never transmitted", as
     { urgency: "recovery", deadline },
   );
 
-  // Time passes while it waits for a slot.
+  // The deadline passes while the cancel is still waiting for a slot.
   clock.advance(50);
   await settle();
+
+  // THE HEADLINE ASSERTION. Releasing the blocking read is the exact moment the baseline transmitted
+  // the DELETE — after the caller had already been told the cancellation timed out. The expiry must
+  // be noticed at the dispatch boundary instead, so the request is refused rather than sent late.
+  //
+  // (Promptly RELEASING the caller is the adapter's job, not the pacer's: it races its own real-timer
+  // deadline and then calls `abandon()`, which is covered by B3. The pacer's guarantee — the one that
+  // matters for what the broker sees — is that an expired entry is NEVER handed to the transport.)
+  parked.resolve("read done");
+  await read;
 
   await assert.rejects(
     cancel,
@@ -304,10 +314,6 @@ test("B1: a cancel whose deadline expires while QUEUED is never transmitted", as
     "an expired queued cancel must be refused, not silently kept",
   );
 
-  // THE HEADLINE ASSERTION. On the baseline the closure survived the timeout and the DELETE was
-  // transmitted here, after the caller had already been told it timed out.
-  parked.resolve("read done");
-  await read;
   await settle();
   assert.equal(cancelSent, false, "an expired, unsent request must NEVER reach the transport later");
   assert.equal(pacer.stats().abandonedBeforeDispatch, 1);
