@@ -678,26 +678,7 @@ export class KiteBrokerAdapter implements BrokerAdapter {
       // registry's `unknown_order_state` blocker) wedge logout and broker switching. This catch-all
       // used to swallow it and quarantine anyway, reintroducing the wedge the error type prevents.
       if (error instanceof BrokerCancelNotTransmittedError) throw error;
-      /*
-       * A LOCAL BUDGET REFUSAL, TRANSLATED — not re-raised bare.
-       *
-       * `reserveRecoveryBudgetOrThrow` throws at the dispatch boundary, so nothing was sent. But
-       * `BrokerPreSubmitRefusedError` means "no broker request was made" to every consumer, and the
-       * manager writes that TERMINALLY REJECTED with `no_broker_post: true` — a falsified terminal
-       * record for an entry order that has already POSTed and is working. The honest statement is the
-       * cancel-specific one: the cancellation did not go out, and the order is unchanged.
-       */
-      if (error instanceof BrokerPreSubmitRefusedError) {
-        throw new BrokerCancelNotTransmittedError(
-          clientOrderId,
-          brokerOrderId,
-          clone(this.orders.get(clientOrderId) ?? order),
-        );
-      }
-      // (retained for reference: the outer catches also guard these types) `reserveRecoveryBudgetOrThrow` throws at
-      // the dispatch boundary -- when the recovery reserve is spent or a 429 cooldown is active --
-      // BEFORE the transport is touched. Falling through to `quarantine()` turned a healthy working leg
-      // into RECONCILIATION_REQUIRED because OUR OWN budget said no, which is uncertainty we invented.
+      // A local pre-submit refusal is likewise a proven no-request and must not be quarantined here.
       if (error instanceof BrokerPreSubmitRefusedError) throw error;
       // A 429 feeds the shared budget a cooldown (never a resend). Done before any classification
       // so the cooldown is recorded even on the ambiguous path below.
@@ -1506,6 +1487,27 @@ export class KiteBrokerAdapter implements BrokerAdapter {
       // it is; dressing it up as ambiguous would quarantine an order the broker never heard about
       // and would tell the operator to reconcile something that never happened.
       if (error instanceof BrokerCancelNotTransmittedError) throw error;
+      /*
+       * A LOCAL BUDGET REFUSAL, TRANSLATED — not re-raised bare, and not quarantined.
+       *
+       * THIS is the catch that converted it. `reserveRecoveryBudgetOrThrow` throws at the dispatch
+       * boundary — recovery reserve spent, or a 429 cooldown active — so nothing was sent, and falling
+       * through to `quarantine()` turned a healthy working leg into RECONCILIATION_REQUIRED because OUR
+       * OWN budget said no. That is uncertainty we invented.
+       *
+       * Re-raising the bare type would be worse than the quarantine: `BrokerPreSubmitRefusedError`
+       * means "no broker request was made" to every consumer, and the manager writes it TERMINALLY
+       * REJECTED with `no_broker_post: true` — a falsified terminal record for an entry order that has
+       * already POSTed and is still working. The cancel-specific type says the true thing: the
+       * cancellation did not go out, and the order is unchanged.
+       */
+      if (error instanceof BrokerPreSubmitRefusedError) {
+        throw new BrokerCancelNotTransmittedError(
+          clientOrderId,
+          brokerOrderId,
+          clone(this.orders.get(clientOrderId) ?? order),
+        );
+      }
       // Quarantine the LATEST accepted state, not the pre-await snapshot: a fill observed while the
       // cancel was in flight is real exposure and must travel with the quarantine.
       const quarantined = this.quarantine(clientOrderId, order);
