@@ -340,6 +340,40 @@ export class BrokerDisabledError extends Error {
  * never a reason to believe the order is gone. The two failure directions are not symmetric: wrongly
  * believing a cancel succeeded leaves live exposure that nobody is watching.
  */
+/**
+ * A cancellation whose OUTCOME COULD NOT BE ESTABLISHED — neither cancelled nor provably untouched.
+ *
+ * Raised when a durable, non-terminal intent cannot be acted on because the adapter has no session
+ * knowledge of it and the identity could not be re-established by adoption. The order is very likely
+ * still WORKING at the broker.
+ *
+ * WHY THIS IS AN ERROR AND NOT AN EMPTY SUCCESS. The adapter returns `undefined` for an unknown client
+ * order id, and that used to be resolved as a no-op: the operator-facing sweep answered
+ * `{ ok: true, eligible: 1, cancelled: [], failures: [] }` with HTTP 200 while making zero broker
+ * calls. "I could not do this" and "there was nothing to do" are opposite facts, and only one of them
+ * is safe to report as success. Surfacing it as a failure puts the intent in `failures`, which flips
+ * `ok` to false and the route to 207, so a supervising operator sees an unresolved order instead of a
+ * green tick.
+ */
+export class BrokerCancelUnresolvedError extends Error {
+  /** Unknown — deliberately not `false`. Nothing was transmitted BY US, but the order may be live. */
+  readonly transmitted = false;
+
+  constructor(
+    readonly clientOrderId: string,
+    readonly brokerOrderId: string | null,
+  ) {
+    super(
+      `Cancellation for ${clientOrderId}` +
+        (brokerOrderId ? ` (broker order ${brokerOrderId})` : "") +
+        " is UNRESOLVED: the order is durable and non-terminal but this session cannot act on it, and " +
+        "its broker identity could not be re-established. No cancellation was sent and the order may " +
+        "still be working. Reconcile, or cancel it broker-side.",
+    );
+    this.name = "BrokerCancelUnresolvedError";
+  }
+}
+
 export class BrokerCancelNotTransmittedError extends Error {
   /** Always false, and proven by the transport queue rather than inferred from a timeout. */
   readonly transmitted = false;

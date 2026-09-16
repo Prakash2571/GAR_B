@@ -117,6 +117,56 @@ function clampInt(name: string, fallback: number, min: number, max: number): num
   return Math.min(max, Math.max(min, Math.round(v)));
 }
 
+/**
+ * A CONTAINMENT limit: absent means the default, but an explicitly-set invalid value is FATAL.
+ *
+ * THE DEFECT THIS CLOSES. `clampInt` funnels every kind of bad input to the fallback or the nearest
+ * bound, and for the settings where `fallback === min === 0` AND `0` means "unlimited", that turns a
+ * typo into the removal of a safety limit:
+ *
+ *     BOX_SESSION_MAX_ENTRY_ATTEMPTS="one"   -> NaN  -> fallback 0 -> UNLIMITED
+ *     BOX_SESSION_MAX_ENTRY_ATTEMPTS="-1"    -> -1   -> clamp  0   -> UNLIMITED
+ *     BOX_SESSION_MAX_ENTRY_ATTEMPTS="0.2"   -> 0.2  -> round  0   -> UNLIMITED
+ *
+ * An operator arming a one-attempt supervised trial who fat-fingers the value gets UNBOUNDED
+ * attempts, and nothing anywhere says so. That is the exact inverse of what a containment limit is
+ * for, so this helper refuses instead: two distinct mechanisms (`NaN` and the `Math.max(min, …)`
+ * clamp) both used to reach 0, and both are rejected here.
+ *
+ * The distinction that matters is MISSING versus EXPLICITLY WRONG. An unset variable is a deliberate
+ * "use the default" and stays silent. A variable the operator took the trouble to set, incorrectly,
+ * must never be silently reinterpreted — least of all into the most permissive value available.
+ *
+ * Throwing is the right failure mode: this runs during config load at boot, and the alternative is a
+ * process that trades with containment the operator believes is in force.
+ */
+function strictLimitInt(name: string, fallback: number, min: number, max: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const text = raw.trim();
+  const value = Number(text);
+  if (!Number.isFinite(value)) {
+    throw new Error(
+      `[BoxConfig] ${name}="${text}" is not a number. This is a safety limit, so it is refused rather ` +
+        `than defaulted — a typo here would silently remove the limit. Leave it unset to use the ` +
+        `default (${fallback}), or set a whole number between ${min} and ${max}.`,
+    );
+  }
+  if (!Number.isInteger(value)) {
+    throw new Error(
+      `[BoxConfig] ${name}="${text}" must be a WHOLE number, not a fraction. Rounding it would change ` +
+        `the limit you asked for (0.2 would become 0, which means UNLIMITED for this setting).`,
+    );
+  }
+  if (value < min || value > max) {
+    throw new Error(
+      `[BoxConfig] ${name}="${text}" is outside the permitted range ${min}..${max}. It is refused ` +
+        `rather than clamped, because silently narrowing or widening a safety limit hides the mistake.`,
+    );
+  }
+  return value;
+}
+
 /** Clamp a percentage to [0, 100]. */
 function clampPct(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -1181,14 +1231,14 @@ export function loadBoxConfig(): BoxConfig {
     liveTradingEnabled,
     liveReconcileIntervalMs: clampInt("BOX_LIVE_RECONCILE_INTERVAL_MS", 60_000, 5_000, 15 * 60_000),
     liveFeedReconnectWarmupMs: clampInt("BOX_LIVE_FEED_RECONNECT_WARMUP_MS", 5_000, 0, 5 * 60_000),
-    liveMaxOpenBoxes: clampInt("BOX_LIVE_MAX_OPEN_BOXES", 1, 0, 20),
+    liveMaxOpenBoxes: strictLimitInt("BOX_LIVE_MAX_OPEN_BOXES", 1, 0, 20),
     liveMaxConcurrentExecutions: clampInt("BOX_LIVE_MAX_CONCURRENT_EXECUTIONS", 1, 1, 4),
     liveMaxResidualLegs: clampInt("BOX_LIVE_MAX_RESIDUAL_LEGS", 1, 0, 4),
-    liveDailyLossLimit: clampInt("BOX_LIVE_DAILY_LOSS_LIMIT", 5_000, 0, 10_000_000),
+    liveDailyLossLimit: strictLimitInt("BOX_LIVE_DAILY_LOSS_LIMIT", 5_000, 0, 10_000_000),
     liveRejectLimit: clampInt("BOX_LIVE_REJECT_LIMIT", 3, 1, 100),
     liveConsecutiveFailureLimit: clampInt("BOX_LIVE_CONSECUTIVE_FAILURE_LIMIT", 3, 1, 100),
-    liveMaxOpenLegQuantity: clampInt("BOX_LIVE_MAX_OPEN_LEG_QUANTITY", 100, 1, 1_000_000),
-    liveMaxGrossOpenLegQuantity: clampInt("BOX_LIVE_MAX_GROSS_OPEN_LEG_QUANTITY", 400, 1, 4_000_000),
+    liveMaxOpenLegQuantity: strictLimitInt("BOX_LIVE_MAX_OPEN_LEG_QUANTITY", 100, 1, 1_000_000),
+    liveMaxGrossOpenLegQuantity: strictLimitInt("BOX_LIVE_MAX_GROSS_OPEN_LEG_QUANTITY", 400, 1, 4_000_000),
     liveHttpTimeoutMs: clampInt("BOX_LIVE_HTTP_TIMEOUT_MS", 5_000, 250, 30_000),
     liveAckTimeoutMs: clampInt("BOX_LIVE_ACK_TIMEOUT_MS", 3_000, 250, 30_000),
     liveWorkingTimeoutMs: clampInt("BOX_LIVE_WORKING_TIMEOUT_MS", 30_000, 1_000, 10 * 60_000),
@@ -1211,7 +1261,7 @@ export function loadBoxConfig(): BoxConfig {
     // 0 = disabled, so an existing deployment upgrading to this build is unaffected. The upper
     // bound is deliberately generous (₹100 crore): this is a per-Box notional cap, and clamping
     // it low would silently weaken an operator's intended limit.
-    liveMaxBoxCapitalRupees: clampInt("BOX_LIVE_MAX_BOX_CAPITAL_RUPEES", 0, 0, 1_000_000_000),
+    liveMaxBoxCapitalRupees: strictLimitInt("BOX_LIVE_MAX_BOX_CAPITAL_RUPEES", 0, 0, 1_000_000_000),
 
     // Economic admission (Task 8). Both controls default OFF so existing behaviour is unchanged;
     // enabling either makes missing/stale funds or margin evidence BLOCK entry.
@@ -1223,11 +1273,11 @@ export function loadBoxConfig(): BoxConfig {
     liveEvidenceFutureSkewGraceMs: clampInt("BOX_LIVE_EVIDENCE_FUTURE_SKEW_GRACE_MS", 1_000, 0, 60_000),
     liveEvidenceConcurrentReads: bool("BOX_LIVE_EVIDENCE_CONCURRENT_READS", false),
     liveRequireStageFunding: bool("BOX_LIVE_REQUIRE_STAGE_FUNDING", false),
-    liveRecoveryReserveRupees: clampInt("BOX_LIVE_RECOVERY_RESERVE_RUPEES", 0, 0, 100_000_000),
+    liveRecoveryReserveRupees: strictLimitInt("BOX_LIVE_RECOVERY_RESERVE_RUPEES", 0, 0, 100_000_000),
 
     oneActiveBoxPerUnderlying: bool("BOX_ONE_ACTIVE_BOX_PER_UNDERLYING", false),
-    sessionMaxCompletedTrades: clampInt("BOX_SESSION_MAX_COMPLETED_TRADES", 0, 0, 10_000),
-    sessionMaxEntryAttempts: clampInt("BOX_SESSION_MAX_ENTRY_ATTEMPTS", 0, 0, 10_000),
+    sessionMaxCompletedTrades: strictLimitInt("BOX_SESSION_MAX_COMPLETED_TRADES", 0, 0, 10_000),
+    sessionMaxEntryAttempts: strictLimitInt("BOX_SESSION_MAX_ENTRY_ATTEMPTS", 0, 0, 10_000),
     paperMaxBoxCapitalRupees: clampInt("BOX_PAPER_MAX_BOX_CAPITAL_RUPEES", 0, 0, 1_000_000_000),
 
     legExecutionMode:

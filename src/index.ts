@@ -246,9 +246,20 @@ const brokerManager = new ActiveBrokerManager({
 
 const app = express();
 app.disable("x-powered-by");
-// Behind nginx. Needed so the verify rate limiter and the session breadcrumb see the
-// real client address rather than the proxy's.
-app.set("trust proxy", true);
+/*
+ * ONE TRUSTED HOP, and the code no longer depends on this setting anyway.
+ *
+ * This used to be `true` — "trust every proxy in the chain" — with a comment claiming it made the
+ * rate limiter and the session breadcrumb see the real client. It did neither: neither path read
+ * `req.ip`, so the setting was inert, and `true` would have made `req.ip` resolve to the LEFTMOST
+ * `X-Forwarded-For` entry, which is the value the caller supplies.
+ *
+ * Client attribution now goes through `trustedClientIp()` (see `src/clientIp.ts`), which consults
+ * forwarding headers only when the connection itself arrives from a trusted proxy and then reads the
+ * hop nginx appended. This setting is left at a single hop so anything in Express that does use
+ * `req.ip` (logging, future middleware) agrees with that model instead of trusting the whole chain.
+ */
+app.set("trust proxy", 1);
 app.use(express.json({ limit: "256kb" }));
 
 // EXACT-ORIGIN CORS WITH CREDENTIALS. Never a wildcard — a wildcard with credentials

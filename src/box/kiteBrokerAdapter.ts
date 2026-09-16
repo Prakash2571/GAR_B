@@ -1195,7 +1195,8 @@ export class KiteBrokerAdapter implements BrokerAdapter {
       this.orderWaiters.set(clientOrderId, waiters);
     }
     let wake: () => void = () => {};
-    const observed = new Promise<"observed">((resolve) => {
+    // Reassigned on every nonterminal event so one registration serves the whole read (see the loop).
+    let observed = new Promise<"observed">((resolve) => {
       wake = () => resolve("observed");
     });
     waiters.add(wake);
@@ -1217,11 +1218,39 @@ export class KiteBrokerAdapter implements BrokerAdapter {
     );
 
     try {
-      const winner = await Promise.race([reading, observed]);
-      if (winner === "observed") {
+      /*
+       * THE OBSERVATION STAYS ARMED ACROSS NONTERMINAL EVENTS.
+       *
+       * THE DEFECT THIS FIXES. This raced the read against ONE observation and then fell out of the
+       * `try`, whose `finally` de-registered the waiter. So a PARTIAL fill arriving during the read
+       * won the race, was found to be nonterminal, and the listener was torn down — after which a
+       * COMPLETE arriving moments later had nothing to wake. The fast path silently degraded to
+       * "wait for REST" for the rest of the read, which on a hedge leg is exactly the latency the
+       * hedge-first barrier turns into a naked-short window.
+       *
+       * Looping keeps ONE registration alive for the whole read and re-arms the promise after each
+       * nonterminal event, so partial -> partial -> COMPLETE releases on the COMPLETE.
+       */
+      for (;;) {
+        // Consume any snapshot that is ALREADY terminal before waiting again — an event may have
+        // landed between the previous iteration's wake and this check.
+        const current = this.orders.get(clientOrderId);
+        if (current && isBrokerOrderTerminal(current.state)) return current;
+
+        const winner = await Promise.race([reading, observed]);
+        if (winner !== "observed") break;
+
         const snapshot = this.orders.get(clientOrderId);
-        // TERMINAL evidence only. Anything less and the read is still the authority.
+        // TERMINAL evidence only. Anything less and the read is still the authority — but we keep
+        // listening rather than giving up on the stream for the remainder of this read.
         if (snapshot && isBrokerOrderTerminal(snapshot.state)) return snapshot;
+
+        // Re-arm for the NEXT event on the same registration.
+        waiters.delete(wake);
+        observed = new Promise<"observed">((resolve) => {
+          wake = () => resolve("observed");
+        });
+        waiters.add(wake);
       }
     } finally {
       waiters.delete(wake);

@@ -1,5 +1,6 @@
 import {
   BrokerAmbiguousSubmitError,
+  BrokerCancelUnresolvedError,
   BrokerOrderRejectedError,
   BrokerPreSubmitRefusedError,
   isBrokerOrderTerminal,
@@ -1388,6 +1389,9 @@ export class BoxOrderManager {
     this.activeClientIds.add(request.client_order_id);
     if (request.purpose === "ENTRY") {
       this.reservations.set(request.client_order_id, request.quantity);
+      // The owning attempt is recorded alongside the reservation so the whole-attempt envelope can
+      // net out this attempt's own commitments instead of charging it for itself twice.
+      this.reservationAttempts.set(request.client_order_id, request.attempt_id);
       this.reservedEntryQuantity += request.quantity;
     } else if (request.purpose !== "PROTECTIVE_CANCEL") {
       const symbol = `${request.exchange}:${request.tradingsymbol}`;
@@ -1604,6 +1608,17 @@ export class BoxOrderManager {
       try {
         const order = await this.enqueueCancel(intent);
         if (order) cancelled.push(order);
+        // BELT AND BRACES. `executeCancel` now raises `BrokerCancelUnresolvedError` rather than
+        // resolving undefined, so this branch should be unreachable — but an intent counted as
+        // ELIGIBLE and then reported in NEITHER `cancelled` nor `failures` is exactly the shape that
+        // produced a green `ok: true` while nothing was cancelled. If it ever happens again it must
+        // be visible, not silent.
+        else {
+          failures.push(
+            `${intent.client_order_id}: the cancellation produced no broker outcome, so whether the ` +
+              "order is still working is UNKNOWN. Reconcile, or cancel it broker-side.",
+          );
+        }
       } catch (error) {
         failures.push(`${intent.client_order_id}: ${errorMessage(error)}`);
       }
@@ -2534,10 +2549,30 @@ export class BoxOrderManager {
 
   private async executeCancel(action: CancelQueueAction): Promise<void> {
     try {
-      const order = await this.deps.adapter.cancelOrder(action.intent.client_order_id);
+      let order = await this.deps.adapter.cancelOrder(action.intent.client_order_id);
       if (!order) {
-        action.resolve(order);
-        return;
+        /*
+         * THE ADAPTER DOES NOT KNOW THIS ORDER — AND THAT IS NOT SUCCESS.
+         *
+         * THE DEFECT THIS FIXES. `cancelOrder` returns `undefined` when the client order id is absent
+         * from the adapter's SESSION-LOCAL map, which is the normal state after a restart for an order
+         * that is still durably OPEN and still working at the broker. That `undefined` was resolved as
+         * a successful no-op: no persistence write, no audit row, no failure. The sweep then reported
+         * `{ ok: true, eligible: 1, cancelled: [], failures: [] }` with HTTP 200 and ZERO broker cancel
+         * calls — an operator pressing the panic button was told it worked while the exposure stayed
+         * live. That is the single most dangerous shape a cancellation result can take.
+         *
+         * So: try to ADOPT the durable identity first, which is the legitimate way to make a
+         * restart-orphaned order cancellable again, and if that cannot be done, report an UNRESOLVED
+         * FAILURE. Never silence.
+         */
+        order = await this.adoptThenCancel(action.intent);
+      }
+      if (!order) {
+        throw new BrokerCancelUnresolvedError(
+          action.intent.client_order_id,
+          action.intent.broker_order_id ?? null,
+        );
       }
       const durable = await this.persistOrder(action.intent, order, "protective cancel reconciliation");
       // A cancel that raced a fill must report the DURABLE quantity: this snapshot decides whether a
@@ -2545,6 +2580,41 @@ export class BoxOrderManager {
       action.resolve(this.authoritativeOrder(order, durable));
     } catch (error) {
       action.reject(error);
+    }
+  }
+
+  /**
+   * Re-establish the adapter's knowledge of a durable order, then cancel it. Undefined if impossible.
+   *
+   * A restart leaves the adapter's session map empty while durable rows remain OPEN and the orders
+   * remain live at the broker. Adoption is the existing, VALIDATED route back: `adoptOrder` requires a
+   * matching durable broker identity and equal immutable fields (exchange, symbol, side, quantity,
+   * limit price, tag) and refuses a broker order already attributed to a different client id, so it
+   * cannot invent an association. Only after the identity is genuinely re-established is a cancel
+   * attempted; nothing here fabricates a cancellation.
+   *
+   * Every failure path returns undefined so the caller raises a structured unresolved failure rather
+   * than a silent success.
+   */
+  private async adoptThenCancel(intent: IBoxOrderIntent): Promise<BrokerOrder | undefined> {
+    const adapter = this.deps.adapter;
+    if (!adapter.adoptOrder || !intent.broker_order_id) return undefined;
+    // Ownership must still hold: never adopt (or cancel) another account's order.
+    if (this.accountConsistencyBlockReason(intent) !== null) return undefined;
+    let snapshot: BrokerOrder | undefined;
+    try {
+      const brokerOrders = await adapter.listOrders();
+      snapshot = brokerOrders.find((candidate) => candidate.broker_order_id === intent.broker_order_id);
+    } catch {
+      // A read failure is not evidence of absence; fall through to the unresolved failure.
+      return undefined;
+    }
+    if (!snapshot) return undefined;
+    try {
+      await adapter.adoptOrder(intent, snapshot);
+      return await adapter.cancelOrder(intent.client_order_id);
+    } catch {
+      return undefined;
     }
   }
 
@@ -3039,6 +3109,7 @@ export class BoxOrderManager {
       const reconciledOwnedIntents = [...ownedByClient.values()];
       if (this.lastReconciledAt === null) {
         this.reservations.clear();
+        this.reservationAttempts.clear();
         this.reservedEntryQuantity = 0;
         this.reductionReservations.clear();
         this.reservedReductionsBySymbol.clear();
@@ -3048,6 +3119,7 @@ export class BoxOrderManager {
           if (remaining === 0) continue;
           if (intent.purpose === "ENTRY") {
             this.reservations.set(intent.client_order_id, remaining);
+            this.reservationAttempts.set(intent.client_order_id, intent.attempt_id);
             this.reservedEntryQuantity += remaining;
             // RESTART: a durable non-terminal ENTRY intent is PROOF this attempt's leg reached the
             // broker — that is what made the row non-terminal — so its surviving siblings must take
@@ -3301,6 +3373,10 @@ export class BoxOrderManager {
         const prior = this.attributedBoxPositions.get(key) ?? 0;
         this.attributedBoxPositions.set(key, prior + (updated.side === "BUY" ? delta : -delta));
         this.recalculateGrossAttributedQuantity();
+        // The filled part is now real attributed exposure, so it must stop being counted as a
+        // RESERVATION as well. Without this a partially filled working leg was counted twice in
+        // every `gross + reserved` comparison.
+        this.reduceReservationByFill(updated.client_order_id, delta);
       }
       this.knownIntents.set(updated.client_order_id, updated);
       if (isBrokerOrderTerminal(order.state)) {
@@ -3511,6 +3587,15 @@ export class BoxOrderManager {
   private readonly postedEntryAttempts = new Set<string>();
 
   /**
+   * Which ATTEMPT each entry reservation belongs to, keyed by client order id.
+   *
+   * Kept in step with {@link reservations} — written where a reservation is taken, deleted wherever one
+   * is released — so the whole-attempt envelope can distinguish "this attempt's own legs" from
+   * "everything else", which is the distinction it was previously unable to make.
+   */
+  private readonly reservationAttempts = new Map<string, string>();
+
+  /**
    * Would the FULL four-leg attempt fit the gross cap? Null if it fits, else the reason.
    *
    * THE HAZARD THIS CLOSES. `withinQuantityLimits` checked the gross cap incrementally —
@@ -3526,7 +3611,7 @@ export class BoxOrderManager {
    * 35-unit BANKNIFTY box (300 / 140); it does NOT admit a 500-unit single-stock lot, which is
    * correctly refused up front rather than half-executed.
    */
-  entryQuantityEnvelopeBlockReason(quantityPerLeg: number): string | null {
+  entryQuantityEnvelopeBlockReason(quantityPerLeg: number, attemptId?: string): string | null {
     const legs = BoxOrderManager.BOX_ENTRY_LEG_COUNT;
     if (quantityPerLeg > this.deps.limits.maxOpenLegQuantity) {
       return (
@@ -3535,16 +3620,59 @@ export class BoxOrderManager {
         `selected instrument's one-lot quantity — do not raise it globally.`
       );
     }
-    const envelope = this.grossOpenLegQuantity + this.reservedEntryQuantity + quantityPerLeg * legs;
+    /*
+     * THE ATTEMPT MUST NOT BE CHARGED FOR ITSELF TWICE.
+     *
+     * THE DEFECT THIS FIXES. `quantityPerLeg * legs` is a claim about ALL FOUR legs of this attempt.
+     * But `submit()` reserves each leg's quantity as it is admitted, so by the time leg 2 asks the
+     * question, leg 1's 75 units are ALREADY inside `reservedEntryQuantity` — and the envelope added
+     * the full 4-leg claim on top of them. A perfectly valid 4 x 75 = 300 box was therefore refused
+     * against a 300 cap:
+     *
+     *     leg 1:  0 + 0   + 300 = 300  <= 300   admitted, reserved -> 75
+     *     leg 2:  0 + 75  + 300 = 375  >  300   REFUSED
+     *
+     * The attempt rejected itself using its own reservation. Worse, with a cap of 400 the first two
+     * legs were admitted and leg 3 was refused at 450 — by which time a hedge had POSTed and could
+     * have FILLED, so the very outcome this envelope exists to prevent (acquiring exposure against a
+     * cap the attempt cannot satisfy) was caused by the envelope itself.
+     *
+     * Other attempts and pre-existing positions are still counted in FULL. Only this attempt's own
+     * commitments are netted out, because `quantityPerLeg * legs` already accounts for them.
+     *
+     * `ownGross` is not subtracted, and does not need to be: this arm only runs when the attempt has
+     * NOT reached the broker (`postedEntryAttempts` is checked by the sole caller), and a leg that has
+     * not posted cannot have filled. So this attempt contributes nothing to `grossOpenLegQuantity`
+     * here, by construction.
+     */
+    const ownReserved = attemptId === undefined ? 0 : this.reservedEntryQuantityForAttempt(attemptId);
+    const committedByOthers =
+      this.grossOpenLegQuantity + Math.max(0, this.reservedEntryQuantity - ownReserved);
+    const envelope = committedByOthers + quantityPerLeg * legs;
     if (envelope > this.deps.limits.maxGrossOpenLegQuantity) {
       return (
         `The full ${legs}-leg attempt needs ${quantityPerLeg * legs} unit(s) of gross leg quantity ` +
-        `(already committed: ${this.grossOpenLegQuantity + this.reservedEntryQuantity}), which exceeds ` +
+        `(already committed elsewhere: ${committedByOthers}), which exceeds ` +
         `BOX_LIVE_MAX_GROSS_OPEN_LEG_QUANTITY=${this.deps.limits.maxGrossOpenLegQuantity}. Refused ` +
         `BEFORE the first leg posts, so no hedge is acquired against a cap the attempt cannot satisfy.`
       );
     }
     return null;
+  }
+
+  /**
+   * How much of `reservedEntryQuantity` belongs to ONE attempt.
+   *
+   * Derived from the existing per-leg reservations rather than tracked as a second running total: a
+   * duplicated total is a second thing that can drift out of step with the first, and this is the
+   * number that decides whether an entry may proceed.
+   */
+  private reservedEntryQuantityForAttempt(attemptId: string): number {
+    let total = 0;
+    for (const [clientOrderId, quantity] of this.reservations) {
+      if (this.reservationAttempts.get(clientOrderId) === attemptId) total += quantity;
+    }
+    return total;
   }
 
   /**
@@ -3562,7 +3690,9 @@ export class BoxOrderManager {
         // Nothing of this attempt has reached the broker: ask the WHOLE-ATTEMPT question while the
         // answer is still meaningful. This is the check that prevents acquiring a hedge against a cap
         // the attempt cannot satisfy. It subsumes the per-leg cap.
-        return this.entryQuantityEnvelopeBlockReason(request.quantity);
+        // The attempt id is passed so the envelope nets out THIS attempt's own reserved siblings.
+        // Without it every leg after the first was charged for the legs already admitted alongside it.
+        return this.entryQuantityEnvelopeBlockReason(request.quantity, request.attempt_id);
       }
       // A leg of this attempt has already POSTed, so re-asking the envelope would double-count this
       // attempt's own committed legs. Fall back to the incremental per-leg check.
@@ -3620,10 +3750,40 @@ export class BoxOrderManager {
     return this.quantityLimitBlockReason(request) === null;
   }
 
+  /**
+   * Reduce a still-working leg's reservation by the quantity that has now DURABLY FILLED.
+   *
+   * THE DOUBLE COUNT THIS REMOVES. A reservation used to be released only when the broker state went
+   * terminal, while attribution was credited on any positive fill delta. So a partially filled,
+   * still-working leg was counted twice — its filled part in `grossOpenLegQuantity` AND its full
+   * quantity in `reservedEntryQuantity` — and every gross check that sums the two over-counted by the
+   * filled amount. That is the same arithmetic that decides whether an entry may proceed, and it is
+   * also inconsistent with the crash-recovery rebuild, which has always reserved only the OUTSTANDING
+   * remainder.
+   *
+   * Clamped at zero and never below, so an over-fill cannot make the reservation negative.
+   */
+  private reduceReservationByFill(clientOrderId: string, filledDelta: number): void {
+    if (!(filledDelta > 0)) return;
+    const held = this.reservations.get(clientOrderId);
+    if (held === undefined || held <= 0) return;
+    const remaining = Math.max(0, held - filledDelta);
+    const consumed = held - remaining;
+    if (consumed <= 0) return;
+    this.reservedEntryQuantity = Math.max(0, this.reservedEntryQuantity - consumed);
+    if (remaining === 0) {
+      this.reservations.delete(clientOrderId);
+      this.reservationAttempts.delete(clientOrderId);
+    } else {
+      this.reservations.set(clientOrderId, remaining);
+    }
+  }
+
   private releaseReservation(clientOrderId: string): void {
     const quantity = this.reservations.get(clientOrderId) ?? 0;
     if (quantity > 0) this.reservedEntryQuantity = Math.max(0, this.reservedEntryQuantity - quantity);
     this.reservations.delete(clientOrderId);
+    this.reservationAttempts.delete(clientOrderId);
     const reduction = this.reductionReservations.get(clientOrderId);
     if (reduction) {
       const remaining = Math.max(0, (this.reservedReductionsBySymbol.get(reduction.symbol) ?? 0) - reduction.quantity);
