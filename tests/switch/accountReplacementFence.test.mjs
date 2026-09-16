@@ -89,8 +89,23 @@ test("R1: an OPEN BOX POSITION blocks replacing the signed-in account", async ()
     blockers.some((b) => b.reason === "open_box_positions"),
     `expected open_box_positions, got ${blockers.map((b) => b.reason).join(",")}`,
   );
-  // The operator-facing sentence must name what is actually happening.
-  assert.match(blockers[0].detail, /replacing the signed-in zerodha account \(ZD-AAA → ZD-BBB\)/);
+  assert.match(blockers[0].detail, /open Box position\(s\)/);
+});
+
+test("R1b: the operator-facing sentence names the ACTION being refused", async () => {
+  // `exposureBlockers` interpolates the action into the blockers whose remedy depends on it (a
+  // working order must be cancelled "before X"), while others carry a fixed remedy. Asserting on one
+  // that does interpolate proves the account-replacement wording reaches the operator, rather than
+  // the generic broker-switch phrasing this guard was assembled from.
+  const manager = await managerWithProbe({ workingOrderCount: () => 2 });
+  const blockers = await manager.accountReplacementBlockers("zerodha", "ZD-AAA", "ZD-BBB");
+  const working = blockers.find((b) => b.reason === "working_orders");
+  assert.ok(working, "a working order must block an account replacement");
+  assert.match(
+    working.detail,
+    /replacing the signed-in zerodha account \(ZD-AAA → ZD-BBB\)/,
+    "the refusal must say what it is refusing, and name both accounts",
+  );
 });
 
 test("R2: every exposure class that blocks a broker SWITCH also blocks an account REPLACEMENT", async () => {
