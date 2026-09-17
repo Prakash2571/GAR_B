@@ -1,5 +1,33 @@
 # Conservative Mumbai EC2 profile (`ap-south-1`)
 
+> ## ⚠ THIS DOCUMENT IS AWS-SPECIFIC AND IS NO LONGER THE DEPLOYMENT
+> The production deployment now runs on **Azure Central India (Pune)**, not AWS Mumbai EC2.
+>
+> The document is retained because the *strategy* profile in it — the conservative limits, the
+> reasoning behind each one, and the config provenance — is host-independent and still correct.
+> The **host-specific** instructions are not. Read it for the profile, not for the platform.
+>
+> **What differs on Azure Central India, and matters:**
+>
+> | Concern | This document says | On Azure |
+> |---|---|---|
+> | Time sync | Amazon Time Sync at `169.254.169.123` via chrony | The **host-provided PTP / VMICTimeSync** source via chrony. The AWS endpoint does not exist. Verify with `chronyc tracking`. |
+> | Public egress IP | Elastic IP / NAT; `curl https://checkip.amazonaws.com` | An Azure Public IP resource. That `checkip` URL is AWS-only — use `curl -s https://api.ipify.org`. |
+> | Broker IP allowlisting | Framed as generally required | **Zerodha/Kite does not require it.** Only Dhan does, via `DHAN_STATIC_PUBLIC_IP` / `DHAN_STATIC_IP_EXPECTED`. A Zerodha-only deployment is unaffected by the IP change. |
+> | Calibration region label | `ap-south-1` | Use a **distinct** label, e.g. `azure-centralindia`. Latency samples are scoped `WHERE region = $1` and must never mix across network paths. |
+>
+> **Why the added distance to the exchange does not require re-tuning any gate.** The cross-leg
+> coherence limits bound *dispersion between the four legs*, not absolute latency, and all four
+> books arrive over one websocket — so a uniformly longer path shifts all four equally and leaves
+> the spread unchanged. `BOX_MAX_RECEIVE_TO_EXCHANGE_DELAY_MS=5000` has vast headroom against a
+> single-digit-millisecond path difference, and `BOX_QUOTE_MAX_AGE_MS=15000` makes plain that this
+> was never a millisecond-scale strategy. What *does* matter on any new host is **clock skew**, not
+> distance: `maxExchangeAheadOfReceiveMs` reads an over-far-ahead exchange stamp as a clock fault,
+> so a badly synchronised host produces false coherence rejections that look like market conditions.
+>
+> The current live posture is **`deploy/FINAL-one-box-live.env.template`**, which supersedes
+> `deploy/mumbai-ec2-conservative.env.example` for a supervised single-box run.
+
 The deliberately over-cautious starting posture for GTS Algo Research live box arbitrage on a
 Mumbai EC2 host. It is designed so the FIRST live session risks as little as possible
 while producing the broker observations you actually need — not so it trades often.
