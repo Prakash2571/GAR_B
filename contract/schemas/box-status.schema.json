@@ -79,6 +79,7 @@
     "order_stream",
     "execution_funnel",
     "economic_admission",
+    "account_funds",
     "market_data_state",
     "market_data_health",
     "operational_readiness",
@@ -181,6 +182,10 @@
         "null"
       ]
     },
+    "account_funds": {
+      "$comment": "FREE CAPITAL, published continuously — distinct from economic_admission.picture.available_funds, which only exists as a by-product of live entry admission and is null in paper, null with the funding gates off, and null before the first entry. Never null itself: when no figure is known it carries an unavailable_reason naming why, so an unread balance can never be rendered as a zero account.",
+      "$ref": "account-funds.schema.json"
+    },
     "market_data_state": {
       "$comment": "MARKET-DATA transport health, DISTINCT from order-stream health and from the crude market_data_healthy boolean. READY is reachable only after fresh usable depth per traded instrument in the current connection generation; a socket merely being open is not READY. Source: MarketDataStateMachine.state().",
       "type": "string",
@@ -259,7 +264,14 @@
       "$comment": "CLOSED. The operator blocklist of underlyings that must never be ENTERED, in any execution mode. Source: src/box/engine.ts listExcludedUnderlyings(). `readable: false` means the durable list could not be read, which REFUSES all new entry (readiness blocker `underlying_exclusions_unreadable`) — a client must render that as the reason nothing is trading, never as an empty blocklist. `persistent: false` means the deployment has no box persistence, so no exclusion could ever have been stored and none is being forgotten.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["readable", "persistent", "load_state", "error", "max", "excluded"],
+      "required": [
+        "readable",
+        "persistent",
+        "load_state",
+        "error",
+        "max",
+        "excluded"
+      ],
       "properties": {
         "readable": {
           "type": "boolean"
@@ -269,10 +281,18 @@
         },
         "load_state": {
           "type": "string",
-          "enum": ["never_loaded", "loaded", "failed", "unpersisted"]
+          "enum": [
+            "never_loaded",
+            "loaded",
+            "failed",
+            "unpersisted"
+          ]
         },
         "error": {
-          "type": ["string", "null"]
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "max": {
           "type": "number"

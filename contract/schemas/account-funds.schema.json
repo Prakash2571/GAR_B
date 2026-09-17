@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "account-funds.schema.json",
+  "title": "Free capital in the trading account, right now",
+  "description": "Source: src/box/accountFunds.ts AccountFundsTracker, refreshed on its own timer (BOX_ACCOUNT_FUNDS_REFRESH_MS, default 15s) in EVERY execution mode that has an authenticated broker session — including paper, because 'what can I actually trade with?' is a question that matters BEFORE arming. TOP LEVEL IS CLOSED. This is DISTINCT from `economic_admission.picture.available_funds`, which is a by-product of live entry admission and is therefore null in paper, null when the funding gates are off, and null until the first entry has been evaluated. NULL IS NEVER ZERO: every absent figure carries an `unavailable_reason` naming why, so a client can never render an unread balance as an empty account. This figure does NOT prove any particular box is affordable — four-leg margin is a separate question answered by the economic-admission gate against the broker's basket margin.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "free_to_trade_rupees",
+    "broker_available_rupees",
+    "broker_utilised_rupees",
+    "broker",
+    "semantics",
+    "encumbrance_netted",
+    "observed_at",
+    "age_ms",
+    "fresh",
+    "unavailable_reason",
+    "last_error",
+    "note"
+  ],
+  "properties": {
+    "free_to_trade_rupees": {
+      "type": ["number", "null"],
+      "description": "THE HEADLINE: spendable rupees, derived through the DECLARED per-broker semantics in src/box/fundsSemantics.ts — the same interpretation the live admission gate applies, so the screen and the engine cannot disagree about whether an entry was affordable. null means NOT KNOWN and must never be rendered as ₹0; see `unavailable_reason`."
+    },
+    "broker_available_rupees": {
+      "type": ["number", "null"],
+      "description": "The broker's own `available` figure before semantics are applied (Zerodha: available.live_balance; Dhan: availabelBalance). Published alongside the headline so an operator can see the raw input to the interpretation. null is unknown."
+    },
+    "broker_utilised_rupees": {
+      "type": ["number", "null"],
+      "description": "What the broker reports as already blocked (Zerodha: utilised.debits). NULL IS UNKNOWN, NOT ZERO — a reported zero utilisation is a real figure and stays 0, whereas an absent one stays null and makes the conservative interpretation apply. Dhan's fund-limit response has no direct equivalent, so it is normally null there."
+    },
+    "broker": {
+      "type": ["string", "null"],
+      "enum": ["zerodha", "dhan", null],
+      "description": "Which broker's account this figure is about. Reset on a broker switch, because one account's balance is not another's."
+    },
+    "semantics": {
+      "type": ["string", "null"],
+      "enum": ["net_of_encumbrance", "gross_of_encumbrance", "unverified", null],
+      "description": "How `broker_available_rupees` was interpreted to reach the headline. `net_of_encumbrance` (Zerodha) means the broker documents `available` as ALREADY net of what is blocked, so the utilisation is NOT subtracted again — doing so would understate free capital by the amount already blocked. `unverified` means the semantics are not declared for this broker and the conservative reading was applied."
+    },
+    "encumbrance_netted": {
+      "type": "boolean",
+      "description": "True when the broker's `available` figure already excludes the encumbrance. Surfaced because it decides the arithmetic completely, and the two possible mistakes are not symmetric: understating refuses affordable entries, overstating admits an entry the account cannot fund."
+    },
+    "observed_at": {
+      "type": ["number", "null"],
+      "description": "Epoch milliseconds the figure was read from the broker, or null when never read."
+    },
+    "age_ms": {
+      "type": ["number", "null"],
+      "description": "Age at publication. Never negative — clamped at zero, so a wall-clock step backwards cannot publish a figure that appears to come from the future."
+    },
+    "fresh": {
+      "type": "boolean",
+      "description": "True when a figure is present AND within BOX_ACCOUNT_FUNDS_MAX_AGE_MS (default 45s, deliberately wider than the 15s refresh so one slow read does not flip a good balance to stale). A stale figure is still published with its age rather than discarded: mid-session, '₹47,000 as of 40s ago, refresh failing' is far more useful than a blank."
+    },
+    "unavailable_reason": {
+      "type": ["string", "null"],
+      "enum": [
+        "no_session",
+        "not_supported",
+        "never_read",
+        "read_failed",
+        "not_reported",
+        "semantics_unknown",
+        null
+      ],
+      "description": "Why there is no usable figure, or null when there is one. These are deliberately NOT collapsed into one another: `no_session` means log in, `never_read` means wait, `not_supported` means stop expecting a number, `read_failed` means the broker call errored, `not_reported` means the broker answered without a finite figure, and `semantics_unknown` means the number exists but cannot responsibly be called money for this broker."
+    },
+    "last_error": {
+      "type": ["string", "null"],
+      "description": "The most recent read failure, whitespace-collapsed and truncated to 200 characters. Safe to display: it is a transport/API message, never a token, and never a URL carrying credentials."
+    },
+    "note": {
+      "type": "string",
+      "description": "One operator-facing sentence stating what this figure can and cannot prove, including its age and — deliberately — that it does NOT establish that a specific four-leg box is affordable."
+    }
+  }
+}

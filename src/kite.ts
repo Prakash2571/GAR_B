@@ -597,6 +597,52 @@ export class KiteClient {
   }
 
   /**
+   * ACCOUNT FUNDS — the equity segment's available balance and what is already blocked.
+   *
+   * WHY THIS LIVES ON THE MARKET-DATA CLIENT AND NOT ONLY ON THE LIVE ORDER ADAPTER
+   *
+   * `KiteBrokerAdapter.margins()` already reads this endpoint, but that adapter is constructed only
+   * on the LIVE path. An operator running a paper rehearsal has a perfectly good authenticated
+   * Zerodha session — it is the same session streaming their prices — and "how much can I actually
+   * trade with?" is exactly the question they need answered BEFORE arming, not after. Reading it
+   * here makes the figure available in every mode that has a session, which is the only way the
+   * number is useful when it matters.
+   *
+   * WHAT THE TWO FIELDS MEAN, and why both are returned. `available.live_balance` is Zerodha's
+   * spendable figure; `utilised.debits` is what is already blocked. This method does NOT combine
+   * them: whether `available` is already net of the encumbrance is a per-broker semantic decided in
+   * `src/box/fundsSemantics.ts`, and doing that arithmetic in two places is how the two answers come
+   * to disagree. Both numbers travel; the meaning is applied once, elsewhere.
+   *
+   * NULL IS "UNKNOWN", NEVER "ZERO". A field the response does not carry stays null, so a caller can
+   * never mistake an absent figure for an empty account. `Number.isFinite(0)` is true, so presence is
+   * decided by the parse, not by the value.
+   *
+   * THROWS on an auth failure (and drops the session, like every other authenticated read here), so a
+   * dead token surfaces as a dead token rather than as ₹0.
+   */
+  async getFunds(): Promise<{ available: number | null; utilised: number | null }> {
+    const { status, ok, json } = await this.getJson<{
+      status: string;
+      data?: {
+        available?: { live_balance?: unknown; cash?: unknown };
+        utilised?: { debits?: unknown };
+      };
+      message?: string;
+    }>(`${KITE_API_ROOT}/user/margins/equity`);
+    if (!ok || json.status !== "success" || !json.data) {
+      if (status === 401 || status === 403) this.clearSession();
+      throw new KiteError(json.message ?? `Failed to fetch funds (HTTP ${status}).`, status || 500);
+    }
+    const num = (v: unknown): number | null =>
+      typeof v === "number" && Number.isFinite(v) ? v : null;
+    return {
+      available: num(json.data.available?.live_balance),
+      utilised: num(json.data.utilised?.debits),
+    };
+  }
+
+  /**
    * Fetch OHLC + last price for a set of instruments via REST.
    * Identifiers are "exchange:tradingsymbol" (e.g. "NSE:INFY", "NFO:INFY24JULFUT").
    * Works regardless of market hours (returns the latest available snapshot),
