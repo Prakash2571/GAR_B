@@ -57,6 +57,13 @@ import {
 import { BoxChargeEstimator, buildEntryChargeLegs, type BoxChargeLeg, type PriceChargeGroupsFn } from "./charges.js";
 import { BoxChargeReconciler } from "./chargeReconciler.js";
 import { activeUnderlyings, type UnderlyingActivity } from "./underlyingLock.js";
+import {
+  MAX_EXCLUDED_UNDERLYINGS,
+  UnderlyingExclusionBook,
+  exclusionEntryRefusal,
+  validateExclusionInput,
+  type UnderlyingExclusion,
+} from "./underlyingExclusions.js";
 import { BoxTradingSessionManager } from "./tradingSessionStore.js";
 import { BoxExecutionSimulator } from "./executionSimulator.js";
 import { createExecutionClock, type ExecutionClock } from "./executionClock.js";
@@ -189,6 +196,9 @@ import {
   markBoxDailyPnlIncomplete,
   loadBoxExecutionAttempts,
   loadBoxLiveRiskSeed,
+  loadBoxExcludedUnderlyings,
+  saveBoxExcludedUnderlying,
+  deleteBoxExcludedUnderlying,
   loadBoxSettings,
   loadBoxTradingSession,
   loadFlatBoxTradeIds,
@@ -505,6 +515,20 @@ export class BoxEngine {
   private strikeLevel: 1 | 2 | 3;
   /** Forces every window to rebuild on the next refresh (set by setStrikeLevel). */
   private forceWindowRebuild = false;
+  /**
+   * THE OPERATOR BLOCKLIST — underlyings that must never be ENTERED, in any execution mode.
+   *
+   * Held in memory because all four enforcement points are synchronous (the scanner's tick path and
+   * the coordinator's no-await prologue both forbid a query), and reloaded from
+   * `box_excluded_underlyings` at boot. A mid-session database outage therefore cannot lose the
+   * blocklist: only a WRITE can fail, and a failed write is reported to the operator and rolled back
+   * in memory rather than silently diverging from what is stored.
+   *
+   * Starts in `never_loaded`, which REFUSES entry. That is deliberate: until the durable list has
+   * been read we cannot assert any name is permitted, and the scanner cannot enter anything before
+   * `start()` anyway, so the closed default costs nothing.
+   */
+  private readonly exclusions = new UnderlyingExclusionBook();
   /**
    * The CONFIGURED gross prefilter (MIN_BOX_GROSS_EDGE), before any gate-driven
    * narrowing. Captured once at construction so applyTuning can re-derive the live
@@ -949,6 +973,8 @@ export class BoxEngine {
       calibration: this.calibration,
       broker: () => this.deps.activeBroker(),
       istMinutesOfDay: () => istMinutesOfDay(),
+      // OPERATOR BLOCKLIST, enforcement point 3 of 4 — the unbypassable refusal for every paper mode.
+      underlyingExclusion: (underlying) => this.underlyingExclusionRefusal(underlying),
       // The local charge calculator prices paper_legging partial-entry and unwind
       // charges synchronously — never a network call inside the fill.
       chargeTotal: (orders) => this.localCharges.legs(orders).total,
@@ -1218,6 +1244,9 @@ export class BoxEngine {
           console.error(`[Box] EXIT REFUSED — execution-mode mismatch: ${detail}`);
         }
       },
+      // OPERATOR BLOCKLIST, enforcement point 4 of 4 — the unbypassable refusal for LIVE, which never
+      // reaches the simulator because simulateLeggingEntry forks to BoxOrderManager before it.
+      underlyingExclusion: (underlying) => this.underlyingExclusionRefusal(underlying),
       isTokenWarm: (token) => this.tokenFeedGeneration.get(token) === this.feedGeneration,
       feedGeneration: () => this.feedGeneration,
       // COMBINED READINESS gate for NEW ENTRY (GAP 1 + D1). Live only: the market-data machine is
@@ -1402,6 +1431,11 @@ export class BoxEngine {
       // LAYER 1a of the underlying lock. Synchronous and durable-state derived, so the lock
       // cannot be lost by a lease expiring while a position is still open.
       activeUnderlyings: () => this.activeUnderlyings(),
+      // OPERATOR BLOCKLIST, enforcement point 2 of 4. Synchronous, so it is legal inside the
+      // coordinator's no-await prologue; ENTRY only, so no reduction path can see it.
+      underlyingExclusion: (underlying) => this.underlyingExclusionRefusal(underlying),
+      // THE MODE-INDEPENDENT INVENTORY CEILING's durable term. Synchronous.
+      boxInventory: () => this.boxInventoryCount(),
       // The session cycle budget, INTERSECTED with "is the residual picture known?". ENTRY only;
       // every reduction path bypasses it.
       sessionEntryGate: () => this.entryGateVerdict(),
@@ -1461,6 +1495,9 @@ export class BoxEngine {
       // LIVE ONLY: whether this attempt's orders actually reached the broker. In paper there is
       // no broker, so the field stays null rather than pretending to know.
       reachedBroker: () => (this.orderManager?.status().inFlight ?? 0) > 0,
+      // OPERATOR BLOCKLIST, enforcement point 1 of 4 — the cheapest. Refuses before a reservation is
+      // taken or a session attempt is spent, so an excluded name costs nothing at all.
+      isUnderlyingExcluded: (underlying) => this.underlyingExclusionRefusal(underlying) !== null,
       openPaperTrade: (args) => this.openPaperTrade(args),
       onExecutionAttempt: (candidate, legging, reason, detail, detectedGrossEdge) =>
         void this.persistExecutionAttempt(candidate, legging, reason, detail, detectedGrossEdge),
@@ -1659,6 +1696,10 @@ export class BoxEngine {
     // Admin-saved thresholds override the env defaults, before anything can be
     // judged against them.
     await this.loadPersistedTuning();
+    // THE BLOCKLIST BEFORE THE FIRST EVALUATION. Loaded here rather than lazily because a lazily
+    // loaded blocklist is an unloaded one for the first few ticks — and the first few ticks are
+    // exactly when a supervised session is most likely to find its one qualifying box.
+    await this.loadPersistedExclusions();
     this.marketOpen = this.deps.isMarketOpen();
     this.scanner.setMarketOpen(this.marketOpen);
     // Capture before adoption can register/work residuals. Every local flatten observation from
@@ -1896,6 +1937,249 @@ export class BoxEngine {
    * Best-effort: an unreachable settings store leaves the env-configured values in
    * place rather than blocking the boot.
    */
+  /* ------------------------- excluded underlyings ------------------------- */
+
+  /**
+   * Load the operator blocklist into memory.
+   *
+   * FAILS CLOSED, and that is the whole point. A read failure leaves the book in `failed`, which
+   * refuses every ENTRY and raises an `entry`-scoped readiness blocker — because a list we cannot
+   * read cannot confirm that any name is permitted. The alternative (treat unreadable as empty) would
+   * silently unlock every excluded name at exactly the moment the operator has least visibility,
+   * which is the same reasoning `BoxTradingSessionManager` applies to an unreadable session record.
+   *
+   * The one exception is a deployment with no box persistence at all: no exclusion could ever have
+   * been saved, so none is being forgotten, and the book records `unpersisted` (which permits entry)
+   * rather than pretending a list was lost. Live execution independently requires healthy persistence
+   * via `BoxOrderManager.entryBlockReasonAfterControls`, so this exception cannot apply to live.
+   *
+   * Retried by the periodic reconciliation pass, so a transient outage at boot heals itself without a
+   * restart.
+   */
+  private async loadPersistedExclusions(): Promise<void> {
+    if (!isBoxDbEnabled()) {
+      this.exclusions.unpersisted();
+      console.warn(
+        "[Box] no box persistence, so the excluded-underlyings blocklist is EMPTY and cannot be " +
+          "saved. Nothing is being forgotten — no exclusion could have been stored.",
+      );
+      return;
+    }
+    const read = await loadBoxExcludedUnderlyings();
+    if (!read.ok) {
+      this.exclusions.loadFailed(read.error);
+      console.error(
+        `[Box] the excluded-underlyings blocklist could not be READ (${read.error}). ` +
+          `NEW ENTRY IS REFUSED until it can be: an unreadable blocklist cannot confirm any name is ` +
+          `tradable. Exits, reductions and protective cancels are unaffected.`,
+      );
+      return;
+    }
+    this.exclusions.loaded(read.rows);
+    if (read.rows.length > 0) {
+      console.log(
+        `[Box] ${read.rows.length} underlying(s) excluded from entry: ${this.exclusions.symbols().join(", ")}.`,
+      );
+    }
+  }
+
+  /**
+   * Retry an earlier failed blocklist read. Called from the periodic reconciliation pass.
+   *
+   * Only ever attempted when the book is actually in `failed`, so a healthy deployment pays nothing
+   * for this and a successful load is never overwritten by a later transient error.
+   */
+  private async retryExclusionLoad(): Promise<void> {
+    if (this.exclusions.loadState !== "failed") return;
+    await this.loadPersistedExclusions();
+    if (this.exclusions.readable) {
+      console.log("[Box] the excluded-underlyings blocklist is readable again; entry is no longer refused for it.");
+      this.publish();
+    }
+  }
+
+  /**
+   * The blocklist verdict for one underlying — the single function all four enforcement points share.
+   *
+   * Synchronous and total, so it is safe in the scanner's tick path and inside the coordinator's
+   * no-await prologue.
+   */
+  private underlyingExclusionRefusal(underlying: string): { code: string; detail: string } | null {
+    return exclusionEntryRefusal(this.exclusions, underlying);
+  }
+
+  /** The blocklist as the API reports it. */
+  listExcludedUnderlyings(): {
+    readable: boolean;
+    persistent: boolean;
+    load_state: string;
+    error: string | null;
+    max: number;
+    excluded: UnderlyingExclusion[];
+  } {
+    return {
+      readable: this.exclusions.readable,
+      persistent: this.exclusions.persistent,
+      load_state: this.exclusions.loadState,
+      error: this.exclusions.loadError,
+      max: MAX_EXCLUDED_UNDERLYINGS,
+      excluded: this.exclusions.list(),
+    };
+  }
+
+  /**
+   * ADMIN control: forbid new entry on an underlying.
+   *
+   * Applies from the very next evaluation, in EVERY execution mode, and is persisted so it survives a
+   * restart. It affects only which NEW boxes may be entered:
+   *
+   *   - a box ALREADY OPEN on this underlying is never touched. It keeps its legs subscribed (see
+   *     `mustKeep` in refreshUniverse), keeps being monitored, exits on its own rules and can still
+   *     be flattened. Excluding a name must not trap exposure;
+   *   - the durable write happens AFTER the in-memory change but a failure ROLLS THE MEMORY BACK, so
+   *     an operator is never told a name was excluded when it will revert on the next restart. Same
+   *     discipline as `setTuning`.
+   */
+  async excludeUnderlying(
+    input: { symbol?: unknown; reason?: unknown },
+    actor?: string,
+  ): Promise<{ ok: true; excluded: UnderlyingExclusion } | { ok: false; code: number; error: string }> {
+    const parsed = validateExclusionInput(input);
+    if (!parsed.ok) return { ok: false, code: 400, error: parsed.error };
+    if (!this.exclusions.persistent) {
+      return {
+        ok: false,
+        code: 503,
+        error:
+          "Box persistence is not configured, so an exclusion cannot be saved. It would be lost on " +
+          "the next restart, so it is refused rather than accepted and forgotten.",
+      };
+    }
+    if (this.exclusions.wouldExceedCap(parsed.symbol)) {
+      return {
+        ok: false,
+        code: 409,
+        error:
+          `At most ${MAX_EXCLUDED_UNDERLYINGS} underlyings may be excluded. A blocklist this large is ` +
+          `better expressed as a narrower universe (BOX_MAX_UNDERLYINGS) than as a deny list.`,
+      };
+    }
+    const entry: UnderlyingExclusion = {
+      symbol: parsed.symbol,
+      reason: parsed.reason,
+      excluded_by: actor ?? null,
+      excluded_at: Date.now(),
+    };
+    const before = this.exclusions.get(parsed.symbol);
+    this.exclusions.set(entry);
+    try {
+      await saveBoxExcludedUnderlying(entry);
+    } catch (err) {
+      // ROLL BACK, so what is running matches what is stored.
+      if (before === undefined) this.exclusions.delete(parsed.symbol);
+      else this.exclusions.set(before);
+      const message = err instanceof Error ? err.message : String(err);
+      return { ok: false, code: 503, error: `Could not save the exclusion: ${message}` };
+    }
+
+    console.log(
+      `[Box] ${entry.symbol} EXCLUDED from new entry${actor ? ` by ${actor}` : ""}` +
+        `${entry.reason === null ? "" : ` — ${entry.reason}`}. Open positions on it are unaffected.`,
+    );
+    void appendBoxEvent({
+      event: "SCANNER_CONFIG",
+      candidate_key: "",
+      underlying: entry.symbol,
+      expiry: "",
+      lower_strike: 0,
+      upper_strike: 0,
+      lot_size: 0,
+      quantity: 0,
+      safety_buffer: this.cfg.safetyBuffer,
+      detail:
+        `underlying_excluded=${entry.symbol}` +
+        (entry.reason === null ? "" : ` reason=${entry.reason}`) +
+        (actor ? ` by=${actor}` : ""),
+    });
+
+    await this.applyExclusionChange();
+    return { ok: true, excluded: entry };
+  }
+
+  /**
+   * ADMIN control: allow new entry on an underlying again.
+   *
+   * Removing an exclusion cannot create exposure by itself — it only makes the name eligible for the
+   * normal gates again — so it is the safer direction and needs no confirmation.
+   */
+  async includeUnderlying(
+    symbol: unknown,
+    actor?: string,
+  ): Promise<{ ok: true; removed: boolean; symbol: string } | { ok: false; code: number; error: string }> {
+    const parsed = validateExclusionInput({ symbol });
+    if (!parsed.ok) return { ok: false, code: 400, error: parsed.error };
+    if (!this.exclusions.persistent) {
+      return {
+        ok: false,
+        code: 503,
+        error: "Box persistence is not configured, so there is no stored blocklist to remove from.",
+      };
+    }
+    const before = this.exclusions.get(parsed.symbol);
+    if (before === undefined) return { ok: true, removed: false, symbol: parsed.symbol };
+    this.exclusions.delete(parsed.symbol);
+    let removed: boolean;
+    try {
+      removed = await deleteBoxExcludedUnderlying(parsed.symbol);
+    } catch (err) {
+      this.exclusions.set(before);
+      const message = err instanceof Error ? err.message : String(err);
+      return { ok: false, code: 503, error: `Could not remove the exclusion: ${message}` };
+    }
+
+    console.log(`[Box] ${parsed.symbol} is no longer excluded${actor ? ` (by ${actor})` : ""}; normal gates apply again.`);
+    void appendBoxEvent({
+      event: "SCANNER_CONFIG",
+      candidate_key: "",
+      underlying: parsed.symbol,
+      expiry: "",
+      lower_strike: 0,
+      upper_strike: 0,
+      lot_size: 0,
+      quantity: 0,
+      safety_buffer: this.cfg.safetyBuffer,
+      detail: `underlying_included=${parsed.symbol}${actor ? ` by=${actor}` : ""}`,
+    });
+
+    await this.applyExclusionChange();
+    return { ok: true, removed, symbol: parsed.symbol };
+  }
+
+  /**
+   * Make a blocklist change VISIBLE immediately, market open or shut.
+   *
+   * The same quartet `setStrikeLevel` uses, and for the same reason: a control whose effect only
+   * appears on the next 60-second universe pass reads as inert, and an operator who cannot see their
+   * exclusion take hold will reasonably assume it did not. Excluding a name drops its candidates
+   * entirely; re-including one rebuilds them.
+   *
+   * Best-effort by design — the exclusion is already applied and persisted at this point, so a
+   * refresh failure must not be reported as a failure to exclude.
+   */
+  private async applyExclusionChange(): Promise<void> {
+    if (this.deps.marketData.isAuthenticated()) {
+      try {
+        this.scanner.clearOpportunities();
+        await this.refreshUniverse();
+        if (this.marketOpen) this.scanner.refreshAll();
+        else await this.refreshIndicative();
+      } catch (err) {
+        this.lastError = err instanceof Error ? err.message : String(err);
+      }
+    }
+    this.publish();
+  }
+
   private async loadPersistedTuning(): Promise<void> {
     const saved = await loadBoxSettings();
     if (saved.size === 0) return;
@@ -3023,6 +3307,24 @@ export class BoxEngine {
         skipped.push(item.symbol);
         continue;
       }
+      /*
+       * OPERATOR BLOCKLIST — the SOFT layer, and deliberately subordinate to `mustKeep`.
+       *
+       * Dropping an excluded name here removes its window and its candidates entirely, so the
+       * scanner never prices it and its ~15 tokens are returned to the subscription budget. That is a
+       * real benefit, not just tidiness: the budget is what decides how much of the universe is
+       * watchable at all.
+       *
+       * But it is NOT the guarantee, for two reasons. Windows are only rebuilt on a refresh pass, so
+       * a newly-added exclusion would otherwise not bite until the next one; and `mustKeep` overrides
+       * every cap here by design, because an underlying carrying an open position or an unresolved
+       * residual leg MUST keep streaming or the monitor cannot exit it. So an excluded name with
+       * exposure stays fully subscribed, and the four entry checks are what actually stop a new box.
+       */
+      if (!mustKeep.has(item.symbol) && this.exclusions.has(item.symbol)) {
+        continue;
+      }
+
       const chain = this.chains.get(item.symbol);
       if (!chain) continue;
 
@@ -3173,6 +3475,12 @@ export class BoxEngine {
     if (this.universePassInFlight) return;
     this.universePassInFlight = true;
     try {
+      // HEAL AN UNREADABLE BLOCKLIST. A boot-time read failure closes ENTRY, so it must not need a
+      // restart to clear. This pass is the right carrier: it already runs on RUN and then every
+      // `universeRefreshMs`, and a successful reload wants a universe rebuild anyway so the newly
+      // known exclusions actually drop out of the candidate set. A cheap no-op unless the last read
+      // failed, and it deliberately cannot throw into the retry logic below.
+      await this.retryExclusionLoad().catch(() => undefined);
       await this.refreshUniverse();
       // Success clears both the pending retry and the backoff, so the next incident starts at the
       // base delay rather than wherever the last one ended.
@@ -4813,6 +5121,34 @@ export class BoxEngine {
     return this.session.evaluateEntry(this.recoveryActive());
   }
 
+  /**
+   * COMMITTED BOX EXPOSURE this engine already holds, for `BOX_MAX_OPEN_BOXES`.
+   *
+   * Deliberately NOT just `positions.size`. Three kinds of thing are capital at risk:
+   *
+   *   - an OPEN position — the obvious one;
+   *   - an unresolved RESIDUAL attempt — a partial entry that never became a Box. Counted per
+   *     ATTEMPT rather than per leg, because one failed four-leg entry is one box's worth of
+   *     exposure, not four;
+   *   - an unresolved ORDER INTENT whose underlying could not be attributed — an order we cannot
+   *     place is the last thing to treat as harmless, which is why `activeUnderlyings()` already
+   *     reports it under a sentinel rather than dropping it.
+   *
+   * A ceiling that counted only established positions would happily admit a second Box on top of a
+   * half-filled first one — which is the exact situation an operator who "cannot afford two" most
+   * needs refused.
+   *
+   * Synchronous and allocation-light: it is read inside the coordinator's no-await prologue.
+   */
+  private boxInventoryCount(): number {
+    // Unresolved intents are counted by DISTINCT UNDERLYING, not per order: four orphaned legs of
+    // one box are one box's worth of unknown exposure, and counting them as four would let a single
+    // unreconciled entry lock out trading far more aggressively than the risk warrants. Unattributable
+    // orders keep their sentinel underlying, so they still count as one.
+    const unresolved = new Set(this.unresolvedIntentUnderlyings().map((intent) => intent.underlying));
+    return this.positions.size + this.residualByAttempt.size + unresolved.size;
+  }
+
   /** How many residual legs are still outstanding across all attempts. */
   private residualLegCount(): number {
     let n = 0;
@@ -6044,6 +6380,16 @@ export class BoxEngine {
         })),
         claimed_underlyings: this.coordinator.claimedUnderlyings(),
         max_open_boxes: this.cfg.liveMaxOpenBoxes,
+        /**
+         * The MODE-INDEPENDENT inventory ceiling and what it currently counts.
+         *
+         * Reported separately from `max_open_boxes` because the two are genuinely different controls:
+         * that one is live-only and read after a position exists, this one is enforced at admission in
+         * every mode. `held` counts committed exposure, not just established positions, so it can
+         * exceed `open_boxes` while a partial entry is unresolved.
+         */
+        max_open_boxes_all_modes: this.cfg.maxOpenBoxes,
+        box_inventory_held: this.boxInventoryCount(),
         open_boxes: this.positions.size,
         residual_legs: this.residualLegCount(),
         daily_loss_limit: this.cfg.liveDailyLossLimit,
@@ -6304,6 +6650,14 @@ export class BoxEngine {
       universe_built_at: this.universeBuiltAt,
       /** The active strikes-each-side level (1, 2 or 3). */
       strike_level: this.strikeLevel,
+      /**
+       * THE OPERATOR BLOCKLIST, as it currently stands.
+       *
+       * Reported in the status the dashboard already polls, so the UI can badge an excluded row
+       * without a second request, and so `readable: false` is visible as a REASON new entry is
+       * refused rather than being an unexplained absence of trades.
+       */
+      excluded_underlyings: this.listExcludedUnderlyings(),
       underlyings: this.windows.size,
       candidates: this.scanner.candidateCount,
       /**
@@ -6866,6 +7220,23 @@ export class BoxEngine {
         code: "market_closed",
         scope: "entry",
         detail: "The exchange is closed: prices shown are last-close and nothing can be entered.",
+      });
+    }
+    /*
+     * THE BLOCKLIST IS UNREADABLE. Scoped `entry`, never `both`: not knowing which names are
+     * forbidden makes taking NEW exposure unsafe, but it must never be a reason the exposure this
+     * process already holds cannot be reduced. Worded like `residual_state_unknown` above, because it
+     * is the same shape of problem — unknown is not the same as none.
+     */
+    if (!this.exclusions.readable) {
+      engineBlockers.push({
+        code: "underlying_exclusions_unreadable",
+        scope: "entry",
+        detail:
+          `The excluded-underlyings blocklist could not be READ ` +
+          `(${this.exclusions.loadError ?? "it has not been loaded yet"}), so no name can be confirmed ` +
+          `tradable and no new box is entered. Exits, reductions and protective cancels continue, and ` +
+          `the read is retried automatically.`,
       });
     }
     if (live && !live.controls.entryEnabled) {

@@ -380,6 +380,13 @@ export interface BoxConfig {
    */
   maxConcurrentPerUnderlying: number;
   /**
+   * The MODE-INDEPENDENT total inventory ceiling: how many Boxes may be held at once. 0 disables it.
+   *
+   * Distinct from `liveMaxOpenBoxes`, which is live-only and read after a position exists. See the
+   * construction site for the full reasoning.
+   */
+  maxOpenBoxes: number;
+  /**
    * Minimum fraction of the originally detected gross edge that must survive for a
    * box that waited on a conflict to be allowed to execute.
    *
@@ -1195,6 +1202,33 @@ export function loadBoxConfig(): BoxConfig {
     // protected, but short enough that a crashed process frees contracts quickly.
     instrumentLockTtlMs: clampInt("BOX_INSTRUMENT_LOCK_TTL_MS", 5_000, 250, 60_000),
     maxConcurrentPerUnderlying: clampInt("BOX_MAX_CONCURRENT_PER_UNDERLYING", 2, 0, 16),
+    /**
+     * THE MODE-INDEPENDENT INVENTORY CEILING: how many Boxes may be held AT ONCE, in total.
+     *
+     * WHY THIS EXISTS SEPARATELY FROM `BOX_LIVE_MAX_OPEN_BOXES`.
+     *
+     * `BOX_LIVE_MAX_OPEN_BOXES` lives in `BoxOrderManager`, which is constructed ONLY on the live
+     * path. So it does two things this one does not: it is invisible in every paper mode (a paper
+     * rehearsal cannot exercise it, which makes "paper never breached the cap" evidence about
+     * nothing), and it is read from a count the engine refreshes only AFTER a position exists — so
+     * it cannot refuse the second of two entries admitted in the same instant.
+     *
+     * This ceiling is checked in the coordinator's synchronous admission prologue, in EVERY
+     * execution mode, against an inventory that counts committed exposure rather than only
+     * established positions: open positions, unresolved residual attempts, unresolved order
+     * intents, in-flight entry claims and reservations retained over an uncertain terminal state.
+     *
+     * `0` = unlimited, preserving existing behaviour exactly. Set it to `1` for a supervised trial
+     * and it becomes the one control that answers "I cannot afford a second box" in the paper
+     * rehearsal AND in live, for boxes on the same underlying and on different underlyings alike —
+     * including a LONG_BOX and a SHORT_BOX, which share reservation keys only while both are in
+     * flight and are otherwise unrelated to each other.
+     *
+     * It is NOT a substitute for `BOX_SESSION_MAX_ENTRY_ATTEMPTS`. This bounds INVENTORY; the
+     * attempt budget bounds RISK-TAKING, including attempts that took real exposure and were then
+     * unwound. A trial wants both.
+     */
+    maxOpenBoxes: clampInt("BOX_MAX_OPEN_BOXES", 0, 0, 50),
     conflictRevalidateMinEdgeRatio: num("BOX_CONFLICT_REVALIDATE_MIN_EDGE_RATIO", 0.8),
     // Default FALSE, preserving today's single-process semantics exactly. Multi-worker
     // deployments (PM2 cluster mode, several replicas) must set it true so live

@@ -136,6 +136,18 @@ export interface BoxExecutionSimulatorDeps {
   broker?: () => BrokerId;
   /** Minutes past IST midnight, for time-of-day calibration buckets. */
   istMinutesOfDay?: () => number;
+  /**
+   * The OPERATOR BLOCKLIST verdict for an underlying — enforcement point 3 of 4.
+   *
+   * This is the check that makes the blocklist a GUARANTEE rather than a policy. The scanner check is
+   * cheap but sits above the pipeline, and the coordinator check is disabled outright when
+   * `BOX_EXECUTION_COORDINATOR_ENABLED=false` — so neither is unbypassable. Every paper mode
+   * terminates HERE, so a refusal here cannot be configured away.
+   *
+   * Synchronous and side-effect-free. Returns the refusal, or null when entry may proceed. ENTRY
+   * ONLY — deliberately not consulted by `simulateExit` or `simulateLeggingExit`.
+   */
+  underlyingExclusion?: (underlying: string) => { code: string; detail: string } | null;
 }
 
 /** The result of a paper_legging entry attempt. */
@@ -515,6 +527,12 @@ export class BoxExecutionSimulator {
       );
     }
 
+    // OPERATOR BLOCKLIST — the unbypassable refusal for the atomic paper modes.
+    const atomicExclusion = this.deps.underlyingExclusion?.(candidate.underlying);
+    if (atomicExclusion) {
+      return this.refuse(detection, "underlying_excluded", atomicExclusion.detail);
+    }
+
     const quantityViolation = singleLotCandidateViolation(candidate);
     if (quantityViolation) {
       return this.refuse(
@@ -680,6 +698,13 @@ export class BoxExecutionSimulator {
       failure_reason: null,
       failure_detail: null,
     });
+
+    // OPERATOR BLOCKLIST — the unbypassable refusal for paper_legging. Checked before the in-flight
+    // set is touched and before any leg is priced, so an excluded name leaves no trace to unwind.
+    const leggingExclusion = this.deps.underlyingExclusion?.(candidate.underlying);
+    if (leggingExclusion) {
+      return this.leggingRefuse(baseRecord(), "underlying_excluded", leggingExclusion.detail);
+    }
 
     const quantityViolation = singleLotCandidateViolation(candidate);
     if (quantityViolation) {

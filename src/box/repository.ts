@@ -31,6 +31,7 @@ import {
 } from "../pg/pool.js";
 import { enqueueOutbox, enqueueOutboxSnapshot } from "../outbox/writer.js";
 import type { BoxMarginSource } from "./brokerContext.js";
+import { normaliseUnderlyingSymbol, type UnderlyingExclusion } from "./underlyingExclusions.js";
 import { LEGACY_BROKER, type BrokerId } from "../brokers/types.js";
 import {
   MAX_FLATTEN_APPLICATION_IDS,
@@ -3072,6 +3073,84 @@ export async function saveBoxSettings(entries: Map<string, number>): Promise<voi
       );
     }
   });
+}
+
+/* ----------------------- excluded underlyings (blocklist) ----------------------- */
+
+/**
+ * Read the operator blocklist.
+ *
+ * Discriminated exactly like {@link loadBoxTradingSession}, and for the same reason: "there are no
+ * exclusions" and "the exclusions could not be read" are completely different facts with identical
+ * shapes if you return a bare array. The caller turns the second one into a REFUSAL to enter, so
+ * flattening it to an empty list here would silently unlock every name on the list.
+ */
+export async function loadBoxExcludedUnderlyings(): Promise<
+  { ok: true; rows: UnderlyingExclusion[] } | { ok: false; error: string }
+> {
+  if (!isBoxDbEnabled()) {
+    return { ok: false, error: "Box persistence is not configured, so the blocklist cannot be read." };
+  }
+  try {
+    const { rows } = await query(
+      `SELECT symbol, reason, excluded_by, excluded_at FROM box_excluded_underlyings ORDER BY symbol`,
+    );
+    const out: UnderlyingExclusion[] = [];
+    for (const row of rows) {
+      const symbol = normaliseUnderlyingSymbol(row.symbol);
+      // A row that cannot be normalised is DROPPED rather than trusted. It could never have matched
+      // the in-memory lookup anyway, and carrying it forward would inflate the count the operator
+      // sees with an entry that protects nothing.
+      if (symbol === null) {
+        console.warn(`[Box] ignoring unusable blocklist row: ${JSON.stringify(row.symbol)}`);
+        continue;
+      }
+      const at = asDate(row.excluded_at);
+      out.push({
+        symbol,
+        reason: typeof row.reason === "string" && row.reason.trim() !== "" ? row.reason : null,
+        excluded_by: typeof row.excluded_by === "string" && row.excluded_by !== "" ? row.excluded_by : null,
+        excluded_at: at ? at.getTime() : 0,
+      });
+    }
+    return { ok: true, rows: out };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
+ * Add or restate one exclusion. THROWS on failure, deliberately.
+ *
+ * Not best-effort: an operator told a name was excluded when the row did not land would believe they
+ * had protection that reverts on the next restart. The engine rolls its in-memory change back when
+ * this throws, so what is running always matches what is stored.
+ */
+export async function saveBoxExcludedUnderlying(entry: UnderlyingExclusion): Promise<void> {
+  if (!isBoxDbEnabled()) {
+    throw new Error("Box persistence is not configured, so an exclusion cannot be saved.");
+  }
+  await query(
+    `INSERT INTO box_excluded_underlyings (symbol, reason, excluded_by, excluded_at)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (symbol) DO UPDATE SET
+       reason = $2, excluded_by = $3, excluded_at = $4`,
+    [entry.symbol, entry.reason, entry.excluded_by, new Date(entry.excluded_at)],
+  );
+}
+
+/**
+ * Remove one exclusion. THROWS on failure. Returns whether a row was actually deleted.
+ *
+ * The boolean matters: re-including a name that was not excluded is a no-op the route reports as
+ * such, rather than claiming to have changed something.
+ */
+export async function deleteBoxExcludedUnderlying(symbol: string): Promise<boolean> {
+  if (!isBoxDbEnabled()) {
+    throw new Error("Box persistence is not configured, so an exclusion cannot be removed.");
+  }
+  const { rowCount } = await query(`DELETE FROM box_excluded_underlyings WHERE symbol = $1`, [symbol]);
+  return (rowCount ?? 0) > 0;
 }
 
 /* --------------------------- durable trading session --------------------------- */

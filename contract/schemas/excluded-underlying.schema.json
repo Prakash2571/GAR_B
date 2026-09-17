@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "excluded-underlying.schema.json",
+  "title": "One underlying the operator has forbidden new entry on",
+  "description": "Source: src/box/underlyingExclusions.ts UnderlyingExclusion, persisted in box_excluded_underlyings (migration 012). An exclusion refuses ENTRY ONLY, in every execution mode (paper_touch, paper_latency, paper_legging, live). It NEVER refuses an exit, a reduction, a protective cancel or a flatten — a box already open on an excluded name keeps streaming, keeps being monitored and still exits on its own rules, because excluding a name must not trap real exposure. Enforced at four independent synchronous chokepoints, of which the two in BoxExecutionSimulator and CentralBoxExecutionGateway cannot be disabled by configuration.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["symbol", "reason", "excluded_by", "excluded_at"],
+  "properties": {
+    "symbol": {
+      "type": "string",
+      "description": "The underlying as the board reports it, uppercased and trimmed (e.g. NIFTY, RELIANCE, M&M). Never blank."
+    },
+    "reason": {
+      "type": ["string", "null"],
+      "description": "Bounded operator note (at most 280 characters). null means no reason was recorded — never that no reason existed."
+    },
+    "excluded_by": {
+      "type": ["string", "null"],
+      "description": "The operator ROLE that added the exclusion. Never a token, key, account or session identifier."
+    },
+    "excluded_at": {
+      "type": "number",
+      "description": "Epoch milliseconds."
+    }
+  }
+}

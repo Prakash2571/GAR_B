@@ -34,6 +34,7 @@
     "stopped_at",
     "universe_built_at",
     "strike_level",
+    "excluded_underlyings",
     "underlyings",
     "candidates",
     "monitored_tokens",
@@ -250,6 +251,36 @@
     },
     "strike_level": {
       "type": "number"
+    },
+    "excluded_underlyings": {
+      "$comment": "CLOSED. The operator blocklist of underlyings that must never be ENTERED, in any execution mode. Source: src/box/engine.ts listExcludedUnderlyings(). `readable: false` means the durable list could not be read, which REFUSES all new entry (readiness blocker `underlying_exclusions_unreadable`) — a client must render that as the reason nothing is trading, never as an empty blocklist. `persistent: false` means the deployment has no box persistence, so no exclusion could ever have been stored and none is being forgotten.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["readable", "persistent", "load_state", "error", "max", "excluded"],
+      "properties": {
+        "readable": {
+          "type": "boolean"
+        },
+        "persistent": {
+          "type": "boolean"
+        },
+        "load_state": {
+          "type": "string",
+          "enum": ["never_loaded", "loaded", "failed", "unpersisted"]
+        },
+        "error": {
+          "type": ["string", "null"]
+        },
+        "max": {
+          "type": "number"
+        },
+        "excluded": {
+          "type": "array",
+          "items": {
+            "$ref": "excluded-underlying.schema.json"
+          }
+        }
+      }
     },
     "underlyings": {
       "type": "number"

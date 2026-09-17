@@ -637,6 +637,30 @@ export type BoxExecutionFailureReason =
    */
   | "underlying_already_active"
   /**
+   * The underlying is on the operator's blocklist (`box_excluded_underlyings`), or that blocklist
+   * could not be read and therefore cannot confirm this name is tradable.
+   *
+   * DELIBERATELY DISTINCT from `underlying_already_active`: nothing is wrong with the market or with
+   * our own exposure — an operator has simply said this name is not to be entered. Reporting it as a
+   * conflict or a market rejection would send them looking for a fault that does not exist.
+   *
+   * Blocks NEW ENTRY ONLY, in every execution mode. An excluded name whose Box is already open is
+   * still monitored, still exits, and can still be flattened — see underlyingExclusions.ts.
+   */
+  | "underlying_excluded"
+  /**
+   * `BOX_MAX_OPEN_BOXES` — the MODE-INDEPENDENT inventory ceiling — is already met.
+   *
+   * DELIBERATELY DISTINCT from `underlying_already_active` (which is per-underlying) and from the
+   * live-only open-box guard inside BoxOrderManager (which is read from a count refreshed only after
+   * a position exists, and is invisible in paper). This one is decided in the coordinator's
+   * synchronous admission prologue in EVERY mode, against committed exposure — open positions,
+   * unresolved residuals and intents, in-flight entry claims and uncertain reservation holds.
+   *
+   * Blocks NEW ENTRY ONLY. Nothing about a full inventory is a reason exposure cannot be reduced.
+   */
+  | "box_inventory_limit"
+  /**
    * The armed trading session has consumed its permitted Box lifecycles
    * (`BOX_SESSION_MAX_COMPLETED_TRADES`), or no session is armed.
    *

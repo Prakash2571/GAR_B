@@ -151,6 +151,83 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
     }
   });
 
+  /* --------------------- excluded underlyings (blocklist) -------------------- */
+
+  /**
+   * READ the operator blocklist.
+   *
+   * Plain admin auth: it is a read, and it contains only symbols, operator ROLE labels and
+   * timestamps — never a token, key or account identifier.
+   *
+   * `readable: false` is the important field. It means the durable list could not be read, which
+   * REFUSES all new entry (see the `underlying_exclusions_unreadable` readiness blocker) — so a
+   * client must render it as a reason nothing is trading, not as an empty blocklist.
+   */
+  app.get("/api/box/excluded-underlyings", requireOperator, (_req: Request, res: Response) => {
+    try {
+      res.json(engine.listExcludedUnderlyings());
+    } catch (err) {
+      fail(res, err);
+    }
+  });
+
+  /**
+   * EXCLUDE an underlying from new entry. FULL ADMIN.
+   *
+   * Full admin because it changes what the engine will trade. Note the asymmetry with the DELETE
+   * below: both are full-admin, but only this direction can ever REDUCE what trades, and it is
+   * deliberately the easier one to reach — a control that stops trading should never be harder to use
+   * than the one that starts it.
+   *
+   * Takes effect on the very next evaluation, in EVERY execution mode, and is persisted. A box
+   * ALREADY OPEN on the symbol is untouched: it keeps streaming, keeps being monitored, exits on its
+   * own rules and can still be flattened.
+   *
+   * Body: { symbol: string, reason?: string }
+   */
+  app.post("/api/box/excluded-underlyings", requireOperator, async (req: Request, res: Response) => {
+    if (!requireFull(req, res)) return;
+    try {
+      const body = (req.body ?? {}) as { symbol?: unknown; reason?: unknown };
+      const actor = deps.getOperatorRole(req) ?? "admin";
+      const result = await engine.excludeUnderlying({ symbol: body.symbol, reason: body.reason }, actor);
+      if (!result.ok) {
+        res.status(result.code).json({ error: result.error });
+        return;
+      }
+      res.json({ ok: true, excluded: result.excluded, excluded_underlyings: engine.listExcludedUnderlyings() });
+    } catch (err) {
+      fail(res, err);
+    }
+  });
+
+  /**
+   * RE-INCLUDE an underlying. FULL ADMIN.
+   *
+   * Idempotent: removing a symbol that was not excluded answers 200 with `removed: false` rather than
+   * 404, because the caller's intent ("this name should be tradable") is satisfied either way and a
+   * 404 would invite a retry loop over nothing.
+   */
+  app.delete("/api/box/excluded-underlyings/:symbol", requireOperator, async (req: Request, res: Response) => {
+    if (!requireFull(req, res)) return;
+    try {
+      const actor = deps.getOperatorRole(req) ?? "admin";
+      const result = await engine.includeUnderlying(req.params.symbol, actor);
+      if (!result.ok) {
+        res.status(result.code).json({ error: result.error });
+        return;
+      }
+      res.json({
+        ok: true,
+        removed: result.removed,
+        symbol: result.symbol,
+        excluded_underlyings: engine.listExcludedUnderlyings(),
+      });
+    } catch (err) {
+      fail(res, err);
+    }
+  });
+
   /** RUN — begin discovering and auto-opening paper boxes. */
   app.post("/api/box/start", requireOperator, async (_req: Request, res: Response) => {
     try {

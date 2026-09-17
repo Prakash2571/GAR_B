@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "box-excluded-underlyings.schema.json",
+  "title": "GET /api/box/excluded-underlyings (200)",
+  "description": "The operator blocklist. Source: src/box/engine.ts listExcludedUnderlyings(), which is also embedded verbatim as `excluded_underlyings` in box-status.schema.json so the dashboard needs no second request. TOP LEVEL IS CLOSED. The load state is part of the contract on purpose: a blocklist that cannot be READ is not an empty blocklist, so `readable: false` must be rendered as the reason no new box is being entered (it raises the `underlying_exclusions_unreadable` readiness blocker, scope `entry`), never as 'nothing is excluded'.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["readable", "persistent", "load_state", "error", "max", "excluded"],
+  "properties": {
+    "readable": {
+      "type": "boolean",
+      "description": "Whether the blocklist may be relied on to decide a name is ALLOWED. False REFUSES all new entry. Note the asymmetry: an unreadable book can still prove a name is forbidden if it happens to hold it, but it can never prove one is permitted."
+    },
+    "persistent": {
+      "type": "boolean",
+      "description": "Whether an exclusion can be stored durably at all. False means the deployment has no box persistence, so no exclusion could ever have been saved and none is being forgotten — writes are refused rather than accepted and lost."
+    },
+    "load_state": {
+      "type": "string",
+      "enum": ["never_loaded", "loaded", "failed", "unpersisted"],
+      "description": "How the in-memory book came to hold what it holds. never_loaded and failed both refuse entry; loaded and unpersisted both permit it."
+    },
+    "error": {
+      "type": ["string", "null"],
+      "description": "Why the last durable read failed, when it did. Bounded and safe to display; never SQL or a stack trace."
+    },
+    "max": {
+      "type": "number",
+      "description": "The most underlyings this deployment will hold on the blocklist (MAX_EXCLUDED_UNDERLYINGS)."
+    },
+    "excluded": {
+      "type": "array",
+      "description": "Ordered by symbol, so a client and a test see a stable list.",
+      "items": {
+        "$ref": "excluded-underlying.schema.json"
+      }
+    }
+  }
+}

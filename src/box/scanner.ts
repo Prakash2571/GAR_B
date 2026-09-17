@@ -140,6 +140,20 @@ export interface BoxScannerDeps {
    * candidates. Optional.
    */
   onQualified?: () => void;
+  /**
+   * THE OPERATOR BLOCKLIST, asked once per candidate that would otherwise be entered.
+   *
+   * Synchronous by contract: this runs on the tick path, so it must be an in-memory lookup and must
+   * never await. Returning `true` means "do not enter this underlying" — which covers BOTH an
+   * explicitly excluded name AND an unreadable blocklist, because a list we cannot read cannot
+   * confirm any name is permitted (see exclusionEntryRefusal).
+   *
+   * Optional so tests and the pure paths need not supply it; absent means "nothing is excluded".
+   * This is the CHEAPEST of the four enforcement points — it refuses before a reservation is taken,
+   * before a session attempt is spent and before any order exists — but it is deliberately not the
+   * only one, because a scanner-level check alone would be bypassed by any future entry originator.
+   */
+  isUnderlyingExcluded?: (underlying: string) => boolean;
 }
 
 /** Counters exposed by GET /api/box/status. */
@@ -155,6 +169,12 @@ export interface BoxScannerStats {
   rejectedNetProfit: number;
   rejectedExecution: number;
   rejectedDuplicate: number;
+  /**
+   * Candidates that would have been entered but whose underlying is on the operator blocklist (or
+   * whose blocklist was unreadable). Counted so an operator can see the control WORKING, rather than
+   * inferring it from an absence of trades — a silent guard is indistinguishable from a broken one.
+   */
+  rejectedExcluded: number;
   /**
    * Candidate evaluations that threw on the hot path.
    *
@@ -197,6 +217,7 @@ export class BoxScanner {
     rejectedNetProfit: 0,
     rejectedExecution: 0,
     rejectedDuplicate: 0,
+    rejectedExcluded: 0,
     evaluationFaults: 0,
     lastEvaluationAt: null,
   };
@@ -402,6 +423,21 @@ export class BoxScanner {
     if (!this.marketOpen) return;
     if (!this.feedHealthy) return;
     if (openKeyTaken) return;
+    /*
+     * OPERATOR BLOCKLIST — enforcement point 1 of 4, and the cheapest.
+     *
+     * Placed AFTER `publish` on purpose: the opportunity stays visible on the board with its real
+     * economics, so an operator can still see what they are declining. It is placed BEFORE
+     * `positions.reserve`, before the session attempt budget and before any order exists, so an
+     * excluded name costs nothing at all — no reservation, no durable write, no attempt spent.
+     *
+     * This is not the guarantee. The guarantee is the unbypassable check in
+     * CentralBoxExecutionGateway; this one exists so the guarantee is almost never reached.
+     */
+    if (this.deps.isUnderlyingExcluded?.(cand.underlying) === true) {
+      this.stats.rejectedExcluded++;
+      return;
+    }
     if (!evaluation.tradable) {
       this.noteRejection(cand, evaluation);
       return;
