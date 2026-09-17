@@ -275,6 +275,7 @@ are the shipped specification:
 
 | Document | What it covers |
 | --- | --- |
+| `docs/LIVE_EXECUTION_MAP.md` | **Start here for execution.** Which module acts when, every gate in order, and what happens on success, partial fill, failure, ambiguity and stale data. |
 | `docs/CONFIGURATION.md` | Every environment variable, its default, and what breaks if it is wrong. |
 | `docs/ACCESS_GATE.md` | The site passcode, sessions, CSRF, rate limiting. |
 | `docs/DEPLOYMENT.md` | Production setup, migrations, backup, rollback. |
