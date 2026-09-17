@@ -228,6 +228,80 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
     }
   });
 
+  /**
+   * APPLY MANY blocklist changes at once. FULL ADMIN.
+   *
+   * WHY THIS IS NOT JUST A CONVENIENCE WRAPPER
+   *
+   * Each single-symbol write above triggers a full universe rebuild — a fresh instrument-master fetch
+   * and a re-derivation of every window. That is correct for one change and unusable for eighty, which
+   * is exactly the shape of the pre-run screening this endpoint exists for: an operator enabling the
+   * whole F&O universe declines a long list of names in one decision, and doing that one request at a
+   * time would mean eighty instrument-master fetches and minutes of churn. This applies the whole batch
+   * in one transaction and rebuilds once.
+   *
+   * DIFF-BASED, NOT REPLACE-THE-SET. `exclude` and `include` are explicit deltas rather than a desired
+   * final list, so a client holding a stale view cannot silently RE-ADMIT a name that was excluded
+   * moments earlier from another tab. That is the only direction of error worth designing against here,
+   * because it re-opens entry on something the operator deliberately declined.
+   *
+   * ALL-OR-NOTHING. Every symbol is validated before anything is written, so one mistyped name rejects
+   * the request instead of leaving a partially applied set the operator then has to reverse-engineer.
+   *
+   * Body: { exclude?: (string | { symbol, reason? })[], include?: string[] }
+   */
+  app.post("/api/box/excluded-underlyings/bulk", requireOperator, async (req: Request, res: Response) => {
+    if (!requireFull(req, res)) return;
+    try {
+      const body = (req.body ?? {}) as { exclude?: unknown; include?: unknown };
+      const actor = deps.getOperatorRole(req) ?? "admin";
+      const result = await engine.setExcludedUnderlyingsBulk(
+        { exclude: body.exclude, include: body.include },
+        actor,
+      );
+      if (!result.ok) {
+        res.status(result.code).json({ error: result.error });
+        return;
+      }
+      res.json({
+        ok: true,
+        added: result.added,
+        removed: result.removed,
+        excluded_underlyings: engine.listExcludedUnderlyings(),
+      });
+    } catch (err) {
+      fail(res, err);
+    }
+  });
+
+  /* ----------------------------- the universe ------------------------------ */
+
+  /**
+   * THE JOINED UNIVERSE — every underlying the engine could watch, for the pre-run picker.
+   *
+   * Plain admin auth: a read of instrument metadata only — symbols, lot sizes, expiries and strike
+   * counts. No token, key, account identifier or position ever appears here.
+   *
+   * Available BEFORE run, which is the entire point. `boot()` performs one universe pass, so this is
+   * populated while the engine is still idle and the operator can decide what to discover instead of
+   * inferring it afterwards from which opportunities happened to appear.
+   *
+   * `built: false` distinguishes "no universe pass has completed" from "the universe is genuinely
+   * empty" — without it an empty list at boot would read as a broken instrument master.
+   *
+   * Each row carries `admissible`, which answers whether the name could trade AT ALL under the current
+   * quantity caps. With one chosen underlying that was trivial; across ~200 names with lot sizes
+   * spanning orders of magnitude it is the difference between a name that is quiet and a name that is
+   * configured to be impossible.
+   */
+  app.get("/api/box/universe", requireOperator, (_req: Request, res: Response) => {
+    try {
+      res.json(engine.listUniverse());
+    } catch (err) {
+      fail(res, err);
+    }
+  });
+
   /** RUN — begin discovering and auto-opening paper boxes. */
   app.post("/api/box/start", requireOperator, async (_req: Request, res: Response) => {
     try {

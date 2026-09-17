@@ -443,3 +443,93 @@ test("[SERDE] projectBrokerHealth output (the REAL broker-health projection) sat
     "the health projection must emit exactly the public field set (no token metadata, feed age or static-IP leak)",
   );
 });
+
+
+/* ══════════════════════════ SERDE: the pre-run universe ══════════════════════════ */
+
+test("[SERDE] projectUniverse / summariseUniverse output (the REAL universe projection) satisfies the schemas", async () => {
+  const { projectUniverse, summariseUniverse } = await import(`${DIST}/box/universeView.js`);
+
+  // A board and chain set covering every branch the projection has: an index, a plain stock, a
+  // stock the operator has excluded, a stock whose lot is over the per-leg cap, a stock whose four
+  // legs are over the GROSS cap while one leg is not, a chain with a single paired strike, and a
+  // board row with no chain at all (which must be DROPPED, not rendered as unusable).
+  const board = [
+    { symbol: "NIFTY", name: "Nifty 50", spot_token: 256265, is_index: true },
+    { symbol: "RELIANCE", name: "Reliance Industries", spot_token: 738561 },
+    { symbol: "ITC", name: "ITC", spot_token: 424961 },
+    { symbol: "TATASTEEL", name: "Tata Steel", spot_token: 895745 },
+    { symbol: "VEDL", name: "Vedanta", spot_token: 784129 },
+    { symbol: "THINCHAIN", name: "One Paired Strike", spot_token: 111111 },
+    { symbol: "NOCHAIN", name: "No Option Chain", spot_token: 222222 },
+  ];
+  const chain = (lot, strikes, expiry = "2026-09-24") => ({
+    underlying: "x", expiry, lot_size: lot, strike_step: 50,
+    strikes, ce: new Map(), pe: new Map(),
+  });
+  const chains = new Map([
+    ["NIFTY", chain(75, [24000, 24050, 24100])],
+    ["RELIANCE", chain(250, [1400, 1450])],
+    ["ITC", chain(800, [400, 420])],        // excluded by the operator, but perfectly admissible
+    ["TATASTEEL", chain(5500, [140, 150])],   // one lot over the per-leg cap
+    ["VEDL", chain(1150, [400, 420])],        // one leg fits, four legs do not
+    ["THINCHAIN", chain(100, [500])],         // cannot form a box at all
+  ]);
+  const exclusions = new Map([["ITC", { reason: "corporate action this week" }]]);
+  const caps = { maxOpenLegQuantity: 2000, maxGrossOpenLegQuantity: 4000 };
+
+  const rows = wire(projectUniverse({ board, chains, exclusions, caps }));
+
+  // Every row is contract-valid, and the awkward ones are present rather than silently dropped.
+  for (const row of rows) {
+    assertValid(await check(row, "universe-underlying.schema.json"), `universe-underlying (${row.symbol})`);
+  }
+  assert.deepEqual(
+    rows.map((r) => r.symbol),
+    ["NIFTY", "ITC", "RELIANCE", "TATASTEEL", "THINCHAIN", "VEDL"],
+    "indices sort first, then alphabetical — the same order prioritiseUniverse keeps names in; " +
+      "NOCHAIN is dropped because a board row with no option chain was never a candidate",
+  );
+
+  const by = (s) => rows.find((r) => r.symbol === s);
+  assert.equal(by("TATASTEEL").inadmissible_reason, "lot_exceeds_per_leg_cap");
+  assert.equal(by("VEDL").inadmissible_reason, "four_legs_exceed_gross_cap");
+  assert.equal(by("THINCHAIN").inadmissible_reason, "no_paired_strikes");
+  assert.equal(by("RELIANCE").admissible, true, "a lot inside both caps is admissible");
+  assert.equal(by("RELIANCE").inadmissible_reason, null);
+  // The two verdicts are INDEPENDENT: an excluded name still reports its own admissibility, so the
+  // UI can tell "you declined this" apart from "this could never have traded".
+  assert.equal(by("ITC").excluded, true);
+  assert.equal(by("ITC").excluded_reason, "corporate action this week");
+  assert.equal(by("ITC").admissible, true);
+
+  const summary = wire(summariseUniverse(rows));
+  assert.deepEqual(
+    summary,
+    { total: 6, indices: 1, excluded: 1, watchable: 2, blocked_by_caps: 3 },
+    "watchable counts only names that are neither excluded nor cap-blocked",
+  );
+
+  // THE WHOLE ENVELOPE. `underlyings` and `summary` come from the real producers above; the four
+  // scalar wrapper fields are assembled here because engine.listUniverse() cannot be reached without
+  // a live BoxEngine (Mongo + PG + a broker feed), exactly as for the other [SERDE] box shapes. So
+  // this pins the envelope's SHAPE, not the engine's field-by-field assembly of it.
+  const envelope = {
+    underlyings: rows,
+    summary,
+    caps: { max_open_leg_quantity: caps.maxOpenLegQuantity, max_gross_open_leg_quantity: caps.maxGrossOpenLegQuantity },
+    built: true,
+    built_at: Date.parse("2026-09-17T03:45:00.000Z"),
+    blocklist_readable: true,
+  };
+  assertValid(await check(envelope, "box-universe.schema.json"), "box-universe");
+
+  // The pre-run case an operator actually hits first: nothing discovered yet. `built: false` must be
+  // representable, because an empty list without it reads as a broken instrument master.
+  const unbuilt = {
+    underlyings: [], summary: wire(summariseUniverse([])),
+    caps: { max_open_leg_quantity: 2000, max_gross_open_leg_quantity: 4000 },
+    built: false, built_at: null, blocklist_readable: false,
+  };
+  assertValid(await check(unbuilt, "box-universe.schema.json"), "box-universe (unbuilt)");
+});

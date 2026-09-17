@@ -290,6 +290,54 @@ Design points that are deliberate rather than incidental:
   database outage therefore cannot lose the blocklist — only a *write* can fail, and a failed write is
   rolled back in memory and reported.
 
+## 9. A WIDE universe breaks the per-leg quantity cap
+
+Everything above assumed the documented one-underlying setup (`BOX_MAX_UNDERLYINGS=1`). Watching the
+whole F&O universe instead is safe for *exposure* — `BOX_MAX_OPEN_BOXES=1` is an inventory ceiling and
+does not care how many names are being watched — but it silently breaks one control.
+
+`BOX_LIVE_MAX_OPEN_LEG_QUANTITY` is **one global number**, and F&O lot sizes span orders of magnitude:
+an index lot of 75 against single-stock lots in the thousands. With one chosen underlying the cap could
+be set to exactly that instrument's lot, which is what §7's advice assumed. Across ~200 underlyings no
+single value works: it is either below most lots or so far above them that it no longer bounds
+anything.
+
+The failure is silent and reads like the wrong thing. A name whose lot exceeds the cap is not *unlikely*
+to trade — it **cannot** trade, ever. The refusal happens deep on the entry path in
+`entryQuantityEnvelopeBlockReason`, where it surfaces as an execution refusal rather than as a
+configuration mismatch, so an operator watching a quiet name cannot tell "no edge today" from
+"impossible by configuration".
+
+**What was added.** `GET /api/box/universe` projects the engine's board joined against its chain index
+(`src/box/universeView.ts`) and labels every row with `admissible` plus a stable
+`inadmissible_reason` — `lot_exceeds_per_leg_cap`, `four_legs_exceed_gross_cap`, `no_paired_strikes` or
+`unusable_lot_size`. The summary's `blocked_by_caps` counts names that are **not** excluded and still
+cannot trade: the count that matters, because those look enabled.
+
+It is readable while the engine is **idle**, which is the point. `boot()` performs exactly one universe
+pass, so the list exists before RUN and the operator decides what to discover instead of inferring it
+afterwards from which opportunities happened to appear.
+
+**The intended workflow.** Set the per-leg cap to the largest lot you are willing to trade, then exclude
+everything above it. The cap and the blocklist then agree, and `BOX_LIVE_MAX_BOX_CAPITAL_RUPEES` becomes
+the real economic bound rather than a second quantity limit fighting the first.
+
+**Why the bulk write exists.** Each single-symbol exclusion triggers a full universe rebuild — a fresh
+instrument-master fetch and a re-derivation of every window. Correct for one change, unusable for
+eighty, which is exactly the shape of pre-run screening. `POST /api/box/excluded-underlyings/bulk`
+applies the batch in one transaction and rebuilds once. It is **diff-based** (`exclude` / `include`
+deltas), not replace-the-set: a client holding a stale list must not be able to silently re-admit a name
+excluded moments earlier from elsewhere, since that is the one direction of error that re-opens entry on
+something deliberately declined. Validation is all-or-nothing, so one mistyped name rejects the request
+instead of leaving a half-applied set.
+
+**Still bounded by the token budget.** `BOX_MAX_SUBSCRIBED_TOKENS` caps subscriptions independently. At
+`BOX_STRIKE_LEVEL=1` (7 tokens per underlying) 2200 tokens covers ~314 names, comfortably above the
+joined board; at level 3 (15 tokens) it covers ~146, so a wide universe and a wide strike window cannot
+both be had. Names dropped for budget appear in `skipped_for_budget` on the status payload, and the
+picker deliberately sorts in the same indices-first order `prioritiseUniverse` keeps names in, so the
+list reads in the order a budget squeeze will actually preserve.
+
 ## What this change does not add
 
 Deliberately out of scope, and worth separate PRs because both touch the exit path:
