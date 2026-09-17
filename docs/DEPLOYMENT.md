@@ -6,13 +6,22 @@ procedure, and — most importantly — the **the predecessor codebase → GTS A
 
 PostgreSQL is this backend's operational authority; treat it accordingly.
 
-> **Going live in Mumbai (`ap-south-1`)?** Read
-> [`docs/MUMBAI_EC2_PROFILE.md`](MUMBAI_EC2_PROFILE.md) first. It holds the conservative
-> starting profile (real trading disabled, one lot, one box), the ready-to-edit
-> [`deploy/mumbai-ec2-conservative.env.example`](../deploy/mumbai-ec2-conservative.env.example),
-> and the EC2-specific requirements: stable outbound IP, clock sync, PostgreSQL
-> durability, monitoring, restart/recovery, config precedence, and the requirement that
-> the predecessor codebase Box execution be disabled first.
+> **Going live?** The production deployment runs on **Azure Central India (Pune)**. For a
+> supervised single-box run the current posture is
+> [`deploy/FINAL-one-box-live.env.template`](../deploy/FINAL-one-box-live.env.template) — a
+> complete env (process, PostgreSQL, access gate, Kite, strategy) with only secrets left blank.
+>
+> [`docs/MUMBAI_EC2_PROFILE.md`](MUMBAI_EC2_PROFILE.md) is still worth reading for the
+> *reasoning* behind the conservative limits, which is host-independent. Its **host-specific**
+> instructions are AWS-only and no longer apply — time sync via the Amazon endpoint, the
+> `checkip.amazonaws.com` probe and Elastic IP/NAT all differ on Azure. That document opens with a
+> table of exactly what changes.
+>
+> One thing to get right on any new host, and it is not the network distance: **clock sync**. An
+> exchange timestamp too far ahead of local receive time is read as a clock fault, so a badly
+> synchronised host produces false four-leg coherence rejections that present as market conditions.
+> On Azure use the host-provided PTP/VMICTimeSync source via chrony and confirm with
+> `chronyc tracking`.
 
 ## 0. `./start.sh` — the automated release
 
