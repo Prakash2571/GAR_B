@@ -1144,12 +1144,21 @@ export class BoxOrderManager {
    *
    *   - `entryEnabled` / `liveOrderEnabled` gate NEW EXPOSURE ONLY (see {@link canEnter}, which
    *     requires both).
-   *   - REDUCTION requires only that this process can still act safely and attributably:
+   *   - REDUCTION requires only that this process can still act at all:
    *       * not disposed — a torn-down manager has no transport;
-   *       * broker AUTHENTICATED — an unauthenticated client cannot cancel anything, and pretending
-   *         otherwise would report success for a request that never left;
-   *       * the ACCOUNT is known — reduction must be attributable to the account that owns the
-   *         exposure (see {@link exposureReductionBlockReason}).
+   *       * the broker session is not KNOWN-BAD (`health.broker_auth === "unhealthy"`) — an
+   *         unauthenticated client cannot cancel anything, and pretending otherwise would report
+   *         success for a request that never left. Note `=== "unhealthy"`, not `!== "healthy"`: an
+   *         UNVERIFIED session (boot, pre-reconciliation) must still be able to get flat.
+   *
+   *     AND EXPLICITLY **NOT** that the ACCOUNT is known. An earlier revision of this list said it
+   *     did, and that claim outlived the code by some margin — see the long comment in
+   *     {@link exposureReductionBlockReason}, which removed the account block on the grounds that it
+   *     was the same defect as this one wearing an identity-shaped costume. `liveBrokerAccount()`
+   *     can return null with a perfectly healthy trading session, so making reduction depend on it
+   *     would strand exposure. Account identity is enforced where it is real evidence — at the send
+   *     boundary and per durable row — and only ever on proof of a DIFFERENT account, never on an
+   *     unknown one.
    *   - Ownership, side and attributed-quantity checks remain mandatory and are unchanged: reduction
    *     is still refused unless it genuinely reduces a position this deployment owns
    *     ({@link withinQuantityLimits}, `queuedActionBlockReason`). Nothing here grants any power over

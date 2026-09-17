@@ -100,7 +100,53 @@ partial-exit SSE event.
 `exit_charge_reconciliation` begins `pending` — charges read immediately after flat are **local
 estimates**, with broker-verified figures landing asynchronously.
 
-## 6. One contradiction to settle before a live window
+## 6. SETTLED: a null broker account does NOT disable the panic button
+
+This was previously listed here as an unresolved contradiction. It has now been read end to end and
+the answer is unambiguous: **the code is correct and the comments were wrong.**
+
+`exposureReductionBlockReason()` (`orderManager.ts:1172-1235`) has exactly two refusals:
+
+```ts
+if (this.disposed) return "...process shutting down...";
+if (this.health.broker_auth === "unhealthy") return "...not authenticated...";
+return null;
+```
+
+It makes **no** call to `brokerAccount()`, `attributedAccountDriftReason()` or any account
+comparison. Note `=== "unhealthy"` rather than `!== "healthy"` — deliberate, so a process that has
+not yet reconciled (boot, or a restart with exposure open) can still cancel.
+
+Account identity *is* consulted on reduction, in three places — `attributedAccountDriftReason` at
+dequeue for `EXIT`/`EMERGENCY_RESIDUAL`, `accountConsistencyBlockReason` per durable intent in the
+cancel sweep, and `dispatchAccountBlockReason` at the send boundary — but every one of them refuses
+**only on two known-and-different account values**, never on null, unknown or unproven. So on a
+single account they all return `null`.
+
+A related risk was checked and is also closed: the two witnesses compared for drift come from
+different accessors (`kite.getSessionAccount()` vs `sessionFor().client_id`), which could in
+principle disagree on formatting and raise a *false* drift that refuses an exit. They cannot: both
+are installed from the same value in one synchronous pair (`registry.ts:983`/`985` and
+`:1208`/`:1210`), and both sides are trimmed before comparison.
+
+`liveBrokerAccount()` can still legitimately return null — it requires
+`marketData.isAuthenticated()`, a *market-data* property — which is precisely why reduction must not
+depend on it. A null blocks **new entry only**.
+
+Already covered by tests: `liveExposureControlAndAccount.test.mjs` D2 ("an unnameable session account
+does NOT disable exposure reduction"), P0-4 ("an UNNAMEABLE session never strands exposure") and A3
+("an unverified session may still TRY to cancel").
+
+**What was actually wrong:** three comments claimed a null account blocks reduction — the
+`canManageExposure` JSDoc, the `brokerAccount` injection comment, and the `liveBrokerAccount` doc
+block. All three are now corrected. A stale comment on a safety path is not cosmetic: an operator
+reading it mid-incident would conclude the flatten button was dead and stop trying.
+
+The only reachable refusals of a flatten in a single-account supervised run are `disposed` (process
+shutting down), `broker_auth === "unhealthy"` (a reconciliation positively observed an
+unauthenticated broker — you genuinely cannot send, and the message says to sign in), and, for
+`/live/flatten` specifically, `box_emergency_flatten is disabled` — a control you can flip.
+`cancel-working` and `POST /trades/:id/close` remain available regardless.
 
 `EVIDENCE-supervised-live-test-readiness.md` §2 states that exposure reduction "no longer consults the
 session account at all". The JSDoc still in `orderManager.ts:1143-1152` lists, as a precondition for
@@ -201,6 +247,26 @@ and are deliberately **excluded**, so a closing box never looks like a held one.
 
 `0` = unlimited, so existing deployments are unaffected. Refusals carry
 `reason: "box_inventory_limit"` and are counted as `inventoryLimitRefusals`.
+
+Two corrections found on review of the first draft, both worth recording because they are the kind of
+mistake that makes a ceiling look present and behave otherwise:
+
+- **The first draft counted unresolved order intents, and that was wrong twice over.** Reading them
+  requires `orderManager.status()`, which calls `rollTradingDay()` — a *mutation* that resets the
+  daily risk counters and can start an async seed load. This method runs in the coordinator's no-await
+  prologue on every admission, and this codebase has already paid once for putting `rollTradingDay()`
+  on a guard path. It also double-counted: an orphaned order belonging to an open position resolves to
+  that position's underlying, so the same box occupied two slots. Removed — and nothing is lost,
+  because an unknown order does not merely occupy a slot, it *refuses* entry outright via
+  `entryBlockReason` and the `reconciliation_incomplete` readiness blocker.
+- **The first draft had an uncounted window.** The coordinator drops its claim in `settle()` as soon
+  as the inner execution returns, but the position is only added to the book later inside
+  `openPaperTrade`, with a PostgreSQL write in between. For those milliseconds the four legs are
+  filled and *nothing* counted them. `BOX_SESSION_MAX_ENTRY_ATTEMPTS=1` happens to cover it, but that
+  is a property of one configuration, not of the ceiling: with the attempt budget left unlimited, two
+  boxes could still open. The engine now holds a slot across the whole establishment
+  (`pendingEstablishments`), released in a `finally` so a throw cannot leak one. Coverage is now
+  continuous from admission to durable record.
 
 It does **not** replace `BOX_SESSION_MAX_ENTRY_ATTEMPTS`. This bounds what you *hold*; the attempt
 budget bounds what you *try*, including attempts that took real exposure and were unwound and so
