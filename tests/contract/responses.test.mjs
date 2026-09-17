@@ -477,8 +477,16 @@ test("[SERDE] projectUniverse / summariseUniverse output (the REAL universe proj
   ]);
   const exclusions = new Map([["ITC", { reason: "corporate action this week" }]]);
   const caps = { maxOpenLegQuantity: 2000, maxGrossOpenLegQuantity: 4000 };
+  // A watch state where an ELIGIBLE name is nonetheless unobserved, because that is the combination
+  // the payload exists to express and the one a client is most likely to render wrongly.
+  const watch = {
+    windows: new Set(["NIFTY", "ITC"]),
+    skippedForUnderlyingCap: new Set(["RELIANCE"]),
+    skippedForBudget: new Set(["VEDL"]),
+    discovering: true,
+  };
 
-  const rows = wire(projectUniverse({ board, chains, exclusions, caps }));
+  const rows = wire(projectUniverse({ board, chains, exclusions, caps, watch }));
 
   // Every row is contract-valid, and the awkward ones are present rather than silently dropped.
   for (const row of rows) {
@@ -503,11 +511,31 @@ test("[SERDE] projectUniverse / summariseUniverse output (the REAL universe proj
   assert.equal(by("ITC").excluded_reason, "corporate action this week");
   assert.equal(by("ITC").admissible, true);
 
+  // WATCHED is separate from admissibility: RELIANCE is perfectly tradable and still unobserved,
+  // because BOX_MAX_UNDERLYINGS gave its place away. Reporting only `watchable` claimed otherwise.
+  assert.equal(by("RELIANCE").admissible, true);
+  assert.equal(by("RELIANCE").watched, false);
+  assert.equal(by("RELIANCE").not_watched_reason, "underlying_cap");
+  assert.equal(by("VEDL").not_watched_reason, "token_budget");
+  assert.equal(by("NIFTY").watched, true);
+  assert.equal(by("NIFTY").not_watched_reason, null);
+  // An excluded name holding a window is still watched — its legs stream so the monitor can exit it.
+  assert.equal(by("ITC").excluded, true);
+  assert.equal(by("ITC").watched, true);
+
   const summary = wire(summariseUniverse(rows));
   assert.deepEqual(
     summary,
-    { total: 6, indices: 1, excluded: 1, watchable: 2, blocked_by_caps: 3 },
-    "watchable counts only names that are neither excluded nor cap-blocked",
+    {
+      total: 6,
+      indices: 1,
+      excluded: 1,
+      watchable: 2,
+      blocked_by_caps: 3,
+      watched: 2,
+      eligible_not_watched: 1,
+    },
+    "watchable counts what nothing forbids; watched counts what actually has a window",
   );
 
   // THE WHOLE ENVELOPE. `underlyings` and `summary` come from the real producers above; the four
@@ -521,6 +549,9 @@ test("[SERDE] projectUniverse / summariseUniverse output (the REAL universe proj
     built: true,
     built_at: Date.parse("2026-09-17T03:45:00.000Z"),
     blocklist_readable: true,
+    max_underlyings: 1,
+    max_subscribed_tokens: 2200,
+    discovering: true,
   };
   assertValid(await check(envelope, "box-universe.schema.json"), "box-universe");
 
@@ -530,6 +561,7 @@ test("[SERDE] projectUniverse / summariseUniverse output (the REAL universe proj
     underlyings: [], summary: wire(summariseUniverse([])),
     caps: { max_open_leg_quantity: 2000, max_gross_open_leg_quantity: 4000 },
     built: false, built_at: null, blocklist_readable: false,
+    max_underlyings: 0, max_subscribed_tokens: 2200, discovering: false,
   };
   assertValid(await check(unbuilt, "box-universe.schema.json"), "box-universe (unbuilt)");
 });

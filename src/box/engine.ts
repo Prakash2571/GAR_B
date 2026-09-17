@@ -571,6 +571,17 @@ export class BoxEngine {
   private subscribedOptionTokens = new Set<number>();
   private subscribedSpotTokens = new Set<number>();
   private skippedForBudget: string[] = [];
+  /**
+   * Left out because BOX_MAX_UNDERLYINGS capped the list, NOT because the feed budget bound.
+   *
+   * Kept apart from `skippedForBudget` for exactly the reason `skippedForIndicativeCap` is: these are
+   * two unrelated limits with identical symptoms, and merging them made the UI blame the live-feed
+   * token budget for a cap that has nothing to do with tokens. With `BOX_MAX_UNDERLYINGS=1` and 215
+   * joined names the operator was told 214 underlyings were "outside the live-feed token budget
+   * (2200 instruments)" while the budget had hundreds of tokens to spare — so the reported cause
+   * pointed at a number that was not the constraint, and the one setting that WAS went unnamed.
+   */
+  private skippedForUnderlyingCap: string[] = [];
   /** Left out of the last-close preview by its own cap, not by the feed budget. */
   private skippedForIndicativeCap: string[] = [];
 
@@ -2225,6 +2236,12 @@ export class BoxEngine {
     built_at: number | null;
     /** The blocklist's own readability, since an unreadable list refuses entry regardless of this view. */
     blocklist_readable: boolean;
+    /** BOX_MAX_UNDERLYINGS (0 = no cap) — the setting to change, named rather than described. */
+    max_underlyings: number;
+    /** BOX_MAX_SUBSCRIBED_TOKENS, the other limit that can leave an eligible name unobserved. */
+    max_subscribed_tokens: number;
+    /** False when the scanner is stopped, which is why nothing is being observed. */
+    discovering: boolean;
   } {
     const exclusions = new Map(
       this.exclusions.list().map((e) => [e.symbol, { reason: e.reason }] as const),
@@ -2238,6 +2255,16 @@ export class BoxEngine {
       chains: this.chains,
       exclusions,
       caps,
+      // GROUND TRUTH for what is being observed: the engine's own window map, not a re-derivation of
+      // the caps. A second implementation of "who won a place in the universe" would be free to
+      // disagree with the one that actually built the windows, and this surface exists precisely to
+      // answer that question authoritatively.
+      watch: {
+        windows: new Set(this.windows.keys()),
+        skippedForUnderlyingCap: new Set(this.skippedForUnderlyingCap),
+        skippedForBudget: new Set(this.skippedForBudget),
+        discovering: this.running,
+      },
     });
     return {
       underlyings,
@@ -2249,6 +2276,9 @@ export class BoxEngine {
       built: this.board.length > 0,
       built_at: this.universeBuiltAt,
       blocklist_readable: this.exclusions.readable,
+      max_underlyings: this.cfg.maxUnderlyings,
+      max_subscribed_tokens: this.cfg.maxSubscribedTokens,
+      discovering: this.running,
     };
   }
 
@@ -3490,6 +3520,12 @@ export class BoxEngine {
      * it — while the market was shut and nothing was streaming at all.
      */
     const skippedIndicative: string[] = [];
+    /**
+     * Skipped because BOX_MAX_UNDERLYINGS capped the list, kept apart from the token-budget list for
+     * the same reason as the indicative cap above: the two limits are unrelated and reporting them
+     * as one names the wrong number as the constraint.
+     */
+    const skippedForCap: string[] = [];
     /** Underlyings that have a live window after this pass (subscribed or not). */
     const liveWindows = new Set<string>();
     let used = 0;
@@ -3526,7 +3562,9 @@ export class BoxEngine {
 
     for (const [i, item] of ordered.entries()) {
       if (i >= cap && !mustKeep.has(item.symbol)) {
-        skipped.push(item.symbol);
+        // BOX_MAX_UNDERLYINGS, not the token budget. Recorded separately so the operator is told
+        // which setting actually excluded the name.
+        skippedForCap.push(item.symbol);
         continue;
       }
       /*
@@ -3644,6 +3682,7 @@ export class BoxEngine {
     // The forced rebuild (from a strike-level change) has now been applied.
     this.forceWindowRebuild = false;
     this.skippedForBudget = skipped;
+    this.skippedForUnderlyingCap = skippedForCap;
     this.skippedForIndicativeCap = skippedIndicative;
     this.universeBuiltAt = now;
     /*
@@ -6976,6 +7015,17 @@ export class BoxEngine {
       day_pnl: this.computeDayPnl(),
       skipped_for_budget: this.skippedForBudget.length,
       skipped_symbols: this.skippedForBudget.slice(0, 25),
+      /**
+       * Skipped by BOX_MAX_UNDERLYINGS — a DIFFERENT limit from the one above.
+       *
+       * Published separately because they were previously merged, which told the operator that 214
+       * names were outside a 2200-token feed budget that in fact had room for all of them, while the
+       * setting genuinely responsible was never mentioned. `max_underlyings` is echoed so the UI can
+       * name the value to change instead of describing the symptom.
+       */
+      skipped_for_underlying_cap: this.skippedForUnderlyingCap.length,
+      skipped_underlying_cap_symbols: this.skippedForUnderlyingCap.slice(0, 25),
+      max_underlyings: this.cfg.maxUnderlyings,
       /**
        * Left out of the LAST-CLOSE PREVIEW by its own cap
        * (BOX_INDICATIVE_MAX_UNDERLYINGS) — a display limit while the market is

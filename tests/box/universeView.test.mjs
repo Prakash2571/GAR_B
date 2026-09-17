@@ -23,11 +23,34 @@ import assert from "node:assert/strict";
 import {
   BOX_ENTRY_LEG_COUNT,
   judgeAdmissibility,
-  projectUniverse,
+  projectUniverse as projectUniverseRaw,
   summariseUniverse,
 } from "../../dist/box/universeView.js";
 
 const CAPS = { maxOpenLegQuantity: 75, maxGrossOpenLegQuantity: 300 };
+
+/**
+ * Everything observed, nothing skipped — the neutral watch state.
+ *
+ * The cases below are about ADMISSIBILITY and the board∩chains join, which are independent of what
+ * the engine happens to be observing. Defaulting to "all watched" keeps each of those tests about one
+ * thing; the watch semantics get their own section at the end, where the skip sets are set explicitly.
+ */
+const WATCH_ALL = {
+  windows: new Set(),
+  skippedForUnderlyingCap: new Set(),
+  skippedForBudget: new Set(),
+  discovering: true,
+};
+
+/** Project with every board symbol treated as observed, unless the caller says otherwise. */
+function projectUniverse(args) {
+  if (args.watch !== undefined) return projectUniverseRaw(args);
+  return projectUniverseRaw({
+    ...args,
+    watch: { ...WATCH_ALL, windows: new Set(args.board.map((b) => b.symbol)) },
+  });
+}
 
 const chain = (lot, strikes = [100, 200, 300], expiry = "2026-09-24") => ({
   lot_size: lot,
@@ -232,5 +255,142 @@ test("an EXCLUDED and inadmissible name counts once, as excluded", () => {
 
 test("an empty universe summarises to zeroes rather than throwing", () => {
   const s = summariseUniverse([]);
-  assert.deepEqual(s, { total: 0, indices: 0, excluded: 0, watchable: 0, blocked_by_caps: 0 });
+  assert.deepEqual(s, {
+    total: 0,
+    indices: 0,
+    excluded: 0,
+    watchable: 0,
+    blocked_by_caps: 0,
+    watched: 0,
+    eligible_not_watched: 0,
+  });
+});
+
+/* ──────────────── what is ACTUALLY being observed ──────────────── */
+
+/*
+ * WHY THIS SECTION EXISTS.
+ *
+ * `watchable` counts what nothing FORBIDS, and it was briefly the only count reported. That misled in
+ * the sharpest possible way on a real deployment: with `BOX_MAX_UNDERLYINGS=1` and 215 joined names it
+ * said 215 while exactly ONE underlying had a window. Being admissible does not win a name a place in
+ * the universe, so `watched` is taken from the engine's own window map rather than re-derived from the
+ * caps — a second implementation of "who won a place" would be free to disagree with the one that
+ * actually built the windows.
+ */
+
+test("WATCHED IS THE ENGINE'S OWN RECORD, not a re-derivation of admissibility", () => {
+  const rows = projectUniverse({
+    board: [
+      { symbol: "BANKNIFTY", name: "BANKNIFTY", is_index: true },
+      { symbol: "NIFTY", name: "NIFTY", is_index: true },
+      ...board("RELIANCE"),
+    ],
+    chains: new Map([
+      ["BANKNIFTY", chain(75)],
+      ["NIFTY", chain(75)],
+      ["RELIANCE", chain(50)],
+    ]),
+    exclusions: new Map(),
+    caps: CAPS,
+    // Exactly the shape of the live deployment: BOX_MAX_UNDERLYINGS=1 kept the first name only.
+    watch: {
+      windows: new Set(["BANKNIFTY"]),
+      skippedForUnderlyingCap: new Set(["NIFTY", "RELIANCE"]),
+      skippedForBudget: new Set(),
+      discovering: true,
+    },
+  });
+  const by = (s) => rows.find((r) => r.symbol === s);
+  assert.equal(by("BANKNIFTY").watched, true);
+  assert.equal(by("BANKNIFTY").not_watched_reason, null);
+  // Admissible and NOT watched — the combination `watchable` alone could not express.
+  assert.equal(by("NIFTY").admissible, true);
+  assert.equal(by("NIFTY").watched, false);
+  assert.equal(by("NIFTY").not_watched_reason, "underlying_cap");
+
+  const s = summariseUniverse(rows);
+  assert.equal(s.watched, 1, "one window, so one watched — whatever the caps permit");
+  assert.equal(s.watchable, 3, "all three are ELIGIBLE, which is a different question");
+  assert.equal(s.eligible_not_watched, 2, "the gap is reported rather than left to be inferred");
+});
+
+test("the reason names the SETTING responsible, and the token budget is not blamed for the underlying cap", () => {
+  // The defect this fixes: both limits pushed into one list, so the UI told the operator that names
+  // were outside a 2200-token budget which in fact had hundreds of tokens spare.
+  const rows = projectUniverse({
+    board: board("CAPPED", "BUDGETED", "SEEN"),
+    chains: new Map([["CAPPED", chain(50)], ["BUDGETED", chain(50)], ["SEEN", chain(50)]]),
+    exclusions: new Map(),
+    caps: CAPS,
+    watch: {
+      windows: new Set(["SEEN"]),
+      skippedForUnderlyingCap: new Set(["CAPPED"]),
+      skippedForBudget: new Set(["BUDGETED"]),
+      discovering: true,
+    },
+  });
+  const by = (s) => rows.find((r) => r.symbol === s);
+  assert.equal(by("CAPPED").not_watched_reason, "underlying_cap");
+  assert.equal(by("BUDGETED").not_watched_reason, "token_budget");
+  assert.equal(by("SEEN").not_watched_reason, null);
+});
+
+test("the blocklist is reported ahead of either cap, because it explains the absence completely", () => {
+  const rows = projectUniverse({
+    board: board("DECLINED"),
+    chains: new Map([["DECLINED", chain(50)]]),
+    exclusions: new Map([["DECLINED", { reason: "ban period" }]]),
+    caps: CAPS,
+    // Also in the cap list — an excluded name frees its tokens, so both can be true at once.
+    watch: {
+      windows: new Set(),
+      skippedForUnderlyingCap: new Set(["DECLINED"]),
+      skippedForBudget: new Set(),
+      discovering: true,
+    },
+  });
+  assert.equal(rows[0].not_watched_reason, "excluded");
+});
+
+test("a stopped scanner explains an unwatched name only when no cap does", () => {
+  const rows = projectUniverse({
+    board: board("IDLE", "CAPPED"),
+    chains: new Map([["IDLE", chain(50)], ["CAPPED", chain(50)]]),
+    exclusions: new Map(),
+    caps: CAPS,
+    watch: {
+      windows: new Set(),
+      skippedForUnderlyingCap: new Set(["CAPPED"]),
+      skippedForBudget: new Set(),
+      discovering: false,
+    },
+  });
+  const by = (s) => rows.find((r) => r.symbol === s);
+  assert.equal(by("IDLE").not_watched_reason, "discovery_off");
+  assert.equal(by("CAPPED").not_watched_reason, "underlying_cap", "the specific cause wins");
+  assert.equal(summariseUniverse(rows).watched, 0);
+});
+
+test("an EXCLUDED name that still holds a window is counted as watched", () => {
+  // Excluding a name never strands exposure: its legs keep streaming so the monitor can exit it. The
+  // count has to reflect what the feed is really carrying, not what the blocklist would prefer.
+  const rows = projectUniverse({
+    board: board("HASPOSITION"),
+    chains: new Map([["HASPOSITION", chain(50)]]),
+    exclusions: new Map([["HASPOSITION", { reason: "declined mid-position" }]]),
+    caps: CAPS,
+    watch: {
+      windows: new Set(["HASPOSITION"]),
+      skippedForUnderlyingCap: new Set(),
+      skippedForBudget: new Set(),
+      discovering: true,
+    },
+  });
+  assert.equal(rows[0].watched, true);
+  assert.equal(rows[0].not_watched_reason, null);
+  const s = summariseUniverse(rows);
+  assert.equal(s.watched, 1);
+  assert.equal(s.excluded, 1);
+  assert.equal(s.eligible_not_watched, 0, "an excluded name is not 'eligible but unwatched'");
 });

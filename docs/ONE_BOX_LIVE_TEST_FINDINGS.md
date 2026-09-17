@@ -331,6 +331,45 @@ excluded moments earlier from elsewhere, since that is the one direction of erro
 something deliberately declined. Validation is all-or-nothing, so one mistyped name rejects the request
 instead of leaving a half-applied set.
 
+### 9a. `watchable` was not what is watched, and two different caps were reported as one
+
+The first version of this surface published only `watchable` — not excluded and admissible — and a
+picker naturally renders that as "underlyings being watched". It is not. It counts what nothing
+*forbids*, and says nothing about `BOX_MAX_UNDERLYINGS` or the token budget, either of which can leave
+a perfectly eligible name unobserved.
+
+On the live deployment that was maximally misleading: with `BOX_MAX_UNDERLYINGS=1` and 215 joined
+names it reported **215 watchable while exactly one underlying had a window**.
+
+Compounding it, `refreshUniverse` pushed *both* the `BOX_MAX_UNDERLYINGS` cut and the token-budget cut
+into one `skipped` array, published as `skipped_for_budget`. The dashboard therefore announced that 214
+underlyings were "outside the live-feed token budget (2200 instruments)" — while that budget had
+hundreds of tokens to spare and the setting actually responsible was never named. This is the same
+conflation the indicative cap was split out to fix, recurring.
+
+**What changed.**
+
+- Each universe row now carries `watched`, taken from the engine's own window map rather than
+  re-derived from the caps. A second implementation of "who won a place in the universe" would be free
+  to disagree with the one that actually built the windows.
+- `not_watched_reason` names the cause: `excluded`, `underlying_cap`, `token_budget` or
+  `discovery_off`. The blocklist is reported first because it explains the absence completely; the
+  specific cap beats the general `discovery_off`.
+- The summary gained `watched` and `eligible_not_watched`. A non-zero gap means a *cap*, not the
+  market, is deciding what gets looked at.
+- `skipped_for_budget` is now only the token budget. `skipped_for_underlying_cap` and
+  `max_underlyings` are published alongside it, so the UI can name the value to change.
+- An excluded name that still holds a window counts as watched, because its legs keep streaming so the
+  monitor can exit it. The count reflects what the feed carries, not what the blocklist would prefer.
+
+**Two operator consequences of the caps as they are usually configured for a one-box test.** With
+`BOX_LIVE_MAX_OPEN_LEG_QUANTITY=75` and `BOX_LIVE_MAX_GROSS_OPEN_LEG_QUANTITY=300`, only instruments
+whose lot is 75 or less are admissible at all — four legs of 75 exactly fill the gross cap. That is
+index-shaped, so essentially **every single stock shows CAP-BLOCKED**. And with
+`BOX_MAX_UNDERLYINGS=1` the one name kept is the alphabetically first index, **BANKNIFTY** — not NIFTY.
+Watching the whole universe therefore needs `BOX_MAX_UNDERLYINGS=0` *and* per-leg/gross caps sized for
+the largest lot to be traded.
+
 **Still bounded by the token budget.** `BOX_MAX_SUBSCRIBED_TOKENS` caps subscriptions independently. At
 `BOX_STRIKE_LEVEL=1` (7 tokens per underlying) 2200 tokens covers ~314 names, comfortably above the
 joined board; at level 3 (15 tokens) it covers ~146, so a wide universe and a wide strike window cannot
