@@ -85,11 +85,13 @@ import type { BoxQuoteStore } from "./quotes.js";
 import {
   BOX_LEG_ROLES,
   directionSign,
+  isPaperExecutionMode,
   type BoxCandidate,
   type BoxDirection,
   type BoxEntryDecision,
   type BoxEvaluation,
   type BoxExecutionFailureReason,
+  type BoxExecutionRecord,
   type BoxLegEvaluation,
   type BoxLegRole,
   type BoxOptionInstrument,
@@ -227,6 +229,15 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     manager?: BoxOrderManager;
     /** The active broker, for attributing a capital refusal. Diagnostics only. */
     broker?: () => string;
+    /**
+     * A restored record was refused because its execution mode is not this process's.
+     *
+     * NOT diagnostics. A refused exit means exposure this process cannot reduce, which the operator
+     * must be told about — the engine turns this into a `reduction`-scoped readiness blocker. Optional
+     * only so existing wiring and tests construct the gateway unchanged; absent ⇒ the refusal still
+     * happens, it is merely not surfaced.
+     */
+    onExecutionModeMismatch?: (detail: string) => void;
     /** Allocates the Mongo identity before any live intent is created. */
     allocateTradeId?: () => string;
     isTokenWarm?: (token: number) => boolean;
@@ -900,11 +911,86 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     }
   }
 
-  simulateExit(args: Parameters<BoxExecutionSimulator["simulateExit"]>[0]): Promise<BoxExitExecutionResult> {
+  /**
+   * Why this process must not act on this position, or null when it may.
+   *
+   * THE BOUNDARY THAT WAS MISSING. Adoption faithfully records the mode a position was created
+   * under (`positions.ts` documents that it is carried per-position "because the config can differ
+   * from what an ADOPTED position was actually opened under") — and then no exit path ever read it.
+   * The only paper/live fork was the process-wide `this.mode`, so restored state was executed under
+   * whatever the process happened to be configured as today.
+   *
+   * Checked at the GATEWAY rather than only at adoption because this is the last point before a
+   * broker submission, and because the position book must keep holding every position for the
+   * broker-switch guard, the delete guard and the margin totals to stay truthful.
+   */
+  private executionModeMismatch(position: BoxOpenPosition): string | null {
+    const processIsPaper = isPaperExecutionMode(this.mode);
+    const recordIsPaper = isPaperExecutionMode(position.execution_mode);
+    if (processIsPaper === recordIsPaper) return null;
+    return processIsPaper
+      ? `Position ${position.id} was opened in ${position.execution_mode} mode, but this process runs ` +
+        `${this.mode}. Refusing to SIMULATE a close of real broker exposure — it would mark the trade ` +
+        `closed while the real position stayed on. A live process must reduce it.`
+      : `Position ${position.id} was opened in ${position.execution_mode} mode, but this process runs ` +
+        `${this.mode}. Refusing to send REAL orders for a simulated position — they would reduce ` +
+        `whatever genuine exposure happens to share these contracts.`;
+  }
+
+  /**
+   * A refusal record for the non-legging exit path.
+   *
+   * `BoxExecutionRecord` (what {@link BoxExitExecutionResult} carries) is a DIFFERENT shape from the
+   * `PaperLeggingExecutionRecord` that `liveRecord` builds, so the two refusal paths cannot share a
+   * constructor. Nothing was executed, so every measured field is null/0 and `legs` is empty — the
+   * record exists to carry the reason honestly, not to describe a fill that never happened.
+   */
+  private modeMismatchRecord(detectedAt: number, detail: string): BoxExecutionRecord {
+    const sentAt = this.now();
+    return {
+      mode: this.mode,
+      detected_at: detectedAt,
+      order_sent_at: sentAt,
+      executed_at: null,
+      decision_to_fill_ms: null,
+      simulated_decision_ms: Math.max(0, sentAt - detectedAt),
+      simulated_latency_ms: 0,
+      detection_quote_version: null,
+      execution_quote_version: null,
+      detected_net_debit_per_unit: null,
+      executed_net_debit_per_unit: null,
+      detected_gross_edge: null,
+      executed_gross_edge: null,
+      total_slippage: 0,
+      legs: [],
+      filled: false,
+      failure_reason: "execution_mode_mismatch",
+      failure_detail: detail,
+    };
+  }
+
+  async simulateExit(args: Parameters<BoxExecutionSimulator["simulateExit"]>[0]): Promise<BoxExitExecutionResult> {
+    const mismatch = this.executionModeMismatch(args.position);
+    if (mismatch !== null) {
+      this.deps.onExecutionModeMismatch?.(mismatch);
+      return {
+        ok: false,
+        record: this.modeMismatchRecord(args.detectedAt, mismatch),
+        reason: "execution_mode_mismatch",
+        detail: mismatch,
+      };
+    }
     return this.deps.simulator.simulateExit(args);
   }
 
   async simulateLeggingExit(args: Parameters<BoxExecutionSimulator["simulateLeggingExit"]>[0]): ReturnType<BoxExecutionSimulator["simulateLeggingExit"]> {
+    // BEFORE the paper/live fork, deliberately: the fork itself is what made the wrong mode act.
+    const mismatch = this.executionModeMismatch(args.position);
+    if (mismatch !== null) {
+      this.deps.onExecutionModeMismatch?.(mismatch);
+      const record = liveRecord(args.detectedAt, this.now(), [], false, this.deps.cfg, undefined, args.position.id);
+      return { ok: false, record, reason: "execution_mode_mismatch", detail: mismatch };
+    }
     if (this.mode !== "live") return this.deps.simulator.simulateLeggingExit(args);
     const manager = this.requireManager();
     const attemptId = stableAttemptId(args.position.id, args.detectedAt, "EXIT");

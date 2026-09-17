@@ -1830,21 +1830,35 @@ export async function loadBoxExecutionAttempts(limit = 200): Promise<BoxExecutio
   }
 }
 
-/** Attempts that still hold RESIDUAL exposure (resolved:false), newest first. */
+/**
+ * Attempts that still hold RESIDUAL exposure (resolved:false), newest first.
+ *
+ * THROWS on a query failure — deliberately, and this is a behaviour change.
+ *
+ * This function used to `catch { return []; }`, which made three completely different situations
+ * indistinguishable to its one caller: there is no residual exposure; the database is unreachable;
+ * the query was refused. Recovery treated all of them as "nothing outstanding". The consequence was
+ * not merely a missing warning: `flattenResiduals()` clears its own interval the first time it finds
+ * the map empty, so a single spurious `[]` meant the residual rows were never revisited for the whole
+ * life of the process, with the engine reporting zero residual exposure throughout.
+ *
+ * "Unknown" and "none" are different claims and only one of them is safe, so the failure is now the
+ * caller's to handle — see `BoxEngine.reconcileResidualExposure`, which records it, raises a readiness
+ * blocker, refuses new entry and retries.
+ *
+ * `isBoxDbEnabled() === false` still returns `[]`, which is correct rather than unknown: with no
+ * persistence configured there are no durable residuals to find.
+ */
 export async function loadUnresolvedBoxExecutionAttempts(limit = 200): Promise<BoxExecutionAttemptRecord[]> {
   if (!isBoxDbEnabled()) return [];
-  try {
-    // Crash-only rows are quarantined unless this process has established/verified their
-    // uniqueness boundary; ordinary residual attempts remain safe to adopt and work.
-    const sql = isBoxRecoveryPersistenceReady()
-      ? `SELECT * FROM box_execution_attempts WHERE resolved = false ORDER BY resolved_at DESC LIMIT $1`
-      : `SELECT * FROM box_execution_attempts WHERE resolved = false AND candidate_key <> $2 ORDER BY resolved_at DESC LIMIT $1`;
-    const params = isBoxRecoveryPersistenceReady() ? [limit] : [limit, BOX_RECOVERY_KEY];
-    const { rows } = await query(sql, params);
-    return rows.map(rowToAttempt);
-  } catch {
-    return [];
-  }
+  // Crash-only rows are quarantined unless this process has established/verified their
+  // uniqueness boundary; ordinary residual attempts remain safe to adopt and work.
+  const sql = isBoxRecoveryPersistenceReady()
+    ? `SELECT * FROM box_execution_attempts WHERE resolved = false ORDER BY resolved_at DESC LIMIT $1`
+    : `SELECT * FROM box_execution_attempts WHERE resolved = false AND candidate_key <> $2 ORDER BY resolved_at DESC LIMIT $1`;
+  const params = isBoxRecoveryPersistenceReady() ? [limit] : [limit, BOX_RECOVERY_KEY];
+  const { rows } = await query(sql, params);
+  return rows.map(rowToAttempt);
 }
 
 function validatedRecoveryExecutionAttempt(

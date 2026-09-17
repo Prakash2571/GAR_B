@@ -643,7 +643,32 @@ export type BoxExecutionFailureReason =
    * Blocks NEW ENTRY ONLY. Monitoring, exit, residual flattening, reconciliation and recovery
    * all continue — a spent session budget must never be a reason exposure cannot be reduced.
    */
-  | "session_limit_reached";
+  | "session_limit_reached"
+  /**
+   * The RECORD and the PROCESS disagree about whether the fills are real.
+   *
+   * Restored state carries the execution mode it was actually created under
+   * (`IBoxTrade.execution_mode`, `IBoxExecutionAttempt.execution_mode`) precisely so it can be
+   * compared against the running process — but nothing compared them, and the exit/flatten path
+   * forked on the PROCESS mode alone. Both directions were unsafe:
+   *
+   *   live process + paper record — a simulated position drives REAL broker orders. The manager's
+   *                                attributed-position check is keyed by `exchange:tradingsymbol`,
+   *                                so when a genuine live box holds the same contract the paper
+   *                                record's exit passes every side/size test and reduces the LIVE
+   *                                box's exposure.
+   *   paper process + live record — the close is SIMULATED and the row is marked closed while real
+   *                                broker exposure remains. No order is ever sent, and nothing says so.
+   *
+   * Refusing is the safe answer in both directions, because the refusal strands nothing this process
+   * could legitimately have acted on: a paper record has no real exposure to leave behind, and a live
+   * record's real exposure must be reduced by a live process, never simulated away. The refusal is
+   * always accompanied by a `reduction`-scoped readiness blocker, so it can never be silent.
+   *
+   * Compared on the PAPER/LIVE BOUNDARY only (see `isPaperExecutionMode`), never by exact equality —
+   * `paper_touch` and `paper_latency` are freely interchangeable and must stay so.
+   */
+  | "execution_mode_mismatch";
 
 /** One leg's detection → execution comparison. */
 export interface BoxExecutionLeg {
