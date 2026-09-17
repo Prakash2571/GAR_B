@@ -213,6 +213,8 @@
         "active_underlyings",
         "claimed_underlyings",
         "max_open_boxes",
+        "max_open_boxes_all_modes",
+        "box_inventory_held",
         "open_boxes",
         "residual_legs",
         "daily_loss_limit",
@@ -245,7 +247,16 @@
           "type": "array"
         },
         "max_open_boxes": {
-          "type": "number"
+          "type": "number",
+          "description": "BOX_LIVE_MAX_OPEN_BOXES. LIVE ONLY — enforced inside BoxOrderManager, which is constructed only on the live path, and read from a count refreshed only AFTER a position exists. It therefore cannot refuse the second of two entries admitted in the same instant, and a paper rehearsal cannot exercise it at all. Use max_open_boxes_all_modes for the guarantee."
+        },
+        "max_open_boxes_all_modes": {
+          "type": "number",
+          "description": "BOX_MAX_OPEN_BOXES. The MODE-INDEPENDENT total inventory ceiling, enforced in the coordinator's synchronous admission prologue in EVERY execution mode and BEFORE any exposure exists. 0 = unlimited. This is the control that answers 'only one box, on any underlying, in either direction'."
+        },
+        "box_inventory_held": {
+          "type": "number",
+          "description": "What max_open_boxes_all_modes currently counts on the engine side: open positions + unresolved residual attempts + distinct underlyings with unresolved order intents. Can exceed open_boxes while a partial entry is unresolved, because a partial entry that never became a Box is still capital at risk."
         },
         "open_boxes": {
           "type": "number"

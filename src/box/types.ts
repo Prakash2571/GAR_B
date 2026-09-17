@@ -649,6 +649,18 @@ export type BoxExecutionFailureReason =
    */
   | "underlying_excluded"
   /**
+   * `BOX_MAX_OPEN_BOXES` — the MODE-INDEPENDENT inventory ceiling — is already met.
+   *
+   * DELIBERATELY DISTINCT from `underlying_already_active` (which is per-underlying) and from the
+   * live-only open-box guard inside BoxOrderManager (which is read from a count refreshed only after
+   * a position exists, and is invisible in paper). This one is decided in the coordinator's
+   * synchronous admission prologue in EVERY mode, against committed exposure — open positions,
+   * unresolved residuals and intents, in-flight entry claims and uncertain reservation holds.
+   *
+   * Blocks NEW ENTRY ONLY. Nothing about a full inventory is a reason exposure cannot be reduced.
+   */
+  | "box_inventory_limit"
+  /**
    * The armed trading session has consumed its permitted Box lifecycles
    * (`BOX_SESSION_MAX_COMPLETED_TRADES`), or no session is armed.
    *

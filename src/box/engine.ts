@@ -1434,6 +1434,8 @@ export class BoxEngine {
       // OPERATOR BLOCKLIST, enforcement point 2 of 4. Synchronous, so it is legal inside the
       // coordinator's no-await prologue; ENTRY only, so no reduction path can see it.
       underlyingExclusion: (underlying) => this.underlyingExclusionRefusal(underlying),
+      // THE MODE-INDEPENDENT INVENTORY CEILING's durable term. Synchronous.
+      boxInventory: () => this.boxInventoryCount(),
       // The session cycle budget, INTERSECTED with "is the residual picture known?". ENTRY only;
       // every reduction path bypasses it.
       sessionEntryGate: () => this.entryGateVerdict(),
@@ -5119,6 +5121,34 @@ export class BoxEngine {
     return this.session.evaluateEntry(this.recoveryActive());
   }
 
+  /**
+   * COMMITTED BOX EXPOSURE this engine already holds, for `BOX_MAX_OPEN_BOXES`.
+   *
+   * Deliberately NOT just `positions.size`. Three kinds of thing are capital at risk:
+   *
+   *   - an OPEN position — the obvious one;
+   *   - an unresolved RESIDUAL attempt — a partial entry that never became a Box. Counted per
+   *     ATTEMPT rather than per leg, because one failed four-leg entry is one box's worth of
+   *     exposure, not four;
+   *   - an unresolved ORDER INTENT whose underlying could not be attributed — an order we cannot
+   *     place is the last thing to treat as harmless, which is why `activeUnderlyings()` already
+   *     reports it under a sentinel rather than dropping it.
+   *
+   * A ceiling that counted only established positions would happily admit a second Box on top of a
+   * half-filled first one — which is the exact situation an operator who "cannot afford two" most
+   * needs refused.
+   *
+   * Synchronous and allocation-light: it is read inside the coordinator's no-await prologue.
+   */
+  private boxInventoryCount(): number {
+    // Unresolved intents are counted by DISTINCT UNDERLYING, not per order: four orphaned legs of
+    // one box are one box's worth of unknown exposure, and counting them as four would let a single
+    // unreconciled entry lock out trading far more aggressively than the risk warrants. Unattributable
+    // orders keep their sentinel underlying, so they still count as one.
+    const unresolved = new Set(this.unresolvedIntentUnderlyings().map((intent) => intent.underlying));
+    return this.positions.size + this.residualByAttempt.size + unresolved.size;
+  }
+
   /** How many residual legs are still outstanding across all attempts. */
   private residualLegCount(): number {
     let n = 0;
@@ -6350,6 +6380,16 @@ export class BoxEngine {
         })),
         claimed_underlyings: this.coordinator.claimedUnderlyings(),
         max_open_boxes: this.cfg.liveMaxOpenBoxes,
+        /**
+         * The MODE-INDEPENDENT inventory ceiling and what it currently counts.
+         *
+         * Reported separately from `max_open_boxes` because the two are genuinely different controls:
+         * that one is live-only and read after a position exists, this one is enforced at admission in
+         * every mode. `held` counts committed exposure, not just established positions, so it can
+         * exceed `open_boxes` while a partial entry is unresolved.
+         */
+        max_open_boxes_all_modes: this.cfg.maxOpenBoxes,
+        box_inventory_held: this.boxInventoryCount(),
         open_boxes: this.positions.size,
         residual_legs: this.residualLegCount(),
         daily_loss_limit: this.cfg.liveDailyLossLimit,

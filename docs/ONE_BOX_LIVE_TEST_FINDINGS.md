@@ -113,6 +113,59 @@ disabling the panic button. It should be resolved by reading
 
 ---
 
+## 7. The paper rehearsal does NOT exercise the live risk ceilings
+
+This is the most load-bearing finding for anyone who plans to rehearse in paper and then go live on
+the same configuration. Every `BOX_LIVE_*` risk ceiling lives in `BoxOrderManager`, which is
+constructed exactly once — inside `if (this.cfg.executionMode === "live")` (`engine.ts:983`, manager
+at `engine.ts:1123`). No paper mode constructs it, so no paper mode can breach those limits.
+
+**Not exercised in paper:**
+
+| Control | Why unreachable |
+|---|---|
+| `BOX_LIVE_MAX_OPEN_BOXES`, `MAX_RESIDUAL_LEGS`, `DAILY_LOSS_LIMIT`, `REJECT_LIMIT`, `CONSECUTIVE_FAILURE_LIMIT`, `MAX_OPEN_LEG_QUANTITY`, `MAX_GROSS_OPEN_LEG_QUANTITY` | `BoxOrderManager` only — live-only construction |
+| The per-Box ₹ capital cap | only call site is `executionGateway.ts:547`, below the `mode !== "live"` return at `:378`. `BOX_PAPER_MAX_BOX_CAPITAL_RUPEES` is parsed but **enforces nothing** — the status surface already admits this via `max_box_capital_enforced` |
+| Funds cover / margin evidence / stage funding | `evaluateEntryEconomics` opens with `if (this.mode !== "live") return null` |
+| Market-data readiness gate (`feed_unhealthy` per candidate) | `executionGateway.ts:429-475`, live only |
+| Hedge-first transport order and the uncovered-SELL barrier | live only; paper has no transport to order |
+| Real broker rate limiting | via the live adapters; the `live_parity` profile approximates the interval only |
+| Four-leg coherence in the ATOMIC paper modes | the shared policy is called only inside `simulateLeggingEntry` — `paper_touch` / `paper_latency` never reach it |
+| Live circuit-breaker stickiness | `orderManager.ts:4064-4076` |
+
+**Faithfully exercised in every mode** (the coordinator/admission tier is mode-independent): session
+arm + cycle budget, session attempt budget, the operator blocklist, the underlying lock (layers 1a
+and 1b), the four-contract instrument reservations including the LONG/SHORT key collision, the
+per-underlying concurrency budget, the single-lot invariant, post-wait re-validation — and, as of
+this change, **`BOX_MAX_OPEN_BOXES`**.
+
+**To make the rehearsal as close as it can get:** `BOX_EXECUTION_MODE=paper_legging` (the only paper
+mode with the coherence gate and residual-leg mechanics), `BOX_PAPER_EXECUTION_PROFILE=live_parity`
+(never `stress` — it injects synthetic faults and is refused in live), plus `BOX_MAX_OPEN_BOXES=1`,
+`BOX_ONE_ACTIVE_BOX_PER_UNDERLYING=true`, `BOX_MAX_CONCURRENT_PER_UNDERLYING=1` and non-zero values
+for **both** session ceilings.
+
+Even then: treat "paper never breached a limit" as evidence about the admission tier only. The seven
+`BOX_LIVE_*` ceilings will be exercised for the first time with real money.
+
+## 8. LONG vs SHORT on the same strikes
+
+Worth stating precisely, because the intuition is wrong in both directions.
+
+A reservation key is `broker:exchange:tradingsymbol` (`instrumentKey.ts:67-77`) — **no side, no role,
+no direction**. `refsForEntry` varies only the `side` metadata with direction, and `keysOf` discards
+side entirely. So `keysOf(refsForEntry(longBox))` is byte-for-byte identical to
+`keysOf(refsForEntry(shortBox))` for the same four contracts.
+
+Consequence: the two directions **cannot be in flight simultaneously** — the second collides,
+waits, and then either gives up (`price_moved`) or re-validates. But `settle()` **releases** the
+lease on a clean outcome (`executionCoordinator.ts:2042-2056`), so once the first box is established
+the collision is gone, the candidate keys differ (so the duplicate guard misses), and the
+per-underlying budget misses too (it counts in-flight executions only).
+
+What actually stops the opposite direction going on top: `BOX_ONE_ACTIVE_BOX_PER_UNDERLYING`
+(**default `false`**) or, now, `BOX_MAX_OPEN_BOXES`.
+
 ## What this change adds
 
 The operator blocklist (`box_excluded_underlyings`, migration 012). Enforced at four independent
@@ -124,6 +177,34 @@ The operator blocklist (`box_excluded_underlyings`, migration 012). Enforced at 
 | 2 | `coordinateEntry` prologue, before `claim()` | yes — `BOX_EXECUTION_COORDINATOR_ENABLED=false` |
 | 3 | `BoxExecutionSimulator.simulateEntry` / `simulateLeggingEntry` | **no** — every paper mode terminates here |
 | 4 | `CentralBoxExecutionGateway.simulateLeggingEntry` live fork | **no** — live never reaches the simulator |
+
+### `BOX_MAX_OPEN_BOXES` — the mode-independent inventory ceiling
+
+The first global "how many boxes may I hold at once" gate that is enforced in **every** execution
+mode and decided **before** any exposure exists. It sits in the coordinator's synchronous admission
+prologue, immediately before the claim, and counts committed exposure rather than established
+positions:
+
+```
+held = open positions
+     + unresolved residual attempts
+     + distinct underlyings with unresolved order intents   (engine side)
+     + in-flight ENTRY claims                               (coordinator: opportunityId !== null)
+     + reservations held over an uncertain terminal state    (coordinator: holds.size)
+```
+
+Each term is load-bearing. A partial entry that never became a box is still capital at risk. An
+in-flight claim is what closes the same-tick window `BOX_LIVE_MAX_OPEN_BOXES` cannot see. An
+uncertain hold represents exposure that may well exist at the broker — treating it as "not a box" is
+exactly the assumption `retain()` refuses to make. Exit acquisitions live in the same `active` map
+and are deliberately **excluded**, so a closing box never looks like a held one.
+
+`0` = unlimited, so existing deployments are unaffected. Refusals carry
+`reason: "box_inventory_limit"` and are counted as `inventoryLimitRefusals`.
+
+It does **not** replace `BOX_SESSION_MAX_ENTRY_ATTEMPTS`. This bounds what you *hold*; the attempt
+budget bounds what you *try*, including attempts that took real exposure and were unwound and so
+leave no inventory behind. A supervised trial wants both.
 
 Design points that are deliberate rather than incidental:
 

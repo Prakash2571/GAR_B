@@ -150,6 +150,8 @@ export interface CoordinatorMetricsSnapshot {
   duplicateSuppressed: number;
   /** Entries refused because the underlying is on the operator blocklist, or it was unreadable. */
   underlyingExcluded: number;
+  /** Entries refused because `BOX_MAX_OPEN_BOXES` (all modes) was already met. */
+  inventoryLimitRefusals: number;
   expiredWhileWaiting: number;
   revalidationRejected: number;
   revalidationPassed: number;
@@ -274,6 +276,18 @@ export interface CoordinatorDeps {
    * excluded name and an unreadable blocklist. ENTRY ONLY — never consulted on any reduction path.
    */
   underlyingExclusion?: (underlying: string) => { code: string; detail: string } | null;
+  /**
+   * DURABLE-SIDE Box inventory: how much committed exposure the engine already holds.
+   *
+   * Counts open positions PLUS unresolved residual attempts PLUS unresolved order intents — not
+   * merely established positions. A partial entry that never became a Box is still capital at risk,
+   * and a ceiling that ignored it would admit a second Box on top of exposure nobody is counting.
+   *
+   * SYNCHRONOUS BY CONTRACT, like `activeUnderlyings` and `sessionEntryGate`: it is read inside the
+   * prologue that must not yield. The coordinator adds its OWN in-flight claims and uncertain holds
+   * on top, because those are exposure the engine cannot see yet.
+   */
+  boxInventory?: () => number;
   /**
    * CONSUME one entry attempt from the session's ATTEMPT budget, durably.
    *
@@ -411,6 +425,7 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
     underlyingAlreadyActive: 0,
     sessionLimitRefusals: 0,
     underlyingExcluded: 0,
+    inventoryLimitRefusals: 0,
     positionClaimsHeld: 0,
     positionClaimsReleased: 0,
     positionClaimFailures: 0,
@@ -860,6 +875,56 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
           kinds: admission.activity.kinds.join(","),
         });
         return { ok: false, reason: UNDERLYING_ALREADY_ACTIVE_REASON, detail: admission.detail };
+      }
+    }
+
+    // ── TOTAL INVENTORY CEILING (BOX_MAX_OPEN_BOXES) — ALL MODES ───────────────────────
+    //
+    // The only global "how many Boxes may I hold at once" gate that works in paper as well as live,
+    // and the only one decided BEFORE exposure exists.
+    //
+    // WHY IT IS NOT `BOX_LIVE_MAX_OPEN_BOXES`. That guard lives in BoxOrderManager, which is
+    // constructed only on the live path, so (a) no paper rehearsal can exercise it and (b) it reads
+    // a count the engine refreshes only AFTER a position has been created — so it cannot refuse the
+    // second of two entries admitted in the same instant. Both gaps are closed here.
+    //
+    // WHAT IS COUNTED, and why each term is needed:
+    //   engine inventory   — open positions, unresolved residual attempts, unresolved order intents.
+    //                        A partial entry that never became a Box is still capital at risk.
+    //   in-flight claims   — entries past `claim()` but not yet settled. `opportunityId !== null` is
+    //                        what distinguishes an ENTRY claim from an EXIT acquisition, which also
+    //                        lives in `this.active` and must NOT count against an entry ceiling.
+    //   uncertain holds    — reservations retained over an ambiguous terminal state. Treating one as
+    //                        "not a Box" is precisely the assumption `retain()` refuses to make.
+    //
+    // Synchronous and before the claim, so a refusal costs no attempt, no reservation and no hold.
+    //
+    // ENTRY ONLY. A full inventory is never a reason exposure cannot be reduced.
+    const inventoryCeiling = this.deps.cfg.maxOpenBoxes;
+    if (inventoryCeiling > 0) {
+      let entriesInFlight = 0;
+      for (const entry of this.active.values()) if (entry.opportunityId !== null) entriesInFlight++;
+      const engineHeld = this.deps.boxInventory?.() ?? 0;
+      const held = engineHeld + entriesInFlight + this.holds.size;
+      if (held >= inventoryCeiling) {
+        this.stats.inventoryLimitRefusals++;
+        this.log({
+          execution: executionId,
+          broker,
+          underlying: candidate.underlying,
+          status: "suppressed_inventory_limit",
+          held,
+          ceiling: inventoryCeiling,
+        });
+        return {
+          ok: false,
+          reason: "box_inventory_limit",
+          detail:
+            `BOX_MAX_OPEN_BOXES=${inventoryCeiling} is already met (${held} held: ${engineHeld} durable, ` +
+            `${entriesInFlight} entry pipeline(s) in flight, ${this.holds.size} reservation(s) held over an ` +
+            `uncertain outcome), so no further box is entered on any underlying, in either direction. ` +
+            `Exits, reductions and protective cancels are unaffected.`,
+        };
       }
     }
 
@@ -2152,6 +2217,7 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
       reservationConflicts: this.stats.reservationConflicts,
       duplicateSuppressed: this.stats.duplicateSuppressed,
       underlyingExcluded: this.stats.underlyingExcluded,
+      inventoryLimitRefusals: this.stats.inventoryLimitRefusals,
       expiredWhileWaiting: this.stats.expiredWhileWaiting,
       revalidationRejected: this.stats.revalidationRejected,
       revalidationPassed: this.stats.revalidationPassed,
