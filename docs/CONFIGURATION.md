@@ -132,7 +132,7 @@ at the network layer** — the response body is a live trading credential. See
 
 | Variable | Default | Req? | What it does | If wrong |
 | --- | --- | --- | --- | --- |
-| `KITE_TOKEN_BROKER_URL` | `https://calspread.online/api/kite/token` | no | the external CalSpread Zerodha token endpoint. | Wrong URL ⇒ token fetch fails; no Zerodha trading. |
+| `KITE_TOKEN_BROKER_URL` | **(none)** | provider mode | Zerodha token endpoint. NO DEFAULT: it receives a broker access token, so provider mode REFUSES TO START without it. Set only a host you control. | Unset in `provider` mode ⇒ boot refused. Wrong URL ⇒ token fetch fails; no Zerodha trading. |
 | `KITE_TOKEN_BROKER_PASSCODE` | — | yes (Zerodha) | Shared passcode for the external CalSpread token routes. | Unset/wrong ⇒ token fetch rejected. |
 | `KITE_API_KEY` | — | yes (Zerodha) | Zerodha API key. Used by the live order adapter (`src/brokers/zerodha/liveAdapter.ts`) **and** by the in-app login, where it appears in the consent URL and pairs with the access token in the auth header. Public, not a secret. Distinct from `KITE_API_KEY_EXPECTED`. | Unset ⇒ Zerodha live execution throws "KITE_API_KEY is missing"; the in-app login reports "not configured" and `login/start` answers 409. |
 | `KITE_API_KEY_EXPECTED` | — | prod | If set, fetched token's api_key must equal this. | Mismatch ⇒ token rejected as foreign (a safety feature). |
@@ -141,7 +141,7 @@ at the network layer** — the response body is a live trading credential. See
 
 | Variable | Default | Req? | What it does | If wrong |
 | --- | --- | --- | --- | --- |
-| `DHAN_TOKEN_URL` | `https://calspread.online/api/dhan/token` | no | the external CalSpread Dhan token endpoint. | Wrong URL ⇒ no Dhan trading. |
+| `DHAN_TOKEN_URL` | **(none)** | provider mode | Dhan token endpoint. NO DEFAULT, same reasoning as `KITE_TOKEN_BROKER_URL`. | Unset in `provider` mode with Dhan active ⇒ boot refused. Wrong URL ⇒ no Dhan trading. |
 | `DHAN_TOKEN_BROKER_PASSCODE` | — | yes (Dhan) | Shared passcode for the Dhan token route. | Unset/wrong ⇒ token fetch rejected. |
 | `DHAN_API_KEY` | — | yes (Dhan) | Dhan app id. Read by `readDhanCredentials()`; required for Dhan live readiness **and** sent as the id header on both in-app consent calls. | Unset ⇒ Dhan reports "not configured"; Dhan live is blocked and `login/start` answers 409. |
 | `DHAN_API_SECRET` | — | yes (Dhan) | Dhan app **secret**. Same credential check as above, and sent as the secret header on both in-app consent calls. Never leaves the server; never a query parameter. | Unset ⇒ Dhan "not configured"; Dhan live blocked and `login/start` answers 409. |

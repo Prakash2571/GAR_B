@@ -142,10 +142,10 @@ is fenced accordingly:
 | Variable | Meaning | Default |
 | --- | --- | --- |
 | `APP_TIMEZONE` | Must be `Asia/Kolkata`; every day/time decision is an IST decision | `Asia/Kolkata` |
-| `KITE_TOKEN_BROKER_URL` | External CalSpread Zerodha token route | `https://calspread.online/api/kite/token` |
+| `KITE_TOKEN_BROKER_URL` | Zerodha token route — a host YOU control | **(none — provider mode refuses to start without it)** |
 | `KITE_TOKEN_BROKER_PASSCODE` | Passcode for the Zerodha route (own variable) | — |
 | `KITE_API_KEY_EXPECTED` | If set, the returned `api_key` must equal it | — |
-| `DHAN_TOKEN_URL` | External CalSpread Dhan token route | `https://calspread.online/api/dhan/token` |
+| `DHAN_TOKEN_URL` | Dhan token route — a host YOU control | **(none — provider mode refuses to start without it)** |
 | `DHAN_TOKEN_BROKER_PASSCODE` | Passcode for the Dhan route (own variable) | — |
 | `DHAN_CLIENT_ID_EXPECTED` | If set, the returned `client_id` must equal it | — |
 | `BROKER_TOKEN_POLL_START` | IST time to begin each morning's acquisition | `09:00` |
