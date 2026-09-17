@@ -530,6 +530,24 @@ export class BoxEngine {
    */
   private readonly exclusions = new UnderlyingExclusionBook();
   /**
+   * CONFIRMED FILLS THAT ARE NOT YET RECORDED — the gap `BOX_MAX_OPEN_BOXES` would otherwise miss.
+   *
+   * THE WINDOW THIS CLOSES. The coordinator releases its entry claim in `settle()`, which runs as
+   * soon as the inner execution returns. The position is only added to the book later, inside
+   * `openPaperTrade`, and `insertWithRetry` puts a PostgreSQL round trip in between. For those few
+   * milliseconds the four legs are genuinely filled and yet nothing counts them: the claim is gone
+   * and `positions.size` has not moved. A tick arriving in that window could admit a second box.
+   *
+   * The session ATTEMPT budget happens to cover this for a one-attempt trial, but that is a
+   * coincidence of configuration, not a property of the ceiling — an operator who sets
+   * `BOX_MAX_OPEN_BOXES=1` and leaves the attempt budget unlimited would still get two boxes. So the
+   * ceiling closes its own gap: incremented around the whole establishment call, decremented in a
+   * `finally`, so it holds the slot until either the position is in the book or the open provably
+   * failed. Together with the coordinator's in-flight claims this gives continuous coverage from
+   * admission to durable record, with no uncounted interval.
+   */
+  private pendingEstablishments = 0;
+  /**
    * The CONFIGURED gross prefilter (MIN_BOX_GROSS_EDGE), before any gate-driven
    * narrowing. Captured once at construction so applyTuning can re-derive the live
    * prefilter from a fixed baseline instead of clamping the running value, which
@@ -1127,8 +1145,15 @@ export class BoxEngine {
         limits: orderManagerLimitsFromConfig(this.cfg),
         // THE VERIFIED ACCOUNT, read fresh on every decision. A token refresh for the SAME account
         // preserves attribution; a login for a DIFFERENT account is visible immediately and blocks
-        // action on the previous account's intents. Null blocks new entry AND reduction, with a
-        // specific reason, rather than acting unattributed.
+        // action on the previous account's intents.
+        //
+        // NULL BLOCKS NEW ENTRY ONLY — it does NOT block reduction. This comment used to claim it
+        // blocked both, which was wrong and dangerous to believe during an incident: an operator
+        // reading it would conclude the flatten button was dead when the account could not be named.
+        // `exposureReductionBlockReason` deliberately does not consult the account at all (only
+        // `disposed` and a KNOWN-BAD broker session), because `liveBrokerAccount()` can return null
+        // with a healthy trading session and stranding exposure on an identity check is the same
+        // defect that guard exists to prevent.
         brokerAccount: () => this.liveBrokerAccount(),
         controls: { entryEnabled: false, liveOrderEnabled: false, emergencyFlatten: false },
         istDayKey: (at) => this.deps.istDayKey(at),
@@ -1498,7 +1523,21 @@ export class BoxEngine {
       // OPERATOR BLOCKLIST, enforcement point 1 of 4 — the cheapest. Refuses before a reservation is
       // taken or a session attempt is spent, so an excluded name costs nothing at all.
       isUnderlyingExcluded: (underlying) => this.underlyingExclusionRefusal(underlying) !== null,
-      openPaperTrade: (args) => this.openPaperTrade(args),
+      /*
+       * HOLD AN INVENTORY SLOT ACROSS THE WHOLE ESTABLISHMENT, not just until the claim drops.
+       *
+       * The counter is incremented here rather than inside `openPaperTrade` so it brackets the
+       * ENTIRE call including its durable write, and is released in a `finally` so a throw cannot
+       * leak a slot and permanently refuse entry. See `pendingEstablishments`.
+       */
+      openPaperTrade: async (args) => {
+        this.pendingEstablishments++;
+        try {
+          return await this.openPaperTrade(args);
+        } finally {
+          this.pendingEstablishments--;
+        }
+      },
       onExecutionAttempt: (candidate, legging, reason, detail, detectedGrossEdge) =>
         void this.persistExecutionAttempt(candidate, legging, reason, detail, detectedGrossEdge),
       // EXECUTION FUNNEL (Task 8): candidate + qualified stages, from the scanner hot path.
@@ -5130,23 +5169,32 @@ export class BoxEngine {
    *   - an unresolved RESIDUAL attempt — a partial entry that never became a Box. Counted per
    *     ATTEMPT rather than per leg, because one failed four-leg entry is one box's worth of
    *     exposure, not four;
-   *   - an unresolved ORDER INTENT whose underlying could not be attributed — an order we cannot
-   *     place is the last thing to treat as harmless, which is why `activeUnderlyings()` already
-   *     reports it under a sentinel rather than dropping it.
+   *   - a fill that is CONFIRMED but not yet recorded ({@link pendingEstablishments}). See below.
    *
    * A ceiling that counted only established positions would happily admit a second Box on top of a
    * half-filled first one — which is the exact situation an operator who "cannot afford two" most
    * needs refused.
    *
-   * Synchronous and allocation-light: it is read inside the coordinator's no-await prologue.
+   * WHY UNRESOLVED ORDER INTENTS ARE **NOT** COUNTED HERE, having been in the first draft.
+   *
+   * Two reasons, both concrete. (1) Reading them requires `orderManager.status()`, and `status()`
+   * calls `rollTradingDay()` — a MUTATION that resets the daily risk counters and can kick off an
+   * async seed load. This method is read inside the coordinator's no-await prologue on every entry
+   * admission, and the codebase has already paid once for putting `rollTradingDay()` on a guard path
+   * (see the comment in `exposureReductionBlockReason`). (2) It double-counted: an orphaned order
+   * belonging to an OPEN position resolves to that position's underlying, so the same box was counted
+   * twice — once here and once in `positions.size`.
+   *
+   * Nothing is lost by omitting them. An unknown order is not merely *counted* against entry, it
+   * REFUSES entry outright: `BoxOrderManager.entryBlockReason` blocks while `unknownOrders > 0`, and
+   * the readiness surface raises `reconciliation_incomplete` (scope `entry`). Both are strictly
+   * stronger than occupying an inventory slot. In paper there is no order manager and so no orphan
+   * concept at all.
+   *
+   * Synchronous, allocation-free and side-effect-free — which is what the prologue requires.
    */
   private boxInventoryCount(): number {
-    // Unresolved intents are counted by DISTINCT UNDERLYING, not per order: four orphaned legs of
-    // one box are one box's worth of unknown exposure, and counting them as four would let a single
-    // unreconciled entry lock out trading far more aggressively than the risk warrants. Unattributable
-    // orders keep their sentinel underlying, so they still count as one.
-    const unresolved = new Set(this.unresolvedIntentUnderlyings().map((intent) => intent.underlying));
-    return this.positions.size + this.residualByAttempt.size + unresolved.size;
+    return this.positions.size + this.residualByAttempt.size + this.pendingEstablishments;
   }
 
   /** How many residual legs are still outstanding across all attempts. */
@@ -7503,8 +7551,17 @@ export class BoxEngine {
      * attribution. It simply was never handed to the order path.
      *
      * Authentication is still required: an unauthenticated session must not name an account, because
-     * the token that proved it may already have been replaced. Returning null here BLOCKS new live
-     * entry and blocks reduction with a specific reason, rather than proceeding unattributed.
+     * the token that proved it may already have been replaced.
+     *
+     * WHAT NULL ACTUALLY BLOCKS. New live ENTRY, and only that (`BoxOrderManager.entryBlockReason`).
+     * It does NOT block reduction — this comment previously said it blocked both, which was wrong.
+     * The distinction is deliberate and load-bearing: this method requires
+     * `marketData.isAuthenticated()`, a MARKET-DATA property, so it can return null while the trading
+     * session is perfectly healthy (Dhan with `DHAN_DATA_ENABLED=false`; a Zerodha stored-session
+     * adoption that leaves session metadata unset). Making the flatten path depend on that would
+     * strand real exposure on an unrelated feed condition. Account identity is instead enforced where
+     * it constitutes evidence — the send boundary and each durable row — and only ever refuses on
+     * proof of a DIFFERENT account, never on an unknown one.
      */
     if (!this.deps.marketData.isAuthenticated()) return null;
     const account = this.deps.brokerAccountRef?.() ?? null;

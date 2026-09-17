@@ -276,6 +276,33 @@ test("0 means UNLIMITED, so an existing deployment is unaffected", async () => {
   assert.equal(coordinator.metrics().inventoryLimitRefusals, 0);
 });
 
+test("the inventory is read FRESH on every admission, never cached", async () => {
+  // This is what makes the engine's `pendingEstablishments` counter effective. That counter exists to
+  // hold a slot across the window between the coordinator releasing its claim (in `settle()`) and the
+  // engine recording the position (after a PostgreSQL write inside `openPaperTrade`) — during which
+  // the fill is real but nothing else counts it. If the ceiling cached the count at construction, or
+  // per process, the counter could not close that window.
+  const gateway = controllableGateway();
+  const { coordinator, inventory } = makeCoordinator({ gateway, config: { maxOpenBoxes: 1 } });
+
+  const first = boxFor({ underlying: "INFY", k1: 1500, k2: 1600 });
+  const a = coordinator.simulateLeggingEntry({ candidate: first, detection: detectionFor(first) });
+  await settle();
+  gateway.finish(0);
+  assert.equal((await a).ok, true, "the first entry is admitted against an empty inventory");
+
+  // The engine now reports a held slot — this is the state a pending establishment produces.
+  inventory.value = 1;
+
+  const second = boxFor({ underlying: "TCS", k1: 3000, k2: 3100 });
+  const result = await coordinator.simulateLeggingEntry({
+    candidate: second,
+    detection: detectionFor(second),
+  });
+  assert.equal(result.ok, false, "the very next admission must observe the new count");
+  assert.equal(result.reason, "box_inventory_limit");
+});
+
 test("below the ceiling, entry proceeds", async () => {
   const gateway = controllableGateway();
   const { coordinator, inventory } = makeCoordinator({ gateway, config: { maxOpenBoxes: 2 } });
