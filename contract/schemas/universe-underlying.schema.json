@@ -16,7 +16,9 @@
     "excluded_reason",
     "admissible",
     "inadmissible_reason",
-    "inadmissible_detail"
+    "inadmissible_detail",
+    "watched",
+    "not_watched_reason"
   ],
   "properties": {
     "symbol": {
