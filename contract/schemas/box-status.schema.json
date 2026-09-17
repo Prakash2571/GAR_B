@@ -63,6 +63,9 @@
     "day_pnl",
     "skipped_for_budget",
     "skipped_symbols",
+    "skipped_for_underlying_cap",
+    "skipped_underlying_cap_symbols",
+    "max_underlyings",
     "skipped_indicative_cap",
     "skipped_indicative_symbols",
     "indicative_max_underlyings",
@@ -378,13 +381,30 @@
       "type": "object"
     },
     "skipped_for_budget": {
-      "type": "number"
+      "type": "number",
+      "description": "Underlyings left unsubscribed because BOX_MAX_SUBSCRIBED_TOKENS ran out. THIS COUNT IS ONLY THE TOKEN BUDGET. Names cut by BOX_MAX_UNDERLYINGS used to be merged in here, which told operators that (for example) 214 names were outside a 2200-token feed budget that in fact had hundreds of tokens to spare, while the setting genuinely responsible went unnamed. Those now live in skipped_for_underlying_cap."
     },
     "skipped_symbols": {
       "type": "array",
+      "description": "A bounded sample (at most 25) of the token-budget skips above, for display.",
       "items": {
         "type": "string"
       }
+    },
+    "skipped_for_underlying_cap": {
+      "type": "number",
+      "description": "Underlyings left out because BOX_MAX_UNDERLYINGS capped the list — a DIFFERENT limit from skipped_for_budget, with identical symptoms. Reported separately so a client names the setting to change rather than blaming the feed budget. Compare max_underlyings."
+    },
+    "skipped_underlying_cap_symbols": {
+      "type": "array",
+      "description": "A bounded sample (at most 25) of the underlying-cap skips, for display.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "max_underlyings": {
+      "type": "number",
+      "description": "BOX_MAX_UNDERLYINGS as configured. 0 means no cap. Echoed so the UI can state the value responsible for skipped_for_underlying_cap instead of describing the effect."
     },
     "skipped_indicative_cap": {
       "type": "number"

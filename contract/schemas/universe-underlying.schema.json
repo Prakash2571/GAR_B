@@ -69,6 +69,15 @@
     "inadmissible_detail": {
       "type": ["string", "null"],
       "description": "One bounded operator-facing sentence naming the actual numbers involved, or null when admissible. Safe to display verbatim."
+    },
+    "watched": {
+      "type": "boolean",
+      "description": "Whether the engine currently holds a live window for this name — whether it is OBSERVING it. The engine's own record, not a re-derivation of the caps: this is the authoritative answer to 'which underlyings is it actually watching?'. INDEPENDENT of `admissible`, because being tradable does not win a name a place in the universe — a perfectly eligible name can be unobserved because BOX_MAX_UNDERLYINGS or the token budget gave its place to something else. Note that an EXCLUDED name carrying exposure is still watched, because its legs must keep streaming for the monitor to exit it."
+    },
+    "not_watched_reason": {
+      "type": ["string", "null"],
+      "enum": ["excluded", "underlying_cap", "token_budget", "discovery_off", null],
+      "description": "Why this name is not being observed, or null when it is. `excluded` = the operator's blocklist removed it. `underlying_cap` = BOX_MAX_UNDERLYINGS capped the list before reaching it. `token_budget` = BOX_MAX_SUBSCRIBED_TOKENS ran out. `discovery_off` = the scanner is stopped and it carries no exposure. Distinct from `inadmissible_reason`, which is about whether an entry could ever be submitted at all rather than whether the name is currently being looked at."
     }
   }
 }

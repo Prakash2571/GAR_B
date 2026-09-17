@@ -71,6 +71,16 @@ export interface UniverseUnderlying {
   readonly inadmissible_reason: UniverseInadmissibility | null;
   /** One bounded sentence for the UI. Null when admissible. */
   readonly inadmissible_detail: string | null;
+  /**
+   * Whether the engine currently holds a live window for this name — i.e. is OBSERVING it.
+   *
+   * The engine's own record, not a derivation. This is the field that answers "which underlyings is
+   * it actually watching?", and it is separate from `admissible` on purpose: a name can be perfectly
+   * tradable and still unobserved because a cap gave its place to something else.
+   */
+  readonly watched: boolean;
+  /** Why not, when `watched` is false and the name is not excluded. */
+  readonly not_watched_reason: UniverseNotWatched | null;
 }
 
 /** The quantity caps a name is judged against. */
@@ -93,6 +103,35 @@ export interface UniverseChain {
   readonly lot_size: number;
   readonly expiry: string;
   readonly strikes: readonly number[];
+}
+
+/**
+ * Why a name that COULD be entered is nonetheless not being observed right now.
+ *
+ * Distinct from {@link UniverseInadmissibility}, which is about whether an entry could ever be
+ * submitted. A name can be perfectly admissible and still not watched, because being admissible does
+ * not win it a place in the universe.
+ */
+export type UniverseNotWatched =
+  /** The operator blocklist removed it, so no window is built and its tokens return to the budget. */
+  | "excluded"
+  /** BOX_MAX_UNDERLYINGS capped the list before reaching it. */
+  | "underlying_cap"
+  /** BOX_MAX_SUBSCRIBED_TOKENS ran out. */
+  | "token_budget"
+  /** Discovery is off (the scanner is stopped) and it carries no exposure, so nothing wants it. */
+  | "discovery_off";
+
+/** What the engine is actually observing, and why anything else is not. */
+export interface UniverseWatchState {
+  /** Underlyings with a live window after the last pass. GROUND TRUTH, not inferred. */
+  readonly windows: ReadonlySet<string>;
+  /** Names BOX_MAX_UNDERLYINGS cut. */
+  readonly skippedForUnderlyingCap: ReadonlySet<string>;
+  /** Names the token budget cut. */
+  readonly skippedForBudget: ReadonlySet<string>;
+  /** False when the scanner is stopped, which leaves everything unwatched for a third reason. */
+  readonly discovering: boolean;
 }
 
 /** What the operator blocklist says about one symbol. */
@@ -166,6 +205,7 @@ export function projectUniverse(args: {
   readonly chains: ReadonlyMap<string, UniverseChain>;
   readonly exclusions: ReadonlyMap<string, UniverseExclusion>;
   readonly caps: UniverseCaps;
+  readonly watch: UniverseWatchState;
 }): UniverseUnderlying[] {
   const rows: UniverseUnderlying[] = [];
   for (const item of args.board) {
@@ -173,6 +213,7 @@ export function projectUniverse(args: {
     if (chain === undefined) continue;
     const verdict = judgeAdmissibility(chain, args.caps);
     const exclusion = args.exclusions.get(item.symbol);
+    const watched = args.watch.windows.has(item.symbol);
     rows.push({
       symbol: item.symbol,
       name: item.name ?? item.symbol,
@@ -185,6 +226,10 @@ export function projectUniverse(args: {
       admissible: verdict === null,
       inadmissible_reason: verdict?.reason ?? null,
       inadmissible_detail: verdict?.detail ?? null,
+      watched,
+      not_watched_reason: watched
+        ? null
+        : whyNotWatched(item.symbol, exclusion !== undefined, args.watch),
     });
   }
   rows.sort((a, b) => {
@@ -194,15 +239,55 @@ export function projectUniverse(args: {
   return rows;
 }
 
+/**
+ * Why an unwatched name is unwatched.
+ *
+ * Ordered by what the operator can act on. The blocklist comes first because it is their own decision
+ * and explains the absence completely; the two caps come next, most-specific first, because an
+ * operator who has set `BOX_MAX_UNDERLYINGS` deliberately should be told THAT is what bound rather
+ * than being sent to look at a token budget with room to spare. `discovery_off` is last: it is a
+ * whole-engine state, so it only explains a name when nothing more specific does.
+ *
+ * Returns null when nothing known accounts for it — better an honest absence than a guessed cause.
+ */
+function whyNotWatched(
+  symbol: string,
+  excluded: boolean,
+  watch: UniverseWatchState,
+): UniverseNotWatched | null {
+  if (excluded) return "excluded";
+  if (watch.skippedForUnderlyingCap.has(symbol)) return "underlying_cap";
+  if (watch.skippedForBudget.has(symbol)) return "token_budget";
+  if (!watch.discovering) return "discovery_off";
+  return null;
+}
+
 /** Headline counts for the RUN summary, so the UI need not re-derive them. */
 export interface UniverseSummary {
   readonly total: number;
   readonly indices: number;
   readonly excluded: number;
-  /** Not excluded AND admissible — what discovery will actually consider. */
+  /**
+   * Not excluded AND admissible — ELIGIBLE, which is not the same as observed.
+   *
+   * This counts what nothing forbids. It does NOT account for `BOX_MAX_UNDERLYINGS` or the token
+   * budget, both of which can leave an eligible name unobserved, so it is an upper bound on what the
+   * scanner will look at rather than a promise. {@link UniverseSummary.watched} is the actual number.
+   */
   readonly watchable: number;
   /** Not excluded but INADMISSIBLE under the current caps: silently dead without this count. */
   readonly blocked_by_caps: number;
+  /**
+   * How many the engine is ACTUALLY observing right now.
+   *
+   * The number an operator means when they ask what is being watched. It exists because `watchable`
+   * alone was actively misleading: with `BOX_MAX_UNDERLYINGS=1` and 215 joined names, `watchable`
+   * reported 215 while exactly ONE underlying had a window — a field named for what will be watched,
+   * reporting a number that was not it.
+   */
+  readonly watched: number;
+  /** Eligible, not excluded, and STILL not observed — the gap between the two counts above. */
+  readonly eligible_not_watched: number;
 }
 
 export function summariseUniverse(rows: readonly UniverseUnderlying[]): UniverseSummary {
@@ -210,16 +295,31 @@ export function summariseUniverse(rows: readonly UniverseUnderlying[]): Universe
   let excluded = 0;
   let watchable = 0;
   let blockedByCaps = 0;
+  let watched = 0;
+  let eligibleNotWatched = 0;
   for (const row of rows) {
     if (row.is_index) indices++;
+    // Counted over EVERY row, including excluded ones: an excluded name carrying exposure keeps its
+    // window so the monitor can exit it, and hiding that would misreport what the feed is carrying.
+    if (row.watched) watched++;
     if (row.excluded) {
       excluded++;
       continue;
     }
     // Counted only for names the operator has NOT excluded: a name they already declined is not a
     // configuration problem they need told about.
-    if (row.admissible) watchable++;
-    else blockedByCaps++;
+    if (row.admissible) {
+      watchable++;
+      if (!row.watched) eligibleNotWatched++;
+    } else blockedByCaps++;
   }
-  return { total: rows.length, indices, excluded, watchable, blocked_by_caps: blockedByCaps };
+  return {
+    total: rows.length,
+    indices,
+    excluded,
+    watchable,
+    blocked_by_caps: blockedByCaps,
+    watched,
+    eligible_not_watched: eligibleNotWatched,
+  };
 }

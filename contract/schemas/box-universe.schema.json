@@ -5,7 +5,17 @@
   "description": "Every underlying the engine could watch, for the PRE-RUN picker. Source: src/box/engine.ts listUniverse(), projected by src/box/universeView.ts. TOP LEVEL IS CLOSED. Available while the engine is still IDLE, which is the whole point: boot() performs one universe pass, so an operator can decide what to discover instead of inferring it afterwards from whichever opportunities happened to appear. Reading it is cheap and side-effect free — board and chains are already in memory and nothing is fetched. Carries no secret: instrument metadata, the operator's own blocklist notes and two quantity caps, never a token, account, position or price.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["underlyings", "summary", "caps", "built", "built_at", "blocklist_readable"],
+  "required": [
+    "underlyings",
+    "summary",
+    "caps",
+    "built",
+    "built_at",
+    "blocklist_readable",
+    "max_underlyings",
+    "max_subscribed_tokens",
+    "discovering"
+  ],
   "properties": {
     "underlyings": {
       "type": "array",
@@ -18,7 +28,15 @@
       "type": "object",
       "additionalProperties": false,
       "description": "Headline counts, so a client need not re-derive them and cannot derive them differently.",
-      "required": ["total", "indices", "excluded", "watchable", "blocked_by_caps"],
+      "required": [
+        "total",
+        "indices",
+        "excluded",
+        "watchable",
+        "blocked_by_caps",
+        "watched",
+        "eligible_not_watched"
+      ],
       "properties": {
         "total": {
           "type": "number",
@@ -34,11 +52,19 @@
         },
         "watchable": {
           "type": "number",
-          "description": "Not excluded AND admissible — what discovery will actually consider. This is the number to sanity-check before arming; the token budget may still narrow it further at run time (see skipped_for_budget in box-status)."
+          "description": "Not excluded AND admissible — ELIGIBLE, which is NOT the same as observed. It counts what nothing forbids and does NOT account for BOX_MAX_UNDERLYINGS or the token budget, so it is an upper bound rather than a promise. Use `watched` for what is actually being looked at; presenting this as 'underlyings being watched' is wrong and was the defect `watched` was added to correct."
         },
         "blocked_by_caps": {
           "type": "number",
           "description": "NOT excluded but inadmissible under the current quantity caps. The count that matters most: these names look enabled and can never trade. Excluded names are omitted from it deliberately — a name the operator already declined is not a configuration problem they need told about."
+        },
+        "watched": {
+          "type": "number",
+          "description": "How many underlyings the engine is ACTUALLY observing right now — the number an operator means when they ask what is being watched. Counted over every row including excluded ones, because an excluded name carrying exposure keeps its window so the monitor can exit it. This exists because `watchable` alone misled: with BOX_MAX_UNDERLYINGS=1 and 215 joined names it reported 215 while exactly ONE underlying had a window."
+        },
+        "eligible_not_watched": {
+          "type": "number",
+          "description": "Eligible (not excluded, admissible) and STILL not observed — the gap between `watchable` and `watched`. Non-zero means a cap, not a market condition, is deciding what gets looked at; each row's `not_watched_reason` names which one."
         }
       }
     },
@@ -69,6 +95,18 @@
     "blocklist_readable": {
       "type": "boolean",
       "description": "Mirrors `readable` from box-excluded-underlyings. False REFUSES all new entry (readiness blocker underlying_exclusions_unreadable), so a picker must say so rather than presenting a universe that looks armable — every row would be refused regardless of what it shows."
+    },
+    "max_underlyings": {
+      "type": "number",
+      "description": "BOX_MAX_UNDERLYINGS. 0 means no cap. Echoed so a client can NAME the setting that is limiting what gets observed instead of describing the symptom — the most common cause of `eligible_not_watched` being non-zero, and the one that is invisible from the row data alone."
+    },
+    "max_subscribed_tokens": {
+      "type": "number",
+      "description": "BOX_MAX_SUBSCRIBED_TOKENS — the other limit that can leave an eligible name unobserved. Roughly 7 tokens per underlying at BOX_STRIKE_LEVEL=1, 11 at level 2 and 15 at level 3, so widening the strike window narrows how much of the universe fits."
+    },
+    "discovering": {
+      "type": "boolean",
+      "description": "Whether the scanner is running. False means nothing is being observed for that reason alone, whatever the caps allow, and every row's `not_watched_reason` will read `discovery_off` unless something more specific applies."
     }
   }
 }
