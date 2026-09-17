@@ -12,7 +12,10 @@
  * credentials — `pgStatus()` already redacts the target.
  */
 
-import "dotenv/config";
+// Loads the protected secrets file AND the server .env, without overwriting anything already in
+// the process environment. Replaces `dotenv/config` so every entry point resolves configuration
+// through exactly one path. See src/env/load.ts.
+import "../env/boot.js";
 import { closePg, initPg, pgConfigFromEnv, pgStatus } from "../pg/pool.js";
 import { assertMigrated, runMigrations } from "../pg/migrate.js";
 

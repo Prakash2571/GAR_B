@@ -455,6 +455,85 @@ jobs:
           fi
           echo "OK: no committed .env or credential files (only .env.example, which is a template)."
 
+      # ── The PM2 file must reference names, never values ────────────────────────────────────
+      #
+      # `pm2 save` serialises a process's environment into ~/.pm2/dump.pm2 and `pm2 resurrect` restores
+      # it from there, so a secret placed in the ecosystem `env` block would be copied into a second
+      # unaudited file and would survive a rotation. The design keeps credentials in a protected file
+      # the app reads at startup; this step is what stops someone "simplifying" that later.
+      - name: PM2 ecosystem file must contain no credential assignment
+        run: |
+          set -euo pipefail
+          f=ecosystem.config.cjs
+          [ -f "$f" ] || { echo "FAIL: $f is missing."; exit 1; }
+          # Strip comments before scanning, so the explanatory prose (which necessarily NAMES these
+          # variables) cannot trip the check while a real assignment would.
+          code="$(sed -E 's://.*$::' "$f" | sed -E '/\/\*/,/\*\//d')"
+          # A credential assignment means one of these names followed by a colon and a NON-EMPTY string.
+          if printf '%s' "$code" | grep -nE '(SITE_ACCESS_SECRET|BROKER_TOKEN_(ENCRYPTION|OLD|NEW)_KEY|TOKEN_EXPOSURE_KEY|DATABASE_URL|MONGODB_URI|KITE_API_(KEY|SECRET)|DHAN_API_(KEY|SECRET)|[A-Z_]*PASSCODE|[A-Z_]*PASSWORD)[[:space:]]*:[[:space:]]*["'"'"'][^"'"'"']'; then
+            echo "FAIL: ecosystem.config.cjs assigns a credential. Secrets must live in the protected"
+            echo "      secrets file the app reads at startup (src/env/load.ts), never in a PM2 file"
+            echo "      that 'pm2 save' will copy into ~/.pm2/dump.pm2."
+            exit 1
+          fi
+          echo "OK: ecosystem.config.cjs contains no credential assignment."
+
+      # ── No workflow may print a secret ─────────────────────────────────────────────────────
+      #
+      # Two specific footguns, both of which have leaked credentials in real projects:
+      #   `echo "${{ secrets.X }}"`  puts the value in the log AND in the runner's process table.
+      #   `set -x` / `bash -x`       traces expanded variables, dumping every secret a step touched.
+      - name: No workflow may echo a secret or enable shell tracing
+        run: |
+          set -euo pipefail
+          fail=0
+          for wf in .github/workflows/*.yml; do
+            # COMMENT LINES ARE STRIPPED FIRST. The prose in these workflows has to be able to name the
+            # very footguns it forbids (this check's own comment above contains a literal `echo` of a
+            # secret expression as the example of what not to do). Scanning raw text would make the
+            # documentation of a rule violate the rule.
+            code="$(grep -vE '^[[:space:]]*#' "$wf" || true)"
+            # `echo`/`printf` of a secrets expression on the same line.
+            if printf '%s\n' "$code" | grep -nE '(echo|printf)[^#]*\$\{\{[[:space:]]*secrets\.'; then
+              echo "FAIL: ${wf} prints a secret expression."; fail=1
+            fi
+            # Shell tracing anywhere in a workflow that handles secrets.
+            if printf '%s\n' "$code" | grep -nE '^[[:space:]]*(set -[a-z]*x|bash -[a-z]*x)'; then
+              echo "FAIL: ${wf} enables shell tracing, which prints expanded secrets."; fail=1
+            fi
+            # `env`/`printenv` dumped wholesale.
+            if printf '%s\n' "$code" | grep -nE '^[[:space:]]*(env|printenv)[[:space:]]*$'; then
+              echo "FAIL: ${wf} dumps the whole environment."; fail=1
+            fi
+          done
+          if [ "$fail" -ne 0 ]; then exit 1; fi
+          echo "OK: no workflow echoes a secret, traces the shell, or dumps the environment."
+
+      # ── Deployment must never overwrite the operational .env ───────────────────────────────
+      #
+      # The server .env holds risk limits, feed windows and the execution mode — state an operator
+      # tuned for a live system. A deploy step that recreated it from a template would silently reset
+      # all of it, and the symptom would be a trading session running on defaults nobody chose.
+      - name: Deployment scripts must not overwrite or delete the server .env
+        run: |
+          set -euo pipefail
+          fail=0
+          for f in start.sh .github/workflows/*.yml; do
+            [ -f "$f" ] || continue
+            code="$(grep -vE '^[[:space:]]*#' "$f" || true)"
+            if printf '%s' "$code" | grep -nE '(cp|mv|install)[^|;&]*\.env\.example[^|;&]*\.env([^.]|$)'; then
+              echo "FAIL: ${f} copies .env.example over .env."; fail=1
+            fi
+            if printf '%s' "$code" | grep -nE 'rm[[:space:]]+(-[a-zA-Z]+[[:space:]]+)*[^|;&]*(^|/|[[:space:]])\.env([[:space:]]|$)'; then
+              echo "FAIL: ${f} deletes a .env."; fail=1
+            fi
+            if printf '%s' "$code" | grep -nE '>[[:space:]]*"?[^"]*/?\.env"?([[:space:]]|$)'; then
+              echo "FAIL: ${f} redirects output over a .env."; fail=1
+            fi
+          done
+          if [ "$fail" -ne 0 ]; then exit 1; fi
+          echo "OK: no deployment script overwrites, truncates or deletes the server .env."
+
   # ── 6. No live broker hostnames in executable test code ─────────────────────────────────
   #
   # Node-independent STATIC backstop to the runtime egress guard in job `test`. Runs

@@ -36,11 +36,19 @@
  * durable recovery path adopts them on restart. See `src/shutdown.ts`.
  */
 
-import "dotenv/config";
+// FIRST IMPORT, AND IT MUST STAY FIRST. This replaces `import "dotenv/config"` and loads the protected
+// secrets file plus the server .env into process.env without overwriting anything already set. It has
+// to be a bare side-effecting import rather than a call in the body below: `src/kite.ts` (and others)
+// resolve env vars in module-level IIFEs, which run during import evaluation — before this file's
+// first statement. See src/env/boot.ts.
+import "./env/boot.js";
 import express from "express";
 import type { Request, Response } from "express";
 
 import { loadAppConfig, boolOr, ConfigError } from "./config.js";
+import { environmentLoadReport } from "./env/boot.js";
+import { renderEnvDiagnostics } from "./env/diagnostics.js";
+import { assertEnvironmentValid, EnvValidationError } from "./env/validate.js";
 import { closePg, initPg, isPgReady, pgConfigFromEnv, pgStatus, query } from "./pg/pool.js";
 import { assertMigrated, listMigrationFiles, runMigrations } from "./pg/migrate.js";
 
@@ -121,21 +129,47 @@ try {
   throw err;
 }
 
+/*
+ * ENVIRONMENT VALIDATION — credentials and the live-enable gates, BEFORE the socket binds.
+ *
+ * Deliberately here rather than inside an import: a credential problem must be reported through the
+ * same fatal-error path as a configuration problem, in the same format, with the WHOLE list in one
+ * pass. An exception thrown during module evaluation would arrive before this reporting exists.
+ *
+ * MODE-AWARE. Paper development requires no broker credential and keeps booting. Live execution
+ * refuses to start with an incomplete set, instead of discovering the gap at the first token write —
+ * which used to happen AFTER a successful broker login, mid-session. See src/env/validate.ts.
+ */
+let envValidation: ReturnType<typeof assertEnvironmentValid>;
+try {
+  envValidation = assertEnvironmentValid();
+} catch (err) {
+  if (err instanceof EnvValidationError) {
+    console.error("[FATAL] GTS Algo Research refuses to start with an incomplete environment.");
+    for (const p of err.problems) console.error(`  - ${p}`);
+    console.error(
+      "  Every line above names a VARIABLE, never a value. Fix the protected secrets file " +
+        "(default /etc/gts/secrets.env, chmod 600) or the server .env, then restart. " +
+        "See docs/SECRETS_AND_CONFIG.md.",
+    );
+    process.exit(1);
+  }
+  throw err;
+}
+
+// Load problems (a group-readable secrets file, a credential sitting in .env) are NOT fatal: they are
+// reported loudly every start so they cannot become permanent, while the process stays diagnosable.
+for (const problem of environmentLoadReport()?.problems ?? []) {
+  console.error(`[Config] ${problem}`);
+}
+for (const warning of envValidation.warnings) {
+  console.error(`[Config] ${warning}`);
+}
+
 const accessSession: AccessSessionConfig = {
   siteAccessSecret: process.env.SITE_ACCESS_SECRET,
   ttlHours: config.siteSessionTtlHours,
 };
-
-if (!accessSession.siteAccessSecret) {
-  // Not fatal, deliberately: the gate FAILS CLOSED (every protected route 401s and
-  // verify can never succeed), so an operator who forgot the secret gets a process
-  // that is safe and diagnosable rather than one that will not boot at all.
-  console.error(
-    "[Access] SITE_ACCESS_SECRET is not set. The gate is FAIL CLOSED: every /api/box/*, " +
-      "/api/broker/*, /api/runtime/status and /api/export/status request will return 401 " +
-      "and no passcode will be accepted. An unset secret NEVER means 'no passcode required'.",
-  );
-}
 
 /**
  * The two independent live-trading DEPLOYMENT gates, read once and reported once.
@@ -1160,6 +1194,19 @@ const httpServer = app.listen(config.port, () => {
       `ZERODHA_LIVE_TRADING_ENABLED=${zerodhaLiveTradingEnabled} DHAN_LIVE_TRADING_ENABLED=${dhanLiveTradingEnabled} ` +
       `— runtime live controls always start DISARMED.`,
   );
+  /*
+   * THE CONFIGURATION REPORT. Credentials appear as `configured` / `missing` and nothing else; a DSN
+   * additionally shows host/port/database, because "which database is this pointed at?" is an
+   * operational question and the host is not the credential. Operational limits show their real
+   * values, which is the whole point — this is the check that catches a `.env` that never got applied.
+   */
+  for (const line of renderEnvDiagnostics({
+    target: process.env as Record<string, string | undefined>,
+    load: environmentLoadReport(),
+    validation: envValidation,
+  })) {
+    console.log(line);
+  }
   void boot()
     .then(() => {
       // Readiness flips to `ready` EXACTLY ONCE, only after every boot step —

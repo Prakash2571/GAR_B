@@ -14,7 +14,25 @@
 // rely on the durable tier for cross-process safety — do that as a deliberate,
 // tested change, not by flipping `exec_mode` to "cluster".
 //
-// NO SECRETS HERE. All configuration comes from the process environment / .env.
+// NO SECRETS HERE, AND THERE IS A REASON BEYOND TIDINESS.
+//
+// `pm2 save` serialises the running process's environment into ~/.pm2/dump.pm2 so `pm2 resurrect` can
+// restore it after a reboot. Any secret placed in the `env` block below would therefore be written in
+// clear text into a SECOND file whose permissions nobody audits, and would be restored from that copy
+// rather than from the authoritative one — so a rotated key would leave its predecessor live in the
+// dump. That is not a hypothetical: it is what makes "just put it in the ecosystem file" wrong.
+//
+// HOW CREDENTIALS ACTUALLY REACH THE PROCESS
+//
+// The backend reads them itself, on every process start, from a protected file (default
+// /etc/gts/secrets.env, mode 0600) — see src/env/boot.ts and src/env/load.ts. Because the read happens
+// at startup rather than being inherited from whoever launched PM2, credentials survive all of:
+//
+//     pm2 restart · pm2 reload · a crash auto-restart · pm2 save + pm2 resurrect · a server reboot
+//
+// and they do NOT depend on the SSH/deploy session that last touched the machine still existing.
+// Operational (non-secret) BOX configuration comes from the repo-local .env, read in the same pass at
+// lower precedence. Nothing needs to be listed here for either to work.
 
 module.exports = {
   apps: [
@@ -58,6 +76,18 @@ module.exports = {
 
       env: {
         NODE_ENV: "production",
+
+        // The PATH to the secrets file — never its contents. A path is not a credential, so it is
+        // safe both to commit and to let `pm2 save` write into the dump.
+        //
+        // Left commented out deliberately: the default (/etc/gts/secrets.env) is compiled into the
+        // application, so the standard layout survives a reboot with no configuration at all. Set this
+        // ONLY if you moved the file — and set it HERE rather than in .env, because the loader reads
+        // this variable from the real process environment before any file is parsed (a file cannot name
+        // the file that has to be read to find it). If you move the file and set the path only in your
+        // shell, `pm2 resurrect` after a reboot will look in the default location and find nothing.
+        //
+        // GTS_SECRETS_FILE: "/etc/gts/secrets.env",
       },
     },
   ],

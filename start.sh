@@ -85,6 +85,18 @@ HEALTH_TIMEOUT_SECS="${HEALTH_TIMEOUT_SECS:-180}"
 LOG_DIR="${LOG_DIR:-/var/log/gts}"
 GIT_REMOTE="${GIT_REMOTE:-origin}"
 
+# The PROTECTED SECRETS FILE — credentials only, mode 0600, deliberately OUTSIDE the repository.
+#
+# Outside because a path inside the working tree is one `git add -A` away from being committed and
+# would be destroyed by a deploy that re-clones. This is the file that makes credentials survive
+# `pm2 restart`, a crash restart, `pm2 resurrect` and a reboot: the backend re-reads it on every
+# process start, so nothing depends on an SSH session still being open.
+#
+# Exported as GTS_SECRETS_FILE so the backend and the effective-config preload resolve the SAME path
+# this script validated. Override in deploy.env for a container or a non-standard layout.
+SECRETS_FILE="${GTS_SECRETS_FILE:-${SECRETS_FILE:-/etc/gts/secrets.env}}"
+export GTS_SECRETS_FILE="$SECRETS_FILE"
+
 DRY_RUN=0
 SKIP_PULL=0
 SKIP_BACKUP=0
@@ -283,8 +295,16 @@ if ! (( FRONTEND_ONLY )); then
   [[ -f "$GAR_B_DIR/.env" ]] || die "missing ${GAR_B_DIR}/.env — the release cannot validate config or reach the database"
 fi
 
-# `.env` supplies DATABASE_URL and PORT. index.ts and migrate.ts load it themselves via
-# `dotenv/config`, but effectiveConfig.js does NOT, and neither does pg_dump.
+# CONFIGURATION COMES FROM TWO FILES, and this script must look in both.
+#
+#   ${SECRETS_FILE}  credentials only (DATABASE_URL, broker keys, SITE_ACCESS_SECRET). Mode 0600,
+#                    outside the repo so a deploy cannot destroy it and `git add -A` cannot commit it.
+#   ${GAR_B_DIR}/.env  operational BOX configuration (risk limits, feed windows, execution mode).
+#
+# The backend reads BOTH itself at startup (src/env/boot.ts, precedence: process env > secrets file >
+# .env > default). This script needs only DATABASE_URL (for pg_dump and the reachability probe) and
+# PORT, so it looks for each in the secrets file first and then in .env — matching the app's order, so
+# the release validates against the same value the app will use.
 #
 # IT IS PARSED, NOT SOURCED. `. .env` would run the file as shell: a value containing `<`, `&`,
 # backticks or `$(...)` either breaks the release or executes on this host, and a real .env is full
@@ -310,8 +330,8 @@ try {
 NODE
 }
 
-read_env() {
-  ENV_FILE="$GAR_B_DIR/.env" ENV_KEY="$1" node <<'NODE'
+read_env_file() {
+  ENV_FILE="$1" ENV_KEY="$2" node <<'NODE'
 const fs = require("node:fs");
 const key = process.env.ENV_KEY;
 let value = "";
@@ -331,15 +351,49 @@ process.stdout.write(value);
 NODE
 }
 
+# Look one key up in the secrets file first, then .env — the SAME precedence the app applies, so this
+# script can never validate against a different value than the one that will be in force.
+# It writes the value to stdout for capture and NEVER to the log.
+read_env() {
+  local key="$1" value=""
+  if [[ -f "$SECRETS_FILE" && -r "$SECRETS_FILE" ]]; then
+    value="$(read_env_file "$SECRETS_FILE" "$key")"
+  fi
+  if [[ -z "$value" && -f "$GAR_B_DIR/.env" ]]; then
+    value="$(read_env_file "$GAR_B_DIR/.env" "$key")"
+  fi
+  printf '%s' "$value"
+}
+
+# ── The protected secrets file ───────────────────────────────────────────────────────────────
+#
+# Checked for MODE, not just presence. The backend REFUSES to read a secrets file that is readable
+# beyond its owner (src/env/load.ts) — so a 0644 file means the app boots with no credentials at all,
+# which in live mode is a startup failure. Catching it here turns that into one clear line during the
+# release instead of a puzzling fatal after restart.
+if ! (( FRONTEND_ONLY )); then
+  if [[ -e "$SECRETS_FILE" ]]; then
+    secrets_mode="$(stat -c '%a' "$SECRETS_FILE" 2>/dev/null || stat -f '%Lp' "$SECRETS_FILE" 2>/dev/null || echo '')"
+    if [[ -n "$secrets_mode" ]] && (( 8#${secrets_mode} & 8#077 )); then
+      die "${SECRETS_FILE} is mode 0${secrets_mode}, readable beyond its owner. The backend will REFUSE
+    to read it and will start with NO credentials. Fix with:  sudo chmod 600 ${SECRETS_FILE}
+    Then assume the contents were exposed and rotate them."
+    fi
+    ok "secrets file ${SECRETS_FILE} present, mode 0${secrets_mode:-unknown}"
+  else
+    warn "no secrets file at ${SECRETS_FILE} — credentials must then come from .env or the process
+    environment. Live startup will FAIL without broker credentials. See docs/SECRETS_AND_CONFIG.md."
+  fi
+fi
+
 DATABASE_URL=""
 PORT=""
-if [[ -f "$GAR_B_DIR/.env" ]]; then
-  PORT="$(read_env PORT)"
-  if ! (( FRONTEND_ONLY )); then
-    DATABASE_URL="$(read_env DATABASE_URL)"
-    [[ -n "$DATABASE_URL" ]] || die "DATABASE_URL is not set in ${GAR_B_DIR}/.env"
-    export DATABASE_URL
-  fi
+PORT="$(read_env PORT)"
+if ! (( FRONTEND_ONLY )); then
+  DATABASE_URL="$(read_env DATABASE_URL)"
+  [[ -n "$DATABASE_URL" ]] || die "DATABASE_URL is set in neither ${SECRETS_FILE} nor ${GAR_B_DIR}/.env.
+    It is a credential (it carries the database password), so it belongs in the secrets file."
+  export DATABASE_URL
 fi
 PORT="${PORT:-3001}"
 HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:${PORT}/api/health}"
@@ -804,16 +858,18 @@ fi
 if (( FRONTEND_ONLY )); then
   log "--frontend-only: the running backend keeps the configuration it booted with"
 elif (( DRY_RUN )); then
-  printf '%s      would run:%s node dist/box/effectiveConfig.js\n' "$C_DIM" "$C_RESET"
+  printf '%s      would run:%s node --import ./dist/env/boot.js dist/box/effectiveConfig.js\n' "$C_DIM" "$C_RESET"
 else
-  # `-r dotenv/config` is how index.ts gets its environment; effectiveConfig.js has no dotenv import
-  # of its own, so the same loader is applied here rather than re-implementing .env resolution.
-  ( cd "$GAR_B_DIR" && node -r dotenv/config dist/box/effectiveConfig.js ) \
+  # `--import ./dist/env/boot.js` is how index.ts gets its environment (protected secrets file, then
+  # .env, neither overriding the process environment). effectiveConfig.js has no such import of its own
+  # because it is also a library imported by tests, so the loader is applied here instead of
+  # re-implementing .env resolution. `--import` not `-r`: the loader is ESM.
+  ( cd "$GAR_B_DIR" && node --import ./dist/env/boot.js dist/box/effectiveConfig.js ) \
     || die "effective configuration is invalid — the backend would not boot"
 
   # Report the safety-relevant state WITHOUT changing it. This script never arms anything.
   effective_json="$(mktemp)"
-  ( cd "$GAR_B_DIR" && node -r dotenv/config dist/box/effectiveConfig.js --json ) > "$effective_json"
+  ( cd "$GAR_B_DIR" && node --import ./dist/env/boot.js dist/box/effectiveConfig.js --json ) > "$effective_json"
   EFFECTIVE_JSON="$effective_json" node <<'NODE'
 const report = JSON.parse(require("node:fs").readFileSync(process.env.EFFECTIVE_JSON, "utf8"));
 const byEnv = new Map(report.values.map((v) => [v.envVar, v]));

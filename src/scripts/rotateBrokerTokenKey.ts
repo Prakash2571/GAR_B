@@ -25,6 +25,12 @@
  * IT PRINTS NO TOKEN MATERIAL. Only counts, broker names and pass/fail.
  */
 
+// FIRST IMPORT. This script reads BROKER_TOKEN_OLD_KEY, BROKER_TOKEN_NEW_KEY and DATABASE_URL, and
+// until now loaded NO env file at all — unlike every other script, it had no `dotenv/config`. Run as
+// `npm run rotate:broker-token-key` it therefore saw whatever was already exported and reported the
+// keys as unset, which for a key-rotation tool is the worst possible time to be confusing. Loading the
+// protected secrets file here is the fix; the keys can still be exported inline to override it.
+import "../env/boot.js";
 import { initPg, closePg, withTx, pgConfigFromEnv } from "../pg/pool.js";
 import { decodeEncryptionKey, openToken, sealToken, type SealedToken, type TokenAad } from "../brokerState/tokenCrypto.js";
 
