@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "box-universe.schema.json",
+  "title": "GET /api/box/universe (200)",
+  "description": "Every underlying the engine could watch, for the PRE-RUN picker. Source: src/box/engine.ts listUniverse(), projected by src/box/universeView.ts. TOP LEVEL IS CLOSED. Available while the engine is still IDLE, which is the whole point: boot() performs one universe pass, so an operator can decide what to discover instead of inferring it afterwards from whichever opportunities happened to appear. Reading it is cheap and side-effect free — board and chains are already in memory and nothing is fetched. Carries no secret: instrument metadata, the operator's own blocklist notes and two quantity caps, never a token, account, position or price.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["underlyings", "summary", "caps", "built", "built_at", "blocklist_readable"],
+  "properties": {
+    "underlyings": {
+      "type": "array",
+      "description": "Indices first, then alphabetical — deliberately the same order prioritiseUniverse applies when the token budget binds, so the list an operator reads is the order the engine will actually select in. A picker sorted differently from the selector would quietly mislead about which names survive a budget squeeze.",
+      "items": {
+        "$ref": "universe-underlying.schema.json"
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Headline counts, so a client need not re-derive them and cannot derive them differently.",
+      "required": ["total", "indices", "excluded", "watchable", "blocked_by_caps"],
+      "properties": {
+        "total": {
+          "type": "number",
+          "description": "Rows in `underlyings`."
+        },
+        "indices": {
+          "type": "number",
+          "description": "How many of those are indices rather than single stocks."
+        },
+        "excluded": {
+          "type": "number",
+          "description": "On the operator blocklist. Counted regardless of admissibility."
+        },
+        "watchable": {
+          "type": "number",
+          "description": "Not excluded AND admissible — what discovery will actually consider. This is the number to sanity-check before arming; the token budget may still narrow it further at run time (see skipped_for_budget in box-status)."
+        },
+        "blocked_by_caps": {
+          "type": "number",
+          "description": "NOT excluded but inadmissible under the current quantity caps. The count that matters most: these names look enabled and can never trade. Excluded names are omitted from it deliberately — a name the operator already declined is not a configuration problem they need told about."
+        }
+      }
+    },
+    "caps": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The quantity caps every row was judged against, echoed so a client can explain a verdict without reading configuration it has no access to. 0 means no limit.",
+      "required": ["max_open_leg_quantity", "max_gross_open_leg_quantity"],
+      "properties": {
+        "max_open_leg_quantity": {
+          "type": "number",
+          "description": "BOX_LIVE_MAX_OPEN_LEG_QUANTITY — units permitted on a single order leg. ONE global number against F&O lot sizes that span orders of magnitude, which is why per-row admissibility has to be computed at all."
+        },
+        "max_gross_open_leg_quantity": {
+          "type": "number",
+          "description": "BOX_LIVE_MAX_GROSS_OPEN_LEG_QUANTITY — units permitted across all open legs. A box needs four legs of one lot, so this binds at a quarter of its face value per box."
+        }
+      }
+    },
+    "built": {
+      "type": "boolean",
+      "description": "Whether a universe pass has produced a board yet. False with an empty `underlyings` means DISCOVERY HAS NOT RUN, not that the universe is empty — without this field an empty list at boot reads as a broken instrument master."
+    },
+    "built_at": {
+      "type": ["number", "null"],
+      "description": "Epoch milliseconds of the last universe pass, or null when none has completed. Same clock as universe_built_at in box-status."
+    },
+    "blocklist_readable": {
+      "type": "boolean",
+      "description": "Mirrors `readable` from box-excluded-underlyings. False REFUSES all new entry (readiness blocker underlying_exclusions_unreadable), so a picker must say so rather than presenting a universe that looks armable — every row would be refused regardless of what it shows."
+    }
+  }
+}

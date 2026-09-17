@@ -64,6 +64,12 @@ import {
   validateExclusionInput,
   type UnderlyingExclusion,
 } from "./underlyingExclusions.js";
+import {
+  projectUniverse,
+  summariseUniverse,
+  type UniverseSummary,
+  type UniverseUnderlying,
+} from "./universeView.js";
 import { BoxTradingSessionManager } from "./tradingSessionStore.js";
 import { BoxExecutionSimulator } from "./executionSimulator.js";
 import { createExecutionClock, type ExecutionClock } from "./executionClock.js";
@@ -199,6 +205,7 @@ import {
   loadBoxExcludedUnderlyings,
   saveBoxExcludedUnderlying,
   deleteBoxExcludedUnderlying,
+  applyBoxExcludedUnderlyingsBulk,
   loadBoxSettings,
   loadBoxTradingSession,
   loadFlatBoxTradeIds,
@@ -2192,6 +2199,182 @@ export class BoxEngine {
 
     await this.applyExclusionChange();
     return { ok: true, removed, symbol: parsed.symbol };
+  }
+
+  /* ------------------------- the tradable universe ------------------------- */
+
+  /**
+   * THE JOINED UNIVERSE, for the pre-run picker.
+   *
+   * Read-only and cheap: `board` and `chains` are already in memory, and `boot()` performs exactly one
+   * universe pass, so this is populated BEFORE the operator presses RUN. That timing is the whole point
+   * — a picker that only worked after discovery started could not be used to decide what to discover.
+   *
+   * Every row carries whether the name could trade AT ALL under the current quantity caps. With one
+   * chosen underlying that question was trivial (set the cap to its lot); across the whole F&O universe
+   * it is not, because lot sizes span orders of magnitude and one global cap cannot fit them all. A name
+   * above the cap is not unlikely to trade, it CANNOT — and without this projection that fact only
+   * surfaces as a deep entry-path refusal that reads like an execution fault.
+   */
+  listUniverse(): {
+    underlyings: UniverseUnderlying[];
+    summary: UniverseSummary;
+    caps: { max_open_leg_quantity: number; max_gross_open_leg_quantity: number };
+    /** False when no universe pass has produced a board yet, so an empty list is not read as "none". */
+    built: boolean;
+    built_at: number | null;
+    /** The blocklist's own readability, since an unreadable list refuses entry regardless of this view. */
+    blocklist_readable: boolean;
+  } {
+    const exclusions = new Map(
+      this.exclusions.list().map((e) => [e.symbol, { reason: e.reason }] as const),
+    );
+    const caps = {
+      maxOpenLegQuantity: this.cfg.liveMaxOpenLegQuantity,
+      maxGrossOpenLegQuantity: this.cfg.liveMaxGrossOpenLegQuantity,
+    };
+    const underlyings = projectUniverse({
+      board: this.board,
+      chains: this.chains,
+      exclusions,
+      caps,
+    });
+    return {
+      underlyings,
+      summary: summariseUniverse(underlyings),
+      caps: {
+        max_open_leg_quantity: caps.maxOpenLegQuantity,
+        max_gross_open_leg_quantity: caps.maxGrossOpenLegQuantity,
+      },
+      built: this.board.length > 0,
+      built_at: this.universeBuiltAt,
+      blocklist_readable: this.exclusions.readable,
+    };
+  }
+
+  /**
+   * ADMIN control: apply MANY blocklist changes at once, with ONE universe rebuild.
+   *
+   * The per-symbol mutators each rebuild the entire universe, which is correct for a single change and
+   * unusable for a hundred: enabling the whole F&O universe makes "exclude eighty names" the normal
+   * operation, and doing that one request at a time would mean eighty instrument-master fetches.
+   *
+   * DIFF-BASED, deliberately. The caller sends explicit adds and removes rather than the desired final
+   * set, so a UI holding a stale list cannot silently RE-ADMIT a name excluded moments earlier from
+   * somewhere else. That is the only direction of error that matters here, because it re-opens entry on
+   * something the operator declined.
+   *
+   * VALIDATED WHOLE, APPLIED WHOLE. Every symbol is normalised and checked before anything is written,
+   * so a single bad entry rejects the request instead of leaving half of it applied — an operator who
+   * mistyped one name in a list of eighty must not have to work out which seventy-nine took effect.
+   */
+  async setExcludedUnderlyingsBulk(
+    input: { exclude?: unknown; include?: unknown },
+    actor?: string,
+  ): Promise<
+    | { ok: true; added: number; removed: number }
+    | { ok: false; code: number; error: string }
+  > {
+    if (!this.exclusions.persistent) {
+      return {
+        ok: false,
+        code: 503,
+        error:
+          "Box persistence is not configured, so exclusions cannot be saved. They would be lost on the " +
+          "next restart, so the request is refused rather than accepted and forgotten.",
+      };
+    }
+
+    const rawExclude = input.exclude === undefined ? [] : input.exclude;
+    const rawInclude = input.include === undefined ? [] : input.include;
+    if (!Array.isArray(rawExclude) || !Array.isArray(rawInclude)) {
+      return { ok: false, code: 400, error: "exclude and include must each be an array when provided." };
+    }
+
+    const at = Date.now();
+    const add: UnderlyingExclusion[] = [];
+    const addSymbols = new Set<string>();
+    for (const raw of rawExclude) {
+      // Accept both a bare symbol and { symbol, reason }, so a picker submitting names without notes
+      // needs no special case.
+      const candidate = typeof raw === "string" ? { symbol: raw } : (raw as { symbol?: unknown; reason?: unknown });
+      const parsed = validateExclusionInput(candidate ?? {});
+      if (!parsed.ok) return { ok: false, code: 400, error: `exclude: ${parsed.error}` };
+      if (addSymbols.has(parsed.symbol)) continue;
+      addSymbols.add(parsed.symbol);
+      add.push({ symbol: parsed.symbol, reason: parsed.reason, excluded_by: actor ?? null, excluded_at: at });
+    }
+
+    const remove: string[] = [];
+    const removeSymbols = new Set<string>();
+    for (const raw of rawInclude) {
+      const parsed = validateExclusionInput({ symbol: raw });
+      if (!parsed.ok) return { ok: false, code: 400, error: `include: ${parsed.error}` };
+      if (addSymbols.has(parsed.symbol)) {
+        return {
+          ok: false,
+          code: 400,
+          error: `${parsed.symbol} appears in both exclude and include; the request is ambiguous and was not applied.`,
+        };
+      }
+      if (removeSymbols.has(parsed.symbol)) continue;
+      removeSymbols.add(parsed.symbol);
+      remove.push(parsed.symbol);
+    }
+
+    // The cap is judged against the RESULTING set, not the request size: re-admitting names in the same
+    // request legitimately makes room for new ones.
+    const resulting = new Set(this.exclusions.symbols());
+    for (const s of removeSymbols) resulting.delete(s);
+    for (const s of addSymbols) resulting.add(s);
+    if (resulting.size > MAX_EXCLUDED_UNDERLYINGS) {
+      return {
+        ok: false,
+        code: 409,
+        error:
+          `That would leave ${resulting.size} excluded underlyings, above the limit of ` +
+          `${MAX_EXCLUDED_UNDERLYINGS}. A blocklist this large is better expressed as a narrower ` +
+          `universe (BOX_MAX_UNDERLYINGS) than as a deny list.`,
+      };
+    }
+
+    // ROLL BACK IN MEMORY ON A FAILED WRITE, exactly as the single-symbol mutators do: the operator must
+    // never be told a set was applied when it will revert on the next restart.
+    const before = new Map(this.exclusions.list().map((e) => [e.symbol, e] as const));
+    for (const entry of add) this.exclusions.set(entry);
+    for (const symbol of remove) this.exclusions.delete(symbol);
+
+    let result: { added: number; removed: number };
+    try {
+      result = await applyBoxExcludedUnderlyingsBulk({ add, remove });
+    } catch (err) {
+      this.exclusions.loaded([...before.values()]);
+      const message = err instanceof Error ? err.message : String(err);
+      return { ok: false, code: 503, error: `Could not save the exclusions: ${message}` };
+    }
+
+    console.log(
+      `[Box] blocklist updated${actor ? ` by ${actor}` : ""}: ${add.length} excluded, ${remove.length} ` +
+        `re-included; ${resulting.size} name(s) now blocked. Open positions are unaffected.`,
+    );
+    void appendBoxEvent({
+      event: "SCANNER_CONFIG",
+      candidate_key: "",
+      underlying: "",
+      expiry: "",
+      lower_strike: 0,
+      upper_strike: 0,
+      lot_size: 0,
+      quantity: 0,
+      safety_buffer: this.cfg.safetyBuffer,
+      detail:
+        `blocklist_bulk excluded=${add.length} included=${remove.length} total=${resulting.size}` +
+        (actor ? ` by=${actor}` : ""),
+    });
+
+    // ONE rebuild for the whole batch — the reason this method exists.
+    await this.applyExclusionChange();
+    return { ok: true, added: result.added, removed: result.removed };
   }
 
   /**

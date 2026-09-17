@@ -3140,6 +3140,60 @@ export async function saveBoxExcludedUnderlying(entry: UnderlyingExclusion): Pro
 }
 
 /**
+ * Apply MANY blocklist changes in ONE transaction. THROWS on failure.
+ *
+ * WHY A BULK PATH IS REQUIRED, NOT A CONVENIENCE.
+ *
+ * The per-symbol writers above each trigger a full `BoxEngine.applyExclusionChange()`, which re-fetches
+ * the entire instrument master (~113k rows), re-derives the board and rebuilds every window. Excluding
+ * 200 names one at a time is therefore 200 full universe rebuilds — minutes of work and a needless
+ * hammering of the broker's instrument endpoint. Enabling the whole F&O universe makes that the normal
+ * case rather than an edge case, so the write has to be batched and the rebuild has to happen once.
+ *
+ * DIFF-BASED, NOT REPLACE-THE-SET. The caller sends explicit adds and removes rather than the desired
+ * final state. A whole-set replace would mean a UI holding a stale list could silently RE-ADMIT a name
+ * the operator had excluded moments earlier from another tab — the one direction of error that matters,
+ * since it re-opens entry on something deliberately declined.
+ *
+ * Adds are upserts (idempotent per migration 012's primary key) and removals are unconditional, so the
+ * same request may safely be retried. Returns what actually changed, because "excluded 40 names" and
+ * "38 of those were already excluded" are different facts an operator may want.
+ */
+export async function applyBoxExcludedUnderlyingsBulk(args: {
+  readonly add: readonly UnderlyingExclusion[];
+  readonly remove: readonly string[];
+}): Promise<{ added: number; removed: number }> {
+  if (!isBoxDbEnabled()) {
+    throw new Error("Box persistence is not configured, so exclusions cannot be saved.");
+  }
+  if (args.add.length === 0 && args.remove.length === 0) return { added: 0, removed: 0 };
+  let added = 0;
+  let removed = 0;
+  await withTx(async (client) => {
+    for (const entry of args.add) {
+      const { rowCount } = await client.query(
+        `INSERT INTO box_excluded_underlyings (symbol, reason, excluded_by, excluded_at)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (symbol) DO UPDATE SET
+           reason = $2, excluded_by = $3, excluded_at = $4`,
+        [entry.symbol, entry.reason, entry.excluded_by, new Date(entry.excluded_at)],
+      );
+      added += rowCount ?? 0;
+    }
+    if (args.remove.length > 0) {
+      // ONE statement for every removal: `= ANY($1)` keeps this a single round trip whatever the
+      // list length, which matters when an operator re-admits a large slice of the universe.
+      const { rowCount } = await client.query(
+        `DELETE FROM box_excluded_underlyings WHERE symbol = ANY($1::text[])`,
+        [[...args.remove]],
+      );
+      removed = rowCount ?? 0;
+    }
+  });
+  return { added, removed };
+}
+
+/**
  * Remove one exclusion. THROWS on failure. Returns whether a row was actually deleted.
  *
  * The boolean matters: re-including a name that was not excluded is a no-op the route reports as

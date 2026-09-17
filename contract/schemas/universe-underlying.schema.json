@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "universe-underlying.schema.json",
+  "title": "One underlying in the tradable universe, as the pre-run picker shows it",
+  "description": "Source: src/box/universeView.ts UniverseUnderlying, projected from the engine's in-memory board joined against its option-chain index. Instrument metadata ONLY — no position, quantity, price, account or token ever appears here. A row exists for every underlying that has BOTH a board entry and a resolved option chain, which is exactly the set discovery would consider; board rows with no chain are omitted rather than shown as unusable, because they were never candidates. The row's job is to let an operator decide what to EXCLUDE before pressing RUN, so it carries two independent verdicts: `excluded` (what the operator has already decided) and `admissible` (whether the current quantity caps permit the name to trade AT ALL).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "symbol",
+    "name",
+    "is_index",
+    "lot_size",
+    "expiry",
+    "paired_strikes",
+    "excluded",
+    "excluded_reason",
+    "admissible",
+    "inadmissible_reason",
+    "inadmissible_detail"
+  ],
+  "properties": {
+    "symbol": {
+      "type": "string",
+      "description": "The underlying as the board reports it, uppercased (e.g. NIFTY, RELIANCE, M&M). This is the exact string POST /api/box/excluded-underlyings/bulk expects."
+    },
+    "name": {
+      "type": "string",
+      "description": "Display name from the instrument master. Falls back to the symbol when the master carried none, so it is never blank."
+    },
+    "is_index": {
+      "type": "boolean",
+      "description": "Whether this is an index rather than a single stock. Indices sort first, matching the order prioritiseUniverse selects in when the token budget binds — so the list reads in the order the engine would actually keep names."
+    },
+    "lot_size": {
+      "type": "number",
+      "description": "One lot in units, from the option chain. 0 means the chain reported no usable lot size, in which case `admissible` is false. This is the number to compare against the per-leg quantity cap."
+    },
+    "expiry": {
+      "type": ["string", "null"],
+      "description": "The nearest non-expired expiry this chain resolved to, as the instrument master spells it. null when none resolved."
+    },
+    "paired_strikes": {
+      "type": "number",
+      "description": "How many strikes carry BOTH a CE and a PE for that expiry. A box needs two such strikes, so anything below 2 cannot form one whatever the caps allow."
+    },
+    "excluded": {
+      "type": "boolean",
+      "description": "Whether the operator blocklist forbids NEW ENTRY on this name. It never forbids an exit: a box already open on an excluded name keeps streaming, keeps being monitored and still exits on its own rules."
+    },
+    "excluded_reason": {
+      "type": ["string", "null"],
+      "description": "The operator's note when one was recorded. null means no reason was recorded, never that no reason existed."
+    },
+    "admissible": {
+      "type": "boolean",
+      "description": "Whether this name could trade AT ALL under the CURRENT quantity caps, ignoring the market entirely. False is a CONFIGURATION fact, not a market condition — the name is not quiet, it is impossible, and every entry on it is refused deep on the entry path where the refusal reads like an execution fault. Independent of `excluded`: a name may be both, or inadmissible while not excluded."
+    },
+    "inadmissible_reason": {
+      "type": ["string", "null"],
+      "enum": [
+        "lot_exceeds_per_leg_cap",
+        "four_legs_exceed_gross_cap",
+        "no_paired_strikes",
+        "unusable_lot_size",
+        null
+      ],
+      "description": "A stable code for WHY the name cannot trade, or null when `admissible` is true. lot_exceeds_per_leg_cap and four_legs_exceed_gross_cap are fixed by changing BOX_LIVE_MAX_OPEN_LEG_QUANTITY / BOX_LIVE_MAX_GROSS_OPEN_LEG_QUANTITY or by excluding the name; the other two are properties of the chain and cannot be configured away."
+    },
+    "inadmissible_detail": {
+      "type": ["string", "null"],
+      "description": "One bounded operator-facing sentence naming the actual numbers involved, or null when admissible. Safe to display verbatim."
+    }
+  }
+}
