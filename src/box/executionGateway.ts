@@ -241,6 +241,19 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     onExecutionModeMismatch?: (detail: string) => void;
     /** Allocates the Mongo identity before any live intent is created. */
     allocateTradeId?: () => string;
+    /**
+     * The OPERATOR BLOCKLIST verdict for an underlying — enforcement point 4 of 4, and the one that
+     * covers LIVE.
+     *
+     * The paper modes are caught inside BoxExecutionSimulator, but live never reaches the simulator:
+     * `simulateLeggingEntry` forks to BoxOrderManager before it. So live needs its own check, and it
+     * is placed at the very top of that fork — before the single-lot invariant, before a trade
+     * identity is allocated and before any durable intent exists, so an excluded name cannot leave a
+     * row, a reservation or an order behind.
+     *
+     * Synchronous. ENTRY ONLY: there is no equivalent on the exit, cancel or flatten paths.
+     */
+    underlyingExclusion?: (underlying: string) => { code: string; detail: string } | null;
     isTokenWarm?: (token: number) => boolean;
     /** Current socket generation, captured with each checked executable book. */
     feedGeneration?: () => number;
@@ -364,6 +377,22 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
   async simulateLeggingEntry(args: Parameters<BoxExecutionSimulator["simulateLeggingEntry"]>[0]): Promise<BoxLeggingResult> {
     if (this.mode !== "live") return this.deps.simulator.simulateLeggingEntry(args);
     const manager = this.requireManager();
+    // OPERATOR BLOCKLIST — the unbypassable LIVE refusal. FIRST, before a trade identity is
+    // allocated and before any durable intent or broker request exists: the cheapest possible
+    // refusal is the only correct one for a name an operator has forbidden.
+    const liveExclusion = this.deps.underlyingExclusion?.(args.candidate.underlying);
+    if (liveExclusion) {
+      return liveEntryFailure(
+        args.candidate,
+        args.detection.at,
+        this.now(),
+        [],
+        "underlying_excluded",
+        liveExclusion.detail,
+        this.deps.cfg,
+        null,
+      );
+    }
     const quantityViolation = singleLotCandidateViolation(args.candidate);
     if (quantityViolation) {
       manager.invariantViolation(`live entry ${args.candidate.key} violated single-lot invariant: ${quantityViolation}`);

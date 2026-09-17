@@ -148,6 +148,8 @@ export interface CoordinatorMetricsSnapshot {
   waitingExecutions: number;
   reservationConflicts: number;
   duplicateSuppressed: number;
+  /** Entries refused because the underlying is on the operator blocklist, or it was unreadable. */
+  underlyingExcluded: number;
   expiredWhileWaiting: number;
   revalidationRejected: number;
   revalidationPassed: number;
@@ -259,6 +261,19 @@ export interface CoordinatorDeps {
    * cancel, a residual flatten or a reconciliation-driven reduction.
    */
   sessionEntryGate?: () => { allowed: boolean; reason: string | null; detail: string | null };
+  /**
+   * The OPERATOR BLOCKLIST verdict for an underlying (`box_excluded_underlyings`).
+   *
+   * SYNCHRONOUS BY CONTRACT, for exactly the same reason as `activeUnderlyings` and
+   * `sessionEntryGate`: it is consulted in the prologue that must not yield, so it has to be an
+   * in-memory lookup. This is why the blocklist is held in memory and reloaded at boot rather than
+   * read from PostgreSQL per decision — a query here would reopen the TOCTOU the prologue exists to
+   * close.
+   *
+   * Returns the refusal, or null when entry may proceed. A non-null result covers both an explicitly
+   * excluded name and an unreadable blocklist. ENTRY ONLY — never consulted on any reduction path.
+   */
+  underlyingExclusion?: (underlying: string) => { code: string; detail: string } | null;
   /**
    * CONSUME one entry attempt from the session's ATTEMPT budget, durably.
    *
@@ -395,6 +410,7 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
     uncertainHoldsAbandoned: 0,
     underlyingAlreadyActive: 0,
     sessionLimitRefusals: 0,
+    underlyingExcluded: 0,
     positionClaimsHeld: 0,
     positionClaimsReleased: 0,
     positionClaimFailures: 0,
@@ -790,6 +806,30 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
           sessionGate.detail ??
           `${sessionGate.reason ?? "session_limit_reached"}: the armed trading session refused entry`,
       };
+    }
+
+    // ── OPERATOR BLOCKLIST — enforcement point 2 of 4 ───────────────────────────────────
+    //
+    // Synchronous, inside the no-await prologue, and BEFORE the claim: an excluded name must not
+    // spend an attempt, take a reservation or hold a claim it will immediately give back.
+    //
+    // Deliberately placed after the session gate so the existing refusal precedence is unchanged,
+    // and before the underlying lock because "the operator forbade this name" is a more useful
+    // answer than "this name is busy" when both happen to be true.
+    //
+    // ENTRY ONLY. There is no counterpart in `acquireForExit`, `coordinateExit` or any reduction
+    // path, and that omission is the point: excluding a name must never trap an open Box.
+    const exclusion = this.deps.underlyingExclusion?.(candidate.underlying);
+    if (exclusion) {
+      this.stats.underlyingExcluded++;
+      this.log({
+        execution: executionId,
+        broker,
+        underlying: candidate.underlying,
+        status: "suppressed_underlying_excluded",
+        reason: exclusion.code,
+      });
+      return { ok: false, reason: "underlying_excluded", detail: exclusion.detail };
     }
 
     // ── UNDERLYING LOCK, LAYER 1a: DURABLE POSITION OWNERSHIP ──────────────────────────
@@ -2111,6 +2151,7 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
       waitingExecutions: this.waiting,
       reservationConflicts: this.stats.reservationConflicts,
       duplicateSuppressed: this.stats.duplicateSuppressed,
+      underlyingExcluded: this.stats.underlyingExcluded,
       expiredWhileWaiting: this.stats.expiredWhileWaiting,
       revalidationRejected: this.stats.revalidationRejected,
       revalidationPassed: this.stats.revalidationPassed,

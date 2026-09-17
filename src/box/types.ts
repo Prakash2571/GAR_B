@@ -637,6 +637,18 @@ export type BoxExecutionFailureReason =
    */
   | "underlying_already_active"
   /**
+   * The underlying is on the operator's blocklist (`box_excluded_underlyings`), or that blocklist
+   * could not be read and therefore cannot confirm this name is tradable.
+   *
+   * DELIBERATELY DISTINCT from `underlying_already_active`: nothing is wrong with the market or with
+   * our own exposure — an operator has simply said this name is not to be entered. Reporting it as a
+   * conflict or a market rejection would send them looking for a fault that does not exist.
+   *
+   * Blocks NEW ENTRY ONLY, in every execution mode. An excluded name whose Box is already open is
+   * still monitored, still exits, and can still be flattened — see underlyingExclusions.ts.
+   */
+  | "underlying_excluded"
+  /**
    * The armed trading session has consumed its permitted Box lifecycles
    * (`BOX_SESSION_MAX_COMPLETED_TRADES`), or no session is armed.
    *
