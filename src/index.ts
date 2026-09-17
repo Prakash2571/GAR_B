@@ -510,6 +510,55 @@ function brokerLoginModeFromEnv(env: NodeJS.ProcessEnv = process.env): BrokerLog
 const brokerLoginMode: BrokerLoginMode = brokerLoginModeFromEnv();
 
 /**
+ * A STRICTLY POSITIVE duration read from the environment.
+ *
+ * `Number(process.env.X ?? fallback)` is NOT this function, and the difference is
+ * load-bearing: `??` only defends against `undefined`/`null`, so a variable that is
+ * PRESENT but blank or malformed skips the fallback entirely and coerces to a value
+ * that then disables the very timer it configures:
+ *
+ *   BROKER_TOKEN_REQUEST_TIMEOUT_MS=      → Number("")    === 0   → abort at 0 ms
+ *   BROKER_TOKEN_REQUEST_TIMEOUT_MS=10s   → Number("10s") === NaN → abort at 0 ms
+ *   BROKER_TOKEN_POLL_INTERVAL_MS=        → Number("")    === 0   → retry loop with no delay
+ *
+ * A blank assignment is one of the most ordinary things an operator does to a `.env`
+ * (commenting a value out by deleting it), and `.env.example` ships both of these keys
+ * WITH values, so blanking one is an edit away. The first case silently costs the whole
+ * trading day — every token fetch aborts before it can complete, and the failure is
+ * reported as an ordinary timeout. The second is worse than silent: it turns the retry
+ * schedule into an unbounded request loop against a third-party endpoint.
+ *
+ * So: reject anything that is not a finite number strictly greater than zero, say so
+ * loudly, and fall back. This mirrors `num()` in `src/box/config.ts`, which every other
+ * numeric variable in the process already goes through.
+ */
+function positiveDurationMsFromEnv(
+  name: string,
+  fallback: number,
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  const raw = env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    console.warn(
+      `[Token] ${name}="${raw}" is not a positive number of milliseconds — using ${fallback}.`,
+    );
+    return fallback;
+  }
+  return parsed;
+}
+
+const brokerTokenRequestTimeoutMs = positiveDurationMsFromEnv(
+  "BROKER_TOKEN_REQUEST_TIMEOUT_MS",
+  10_000,
+);
+const brokerTokenPollIntervalMs = positiveDurationMsFromEnv(
+  "BROKER_TOKEN_POLL_INTERVAL_MS",
+  60_000,
+);
+
+/**
  * Single-use, TTL-bounded record of an in-flight browser login, one slot per broker.
  *
  * This is what authenticates the OAuth callback, which cannot present the session cookie
@@ -543,7 +592,7 @@ const tokenProviderConfigs: BrokerProviderConfigs = {
     ...(process.env.KITE_API_KEY_EXPECTED?.trim()
       ? { expectedIdentity: process.env.KITE_API_KEY_EXPECTED.trim() }
       : {}),
-    requestTimeoutMs: Number(process.env.BROKER_TOKEN_REQUEST_TIMEOUT_MS ?? 10_000),
+    requestTimeoutMs: brokerTokenRequestTimeoutMs,
     requireHttps: config.nodeEnv !== "test",
   },
   dhan: {
@@ -552,7 +601,7 @@ const tokenProviderConfigs: BrokerProviderConfigs = {
     ...(process.env.DHAN_CLIENT_ID_EXPECTED?.trim()
       ? { expectedIdentity: process.env.DHAN_CLIENT_ID_EXPECTED.trim() }
       : {}),
-    requestTimeoutMs: Number(process.env.BROKER_TOKEN_REQUEST_TIMEOUT_MS ?? 10_000),
+    requestTimeoutMs: brokerTokenRequestTimeoutMs,
     requireHttps: config.nodeEnv !== "test",
   },
 };
@@ -561,7 +610,7 @@ const tokenService = new BrokerTokenAcquisitionService({
   clock: systemClock,
   configs: tokenProviderConfigs,
   pollStart: (process.env.BROKER_TOKEN_POLL_START ?? "09:00").trim(),
-  pollIntervalMs: Number(process.env.BROKER_TOKEN_POLL_INTERVAL_MS ?? 60_000),
+  pollIntervalMs: brokerTokenPollIntervalMs,
   persist: {
     saveZerodha: async ({ apiKey, accessToken, loginDate }) => {
       await saveKiteSession({

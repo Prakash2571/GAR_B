@@ -82,6 +82,9 @@ export interface TokenProviderConfig {
 /** Injected so tests can supply a mock without touching the network. */
 export type FetchLike = typeof fetch;
 
+/** Used when `requestTimeoutMs` is not a positive finite number. */
+const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
+
 /**
  * Fetch and validate a token from the provider. `atMs` is the current instant from
  * the IST clock, so "today" is decided by the same arithmetic everywhere and tests
@@ -109,7 +112,18 @@ export async function fetchBrokerToken(
   }
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), cfg.requestTimeoutMs);
+  /*
+   * A non-finite or non-positive timeout must not become `setTimeout(abort, 0)`, which aborts
+   * the request before it can be sent and reports the result as an ordinary timeout — costing a
+   * whole trading day's token with nothing in the logs but a retryable network error. The source
+   * of the value is validated in `src/index.ts`; this is the second line of defence, for any
+   * other caller and for a config object built by hand in a test.
+   */
+  const timeoutMs =
+    Number.isFinite(cfg.requestTimeoutMs) && cfg.requestTimeoutMs > 0
+      ? cfg.requestTimeoutMs
+      : DEFAULT_REQUEST_TIMEOUT_MS;
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   let res: Response;
   try {
     res = await fetchImpl(parsedUrl.toString(), {

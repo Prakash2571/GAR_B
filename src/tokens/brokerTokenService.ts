@@ -143,6 +143,13 @@ interface BrokerRuntime {
   blockerStreak: number;
 }
 
+/**
+ * The delay `arm()` falls back to when it is handed a non-finite one. Deliberately a whole
+ * minute: a caller that cannot compute a retry delay is in an unknown state, and the safe
+ * response to an unknown state is to wait, not to retry as fast as the event loop allows.
+ */
+const ARM_FALLBACK_DELAY_MS = 60_000;
+
 export class BrokerTokenAcquisitionService {
   private readonly opts: BrokerTokenServiceOptions;
   private readonly runtimes: Record<BrokerKind, BrokerRuntime>;
@@ -278,10 +285,21 @@ export class BrokerTokenAcquisitionService {
     if (this.stopped) return;
     const rt = this.runtimes[broker];
     if (rt.timer) clearTimeout(rt.timer);
-    rt.timer = setTimeout(() => {
-      rt.timer = null;
-      if (!this.stopped) fn();
-    }, Math.max(0, delayMs));
+    /*
+     * `Math.max(0, NaN)` is `NaN`, and `setTimeout(fn, NaN)` fires on the next tick — so a
+     * non-finite delay does not merely schedule early, it converts this retry schedule into an
+     * unbounded request loop against the token provider. Clamping the LOW end is therefore not
+     * enough; the delay has to be proven finite first, and a caller that cannot say when to
+     * retry is answered with the conservative floor rather than "immediately".
+     */
+    const requested = Number.isFinite(delayMs) ? delayMs : ARM_FALLBACK_DELAY_MS;
+    rt.timer = setTimeout(
+      () => {
+        rt.timer = null;
+        if (!this.stopped) fn();
+      },
+      Math.max(0, requested),
+    );
     // Do not keep the event loop alive purely for a poll timer.
     if (typeof rt.timer === "object" && rt.timer && "unref" in rt.timer) {
       (rt.timer as { unref: () => void }).unref();
