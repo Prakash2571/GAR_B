@@ -925,10 +925,15 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
    * broker submission, and because the position book must keep holding every position for the
    * broker-switch guard, the delete guard and the margin totals to stay truthful.
    */
-  private executionModeMismatch(position: BoxOpenPosition): string | null {
+  private executionModeMismatch(position: BoxOpenPosition | undefined): string | null {
     // NO CLAIM ⇒ NO REFUSAL. A record that does not state its mode cannot contradict this process,
     // and inventing a contradiction from missing data would block a reduction — see
     // `statedExecutionMode`. Real restored positions always state it (the column is NOT NULL).
+    //
+    // `position` is typed as required, but this guard runs before anything else on the exit path and
+    // must not be the thing that turns a malformed call into a TypeError instead of the refusal (or
+    // delegation) the caller was going to get.
+    if (!position) return null;
     const stated = statedExecutionMode(position.execution_mode);
     if (stated === null) return null;
     const processIsPaper = isPaperExecutionMode(this.mode);

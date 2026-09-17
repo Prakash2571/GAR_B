@@ -416,56 +416,94 @@ test("B5: the non-legging exit path is guarded too, with a correctly shaped reco
   assert.deepEqual(result.record.legs, []);
 });
 
+/**
+ * Did the mode guard let this call through?
+ *
+ * A LIVE gateway with no manager cannot complete an exit — `requireManager()` throws. That is exactly
+ * what makes this a sharp probe: reaching the throw PROVES the mode guard did not refuse, because a
+ * refusal returns `{ ok: false, reason: "execution_mode_mismatch" }` *before* the manager is ever
+ * requested. Before the `statedExecutionMode` fix these cases returned the refusal instead.
+ */
+async function passedModeGuard(gateway, pos) {
+  try {
+    const result = await gateway.simulateLeggingExit({
+      position: pos,
+      detectionLegs: detectionLegs(),
+      detectedAt: 1_000,
+    });
+    return result.reason !== "execution_mode_mismatch";
+  } catch (err) {
+    return /manager is unavailable/i.test(String(err.message));
+  }
+}
+
 test("B9: a record that states NO mode is NOT refused — missing data must not block a reduction", async () => {
-  let simulatorCalls = 0;
   const { gateway, mismatches } = await makeGateway("live", {
     simulateLeggingExit: async () => {
-      simulatorCalls++;
-      return { ok: true, legs: [], record: {}, booksAtFill: new Map() };
+      throw new Error("SIMULATOR MUST NOT BE REACHED IN LIVE MODE");
     },
   });
 
   const noClaim = position("live");
   delete noClaim.execution_mode;
 
-  const result = await gateway.simulateLeggingExit({
-    position: noClaim,
-    detectionLegs: detectionLegs(),
-    detectedAt: 1_000,
-  });
-
   /*
    * The refusal must rest on a mode the record ASSERTS, never on the absence of one. Defaulting a
-   * missing value to "paper" would turn "cannot tell" into a positive claim and a live process would
-   * refuse to exit it — a reduction blocker manufactured from missing data, which is the one
-   * direction this codebase never fails in. Real rows are unaffected: both execution_mode columns
-   * are NOT NULL, so a restored position always states its mode and is always checked.
+   * missing value to "paper" would turn "cannot tell" into a positive claim, and a live process would
+   * refuse to exit it — a REDUCTION blocker manufactured from missing data, which is the one direction
+   * this codebase never fails in. Real rows are unaffected: both execution_mode columns are NOT NULL,
+   * so a restored position always states its mode and is always checked.
    */
-  assert.notEqual(result.reason, "execution_mode_mismatch", "an unstated mode must not be treated as a mismatch");
+  assert.equal(await passedModeGuard(gateway, noClaim), true, "an unstated mode must not be treated as a mismatch");
   assert.equal(mismatches.length, 0, "no claim means nothing to report");
-  assert.equal(simulatorCalls, 1, "the exit must proceed exactly as it did before mode isolation existed");
 });
 
 test("B10: an unrecognised mode string is also treated as NO CLAIM, not as paper", async () => {
-  let simulatorCalls = 0;
-  const { gateway } = await makeGateway("live", {
+  const { gateway, mismatches } = await makeGateway("live", {
     simulateLeggingExit: async () => {
-      simulatorCalls++;
-      return { ok: true, legs: [], record: {}, booksAtFill: new Map() };
+      throw new Error("SIMULATOR MUST NOT BE REACHED IN LIVE MODE");
     },
   });
 
   const garbage = position("live");
   garbage.execution_mode = "not_a_real_mode";
 
-  const result = await gateway.simulateLeggingExit({
-    position: garbage,
-    detectionLegs: detectionLegs(),
-    detectedAt: 1_000,
+  assert.equal(
+    await passedModeGuard(gateway, garbage),
+    true,
+    "a value that crossed a database boundary and is not a known mode states nothing",
+  );
+  assert.equal(mismatches.length, 0);
+});
+
+test("B11 (non-vacuous control for B9/B10): a STATED paper mode IS refused by the same probe", async () => {
+  const { gateway } = await makeGateway("live", {
+    simulateLeggingExit: async () => {
+      throw new Error("SIMULATOR MUST NOT BE REACHED IN LIVE MODE");
+    },
   });
 
-  assert.notEqual(result.reason, "execution_mode_mismatch");
-  assert.equal(simulatorCalls, 1, "a value that crossed a database boundary and is not a known mode states nothing");
+  assert.equal(
+    await passedModeGuard(gateway, position("paper_legging")),
+    false,
+    "a stated contradiction must still be refused — otherwise B9/B10 prove nothing",
+  );
+});
+
+test("B12: a missing position does not turn the guard into a TypeError", async () => {
+  let delegated = 0;
+  const { gateway } = await makeGateway("paper_latency", {
+    simulateLeggingExit: async () => {
+      delegated++;
+      return { ok: true, legs: [], record: {}, booksAtFill: new Map() };
+    },
+  });
+
+  // Paper delegation is asserted elsewhere to be byte-for-byte; the guard must not break that by
+  // dereferencing a position the caller never supplied.
+  const result = await gateway.simulateLeggingExit({ detectionLegs: detectionLegs(), detectedAt: 1_000 });
+  assert.equal(result.ok, true);
+  assert.equal(delegated, 1);
 });
 
 /* ═════════════ B'. RESIDUAL OWNERSHIP IS CARRIED AND HONOURED ═════════════ */
@@ -558,14 +596,20 @@ test("C3: the unknown-residual refusal is ENTRY-scoped, so reduction is never bl
   engine.residualRecoveryLoadError = "permission denied for table box_execution_attempts";
 
   const decision = engine.operationalReadiness();
-  const blocker = decision.blockers.find((b) => b.code === "residual_state_unknown");
-  assert.ok(blocker, "the condition must appear in the ONE authoritative readiness decision");
+
+  // An entry-scoped blocker surfaces as an ENTRY refusal reason...
+  const entryReason = decision.entry.reasons.find((b) => b.code === "residual_state_unknown");
+  assert.ok(entryReason, "the condition must appear in the ONE authoritative readiness decision");
+  assert.equal(entryReason.scope, "entry");
+  assert.match(entryReason.detail, /permission denied/, "the operator needs the actual cause");
+
+  // ...and MUST NOT appear among the reduction refusals. This is the structural invariant: not
+  // knowing what exposure exists can never become a reason exposure cannot be REDUCED.
   assert.equal(
-    blocker.scope,
-    "entry",
-    "not knowing what exposure exists must never become a reason exposure cannot be REDUCED",
+    decision.exposure_management.blocked_reasons.some((b) => b.code === "residual_state_unknown"),
+    false,
+    "an entry-scoped fact must never reach the reduction verdict",
   );
-  assert.match(blocker.detail, /permission denied/, "the operator needs the actual cause");
 
   engine.dispose();
 });
@@ -580,12 +624,33 @@ test("C4: exposure this process must not execute is published as a REDUCTION blo
   });
 
   const decision = engine.operationalReadiness();
-  const blocker = decision.blockers.find((b) => b.code === "execution_mode_mismatch");
-  assert.ok(blocker, "a position/residual this process cannot close must be named");
+  const blocked = decision.exposure_management.blocked_reasons.find((b) => b.code === "execution_mode_mismatch");
+  assert.ok(blocked, "a position/residual this process cannot close must be named as a REDUCTION blocker");
   assert.equal(
-    blocker.scope,
+    blocked.scope,
     "reduction",
     "a real position that cannot be closed here is the most serious scope there is",
+  );
+  assert.equal(
+    decision.exposure_management.exit_and_reduce,
+    false,
+    "the published verdict must agree with the blocker rather than claiming reduction is fine",
+  );
+
+  engine.dispose();
+});
+
+test("C5 (non-vacuous control): with no foreign exposure, reduction is not blocked", async () => {
+  const spy = feedSpy();
+  const engine = await makeEngine(spy);
+
+  engine.registerResidual("attempt-C5", [residualLeg(9901)], 0, "id-C5", "RELIANCE"); // this process's own
+
+  const decision = engine.operationalReadiness();
+  assert.equal(
+    decision.exposure_management.blocked_reasons.some((b) => b.code === "execution_mode_mismatch"),
+    false,
+    "this process's own exposure must not be reported as unworkable — otherwise C4 is vacuous",
   );
 
   engine.dispose();
