@@ -71,6 +71,7 @@ import {
   type UniverseUnderlying,
 } from "./universeView.js";
 import { BoxTradingSessionManager } from "./tradingSessionStore.js";
+import { AccountFundsTracker, unavailableFunds, type AccountFundsSnapshot } from "./accountFunds.js";
 import { BoxExecutionSimulator } from "./executionSimulator.js";
 import { createExecutionClock, type ExecutionClock } from "./executionClock.js";
 import { ExecutionEnvironmentMonitor } from "./executionEnvironment.js";
@@ -589,6 +590,18 @@ export class BoxEngine {
   private removeTickListener: (() => void) | null = null;
   private removeConnectionListener: (() => void) | null = null;
   private universeTimer: NodeJS.Timeout | null = null;
+  /**
+   * THE STANDING ACCOUNT-BALANCE OBSERVATION.
+   *
+   * Separate from the `available_funds` figure inside `economic_admission`, which is a by-product of
+   * live entry admission and is therefore null in paper, null when the funding gates are off, and
+   * null until the first entry has been evaluated — i.e. absent exactly when an operator is deciding
+   * whether to arm. This one is refreshed on its own timer whenever a session exists, in any mode.
+   */
+  private readonly accountFunds: AccountFundsTracker;
+  private fundsTimer: NodeJS.Timeout | null = null;
+  /** True while a refresh is in flight, so a slow broker cannot stack overlapping reads. */
+  private fundsRefreshInFlight = false;
   private publishTimer: NodeJS.Timeout | null = null;
 
   private running = false;
@@ -1443,6 +1456,11 @@ export class BoxEngine {
     });
     // The durable trading session. Constructed here so the coordinator's entry gate can close
     // over it; its state is READ later, during start(), once persistence is known to be up.
+    this.accountFunds = new AccountFundsTracker({
+      freshnessMaxAgeMs: this.cfg.accountFundsFreshnessMaxAgeMs,
+      now: () => Date.now(),
+    });
+
     this.session = new BoxTradingSessionManager({
       persistence: {
         load: () => loadBoxTradingSession(),
@@ -1914,6 +1932,19 @@ export class BoxEngine {
         console.warn("[Box] universe refresh failed at boot:", err),
       );
     }
+    /*
+     * START THE BALANCE POLLER — last, and deliberately not awaited.
+     *
+     * It is a diagnostic: boot must not be able to fail, or even be delayed, because a funds endpoint
+     * is slow. `ensureAccountFundsTimer` fires one read immediately and then polls, and every path
+     * inside it swallows its own errors, so nothing here can reject.
+     *
+     * Started in EVERY mode, not just live. A paper rehearsal has the same authenticated session and
+     * the same question — "what can I actually trade with?" — and needs the answer before arming
+     * rather than after.
+     */
+    this.ensureAccountFundsTimer();
+
     console.log(
       `[Box] engine ready — ${this.positions.size} open box position(s), ` +
         `entry gate ₹${requiredNetProfit(this.cfg)} EXPECTED NET after every cost ` +
@@ -3011,6 +3042,9 @@ export class BoxEngine {
     // unref'd, but stopping it explicitly keeps the "every timer the engine owns is
     // cleared" property this method exists to guarantee.
     this.coordinator.dispose();
+    // The balance poller. Unref'd, so it could not hold the process open, but stopping it keeps the
+    // "every timer the engine owns is cleared" property this method exists to guarantee.
+    this.stopAccountFundsTimer(false);
     if (this.removeConnectionListener) {
       this.removeConnectionListener();
       this.removeConnectionListener = null;
@@ -5382,6 +5416,90 @@ export class BoxEngine {
     return this.session.evaluateEntry(this.recoveryActive());
   }
 
+  /* ------------------------------ account funds ------------------------------ */
+
+  /**
+   * The published free-capital snapshot.
+   *
+   * Answers "not supported" and "no session" distinctly from "unknown", because an operator staring
+   * at a blank needs to know whether to log in, wait, or stop expecting a number at all.
+   */
+  private accountFundsSnapshot(): AccountFundsSnapshot {
+    if (!this.cfg.accountFundsEnabled) {
+      return unavailableFunds(
+        "not_supported",
+        "Account-funds polling is disabled (BOX_ACCOUNT_FUNDS_ENABLED=false), so free capital is not " +
+          "being read. This is NOT a zero balance.",
+        this.deps.activeBroker(),
+      );
+    }
+    return this.accountFunds.snapshot({
+      sessionReady: this.deps.marketData.isAuthenticated(),
+      supported: typeof this.deps.marketData.getFunds === "function",
+    });
+  }
+
+  /**
+   * Read the balance once, recording either the figure or the failure.
+   *
+   * NEVER THROWS. A funds read is a diagnostic: if it could throw into a timer it would become an
+   * unhandled rejection, and if it could throw into the status path it would take down the whole
+   * status response for a number that is merely informational.
+   *
+   * Skipped entirely when no session exists, so a logged-out deployment does not generate a failed
+   * read every cycle and then report "read_failed" when the honest answer is "no session".
+   */
+  private async refreshAccountFunds(): Promise<void> {
+    if (!this.cfg.accountFundsEnabled) return;
+    const read = this.deps.marketData.getFunds;
+    if (typeof read !== "function") return;
+    if (!this.deps.marketData.isAuthenticated()) return;
+    // One at a time. Without this a broker slower than the interval would queue reads indefinitely,
+    // and each would then be charged against the same rate limit the market feed depends on.
+    if (this.fundsRefreshInFlight) return;
+    this.fundsRefreshInFlight = true;
+    try {
+      const funds = await read.call(this.deps.marketData);
+      this.accountFunds.record(this.deps.activeBroker(), {
+        availableRupees: funds.available,
+        utilisedRupees: funds.utilised,
+      });
+    } catch (error) {
+      // The PREVIOUS figure is kept and marked stale by the tracker — an operator mid-session is
+      // better served by "₹47,000 as of 40s ago, refresh failing" than by a blank.
+      this.accountFunds.recordFailure(
+        error instanceof Error ? error.message : String(error),
+        this.deps.activeBroker(),
+      );
+    } finally {
+      this.fundsRefreshInFlight = false;
+    }
+  }
+
+  /** Start the balance poller. Idempotent. */
+  private ensureAccountFundsTimer(): void {
+    if (!this.cfg.accountFundsEnabled) return;
+    if (this.fundsTimer !== null) return;
+    if (typeof this.deps.marketData.getFunds !== "function") return;
+    void this.refreshAccountFunds();
+    this.fundsTimer = setInterval(() => {
+      void this.refreshAccountFunds();
+    }, this.cfg.accountFundsRefreshMs);
+    // Never hold the process open for a diagnostic poll.
+    if (typeof this.fundsTimer.unref === "function") this.fundsTimer.unref();
+  }
+
+  /** Stop the poller and forget the figure. Called on shutdown and on a broker switch. */
+  private stopAccountFundsTimer(forget: boolean): void {
+    if (this.fundsTimer !== null) {
+      clearInterval(this.fundsTimer);
+      this.fundsTimer = null;
+    }
+    // One broker's balance is not another's, so a switch must not leave the outgoing account's
+    // number on screen under the incoming account's name.
+    if (forget) this.accountFunds.reset();
+  }
+
   /**
    * COMMITTED BOX EXPOSURE this engine already holds, for `BOX_MAX_OPEN_BOXES`.
    *
@@ -6907,6 +7025,8 @@ export class BoxEngine {
        * appears as an entry-scoped blocker in `operational_readiness`.
        */
       economic_admission: this.economicAdmissionStatus(),
+      // FREE CAPITAL, published continuously rather than as a side effect of an entry attempt.
+      account_funds: this.accountFundsSnapshot(),
       database_healthy: isBoxDbEnabled() && (!live || live.health.persistence === "healthy"),
       daily_risk_seed_healthy: live ? live.health.daily_risk_seed === "healthy" : null,
       reconciliation_complete: live?.health.reconciliation_complete ?? true,
@@ -7116,6 +7236,11 @@ export class BoxEngine {
    */
   async clearInstrumentReservations(): Promise<void> {
     await this.coordinator.resetForBrokerSwitch();
+    // FORGET THE BALANCE TOO. It was read from the OUTGOING broker, and leaving it on screen under
+    // the incoming broker's name would attribute one account's free capital to another. The poller
+    // restarts on the next boot pass and re-reads against the new session.
+    this.stopAccountFundsTimer(true);
+    this.ensureAccountFundsTimer();
   }
 
   /**

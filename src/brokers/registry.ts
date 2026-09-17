@@ -1951,6 +1951,29 @@ export class ActiveBrokerManager {
         this.active === "zerodha"
           ? this.deps.kite.getQuoteFull(identifiers)
           : this.dhanQuoteFull(identifiers),
+      /*
+       * ACCOUNT FUNDS, from whichever broker is active.
+       *
+       * Routed through the DATA client rather than the live order adapter on purpose: the adapter
+       * exists only in live mode, and the balance is most needed BEFORE arming. Both numbers are
+       * passed through unmodified — combining them is a per-broker semantic decided once, in
+       * `box/fundsSemantics.ts`, and doing it here as well would put the meaning in two places.
+       *
+       * Dhan's field name carries the vendor's own spelling (`availabelBalance`); it is read via the
+       * typed client so the typo lives in exactly one place. Dhan's fund-limit response has no direct
+       * equivalent of Kite's `utilised.debits`, so the encumbrance stays null — and null makes the
+       * conservative path apply rather than being read as "nothing is blocked".
+       */
+      getFunds: async () => {
+        if (this.active === "zerodha") return this.deps.kite.getFunds();
+        const funds = await this.dhanClient.getFundLimit();
+        const num = (v: unknown): number | null =>
+          typeof v === "number" && Number.isFinite(v) ? v : null;
+        return {
+          available: num((funds as { availabelBalance?: unknown }).availabelBalance),
+          utilised: num((funds as { utilizedAmount?: unknown }).utilizedAmount),
+        };
+      },
     };
   }
 

@@ -64,6 +64,26 @@ export interface BoxMarketDataProvider {
    * limiting; the engine passes the whole universe and expects one array back.
    */
   getQuoteFull(identifiers: string[]): Promise<BoxRestQuote[]>;
+  /**
+   * The account's available balance and what is already blocked, in rupees.
+   *
+   * OPTIONAL, and the optionality is the honest part: not every provider can answer this, and a
+   * provider that cannot must be distinguishable from an account with no money. An implementation
+   * that omits it produces `unavailable_reason: "not_supported"` rather than ₹0.
+   *
+   * ON THE MARKET-DATA PROVIDER RATHER THAN THE LIVE ORDER ADAPTER, deliberately. The live adapter
+   * exists only in live mode, but "how much can I actually trade with?" is a question an operator
+   * needs answered while REHEARSING — before arming, not after. The same authenticated session that
+   * streams prices can read the balance, so it is asked here and is therefore available in paper too.
+   *
+   * NULL FIELDS ARE UNKNOWN, NEVER ZERO. Whether `available` is already net of the encumbrance is a
+   * per-broker semantic resolved once in `fundsSemantics.ts`; implementations must NOT pre-combine
+   * the two numbers, or the meaning would be decided in two places and could differ.
+   *
+   * May throw. A throw is recorded as a failed read (the previous figure is kept and marked stale),
+   * which is why it must not be swallowed into a zero by the implementation.
+   */
+  getFunds?(): Promise<{ available: number | null; utilised: number | null }>;
 }
 
 /** One leg of a basket-margin request, broker-neutral. */

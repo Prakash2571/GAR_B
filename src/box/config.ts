@@ -355,6 +355,11 @@ export interface BoxConfig {
    * turning it off restores that behaviour.
    */
   executionCoordinatorEnabled: boolean;
+  /** Whether to poll the broker for the account balance. Display only; never gates a trade. */
+  accountFundsEnabled: boolean;
+  accountFundsRefreshMs: number;
+  /** How old the balance may be and still be reported as fresh. Wider than the refresh interval. */
+  accountFundsFreshnessMaxAgeMs: number;
   /**
    * How long a box may wait for a contract another execution is holding.
    *
@@ -1185,6 +1190,47 @@ export function loadBoxConfig(): BoxConfig {
     );
   }
 
+  /*
+   * THE COORDINATOR IS NOT OPTIONAL IN LIVE, AND THIS IS THE MOST IMPORTANT REFUSAL IN THIS FUNCTION.
+   *
+   * `CoordinatedBoxExecutionGateway.simulateEntry` / `simulateLeggingEntry` both begin with
+   *
+   *     if (!this.deps.cfg.executionCoordinatorEnabled) return this.deps.inner.<same>(args);
+   *
+   * — a straight delegation to the uncoordinated gateway. Everything the coordinator's entry prologue
+   * enforces is therefore SKIPPED WHOLESALE when the flag is false, and that list is not a set of
+   * refinements:
+   *
+   *   · BOX_MAX_OPEN_BOXES — the ONLY mode-independent inventory ceiling, and it has exactly one
+   *     enforcement point, inside that prologue. `BOX_LIVE_MAX_OPEN_BOXES` in BoxOrderManager is a
+   *     DIFFERENT variable read from a count refreshed only after a position exists;
+   *   · the session ATTEMPT budget (BOX_SESSION_MAX_ENTRY_ATTEMPTS) — consumed inside the prologue,
+   *     so with the coordinator off a one-attempt supervised trial can submit indefinitely;
+   *   · the session ENTRY gate (BOX_SESSION_MAX_COMPLETED_TRADES);
+   *   · BOX_ONE_ACTIVE_BOX_PER_UNDERLYING, all three layers;
+   *   · the duplicate-opportunity guard;
+   *   · contract-level instrument reservations, i.e. all cross-process exclusion.
+   *
+   * An operator who sets BOX_MAX_OPEN_BOXES=1 because they cannot fund a second box, and separately
+   * turns this flag off, gets NO ceiling at all — and nothing tells them. That is the exact shape of
+   * failure the double-gating above exists to prevent, so it is refused the same way rather than
+   * being left to a warning nobody reads at 09:14.
+   *
+   * NO LEGITIMATE CONFIGURATION IS LOST. Live execution already requires durable reservations to be
+   * reachable (`BOX_RESERVATION_REQUIRE_DURABLE`, and the coordinator fails live closed when the
+   * authority is unavailable), so a live deployment with coordination disabled was never a supported
+   * state — merely an unguarded one. Paper is untouched: development and tests may still disable it.
+   */
+  if (mode === "live" && !bool("BOX_EXECUTION_COORDINATOR_ENABLED", true)) {
+    throw new Error(
+      "[Box] BOX_EXECUTION_COORDINATOR_ENABLED=false cannot be combined with BOX_EXECUTION_MODE=live. " +
+        "The coordinator's entry prologue is the ONLY enforcement point for BOX_MAX_OPEN_BOXES, the " +
+        "session attempt budget, BOX_ONE_ACTIVE_BOX_PER_UNDERLYING, the duplicate-opportunity guard " +
+        "and every instrument reservation. Disabling it in live silently removes all of them, so " +
+        "startup is refused rather than trading without an inventory ceiling.",
+    );
+  }
+
   return {
     executionMode: mode,
     simulatedDecisionMs: num("BOX_SIMULATED_DECISION_MS", 40),
@@ -1192,6 +1238,25 @@ export function loadBoxConfig(): BoxConfig {
     executionMaxWaitMs: num("BOX_EXECUTION_MAX_WAIT_MS", 1500),
     executionPollMs: num("BOX_EXECUTION_POLL_MS", 20),
     maxConcurrentExecutions: num("BOX_MAX_CONCURRENT_EXECUTIONS", 8),
+
+    /*
+     * ACCOUNT-FUNDS POLLING — a diagnostic, and priced like one.
+     *
+     * `bool` not `strictBool`, and enabled by default, because this knob cannot affect what trades:
+     * it decides whether a balance is DISPLAYED. A typo that silently disabled it would cost an
+     * operator a number on a screen, which does not justify refusing to boot. Contrast
+     * BOX_MAX_OPEN_BOXES, where a typo would silently remove a safety ceiling and therefore throws.
+     *
+     * 15s default. The figure moves only when an order fills or funds are transferred, so polling
+     * faster buys nothing and spends the same broker rate limit the market feed depends on. The
+     * freshness bound is deliberately WIDER than the interval (45s vs 15s) so a single missed or slow
+     * read does not flip a perfectly good balance to "stale" — it takes three consecutive failures.
+     *
+     * Neither value is safety-critical, so both clamp rather than throw.
+     */
+    accountFundsEnabled: bool("BOX_ACCOUNT_FUNDS_ENABLED", true),
+    accountFundsRefreshMs: clampInt("BOX_ACCOUNT_FUNDS_REFRESH_MS", 15_000, 2_000, 600_000),
+    accountFundsFreshnessMaxAgeMs: clampInt("BOX_ACCOUNT_FUNDS_MAX_AGE_MS", 45_000, 5_000, 3_600_000),
 
     boxDedicatedMarketFeed: bool("BOX_DEDICATED_MARKET_FEED", true),
     executionCoordinatorEnabled: bool("BOX_EXECUTION_COORDINATOR_ENABLED", true),

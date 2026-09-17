@@ -2111,7 +2111,19 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
   ): Promise<void> {
     const exec = this.active.get(executionId);
     this.abandon(executionId);
-    if (opportunityId !== null) this.activeOpportunities.delete(opportunityId);
+    // NOTE the deliberate ABSENCE of an unguarded `activeOpportunities.delete(opportunityId)` here.
+    //
+    // `abandon()` above already removes the entry, but ONLY when it still maps to THIS execution
+    // (see the guard at its own delete). That guard is the whole point, and repeating the delete
+    // unguarded defeated it: if a successor execution has since claimed the same opportunity id,
+    // this line deleted the SUCCESSOR's suppression entry while the successor was still running —
+    // re-opening the duplicate window for an opportunity that is actively executing.
+    //
+    // That is the same failure the no-await banner above `coordinateEntry` records having already
+    // been paid for once ("the second `claim()` also overwrote the first execution's
+    // `activeOpportunities` entry, after which execution #1's `abandon()` no longer removed its
+    // own key"), approached from the other side. The guarded delete in `abandon` is sufficient and
+    // is the only correct one.
     if (outcome === "clean") {
       await this.releaseLease(executionId, exec?.lease ?? null);
       this.stopHeartbeatIfIdle();
@@ -2120,10 +2132,11 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
     this.retain(executionId, exec, "uncertain_terminal_state");
   }
 
-  private holdOnUncertainty(executionId: string, opportunityId: string | null, why: string): void {
+  private holdOnUncertainty(executionId: string, _opportunityId: string | null, why: string): void {
     const exec = this.active.get(executionId);
+    // `abandon()` performs the OWNERSHIP-GUARDED removal. See the note in `settle` for why an
+    // unguarded delete here was actively harmful rather than merely redundant.
     this.abandon(executionId);
-    if (opportunityId !== null) this.activeOpportunities.delete(opportunityId);
     this.retain(executionId, exec, why);
   }
 
