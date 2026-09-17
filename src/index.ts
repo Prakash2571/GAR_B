@@ -1137,6 +1137,24 @@ app.use(errorHandler());
  */
 const httpServer = app.listen(config.port, () => {
   console.log(`GTS Algo Research backend listening on http://localhost:${config.port} (readiness: starting)`);
+  /*
+   * THE EXPECTED ORIGIN, PRINTED AT BOOT.
+   *
+   * A mutating request whose `Origin` does not match `csrfAllowedOrigin` is refused with
+   * `bad_origin` / "Request origin is not allowed." — correctly, but the operator then has no way to
+   * see what the server actually expects. GET requests keep working (the check runs only on
+   * POST/PUT/PATCH/DELETE), so the symptom is a UI that renders perfectly and refuses every action,
+   * which reads like a broken button rather than a configuration mismatch.
+   *
+   * The comparison is `protocol//host`, exact: `https://example.com` and `https://www.example.com`
+   * are DIFFERENT origins, as are http and https. Printing it turns a confusing 403 into a
+   * one-line diff against the browser's address bar.
+   */
+  console.log(
+    `[CSRF] mutating requests must carry Origin: ${config.csrfAllowedOrigin} ` +
+      `(from ${process.env.CSRF_ALLOWED_ORIGIN?.trim() ? "CSRF_ALLOWED_ORIGIN" : "FRONTEND_URL"}). ` +
+      `Compared as protocol//host, exactly — "www." and http/https differences do NOT match.`,
+  );
   console.log(
     `[Gates] BOX_EXECUTION_MODE=${boxExecutionMode} BOX_LIVE_TRADING_ENABLED=${boxLiveTradingEnabled} ` +
       `ZERODHA_LIVE_TRADING_ENABLED=${zerodhaLiveTradingEnabled} DHAN_LIVE_TRADING_ENABLED=${dhanLiveTradingEnabled} ` +
