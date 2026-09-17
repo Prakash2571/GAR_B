@@ -587,7 +587,26 @@ const pendingBrokerLogins = new PendingLoginStore();
  */
 const tokenProviderConfigs: BrokerProviderConfigs = {
   zerodha: {
-    url: (process.env.KITE_TOKEN_BROKER_URL ?? "https://calspread.online/api/kite/token").trim(),
+    /*
+     * NO DEFAULT URL, DELIBERATELY.
+     *
+     * THE DEFECT THIS CLOSES. These two URLs used to default to a specific external
+     * deployment's hostname. In `provider` mode with the URL unset, this backend would then POST
+     * its token-route passcode to a THIRD-PARTY HOST and accept a BROKER ACCESS TOKEN back from
+     * it — a token subsequently used to place real orders. `expectedIdentity`
+     * (`KITE_API_KEY_EXPECTED`) is optional, so without it nothing even checked that the token
+     * belonged to this deployment's API key.
+     *
+     * It was inert in `in_app` mode, which is the only reason it was survivable: the poller is
+     * started solely in the `provider` branch. But "inert unless one environment variable
+     * changes" is not a security property, and the fail-open direction is exactly wrong for a
+     * credential path — an operator switching to `provider` mode is the person LEAST likely to
+     * notice that a hostname they never configured is being contacted.
+     *
+     * Blank now, and the provider branch refuses to start without an explicit value. A
+     * deployment that genuinely uses a token service must name it.
+     */
+    url: (process.env.KITE_TOKEN_BROKER_URL ?? "").trim(),
     passcode: process.env.KITE_TOKEN_BROKER_PASSCODE ?? "",
     ...(process.env.KITE_API_KEY_EXPECTED?.trim()
       ? { expectedIdentity: process.env.KITE_API_KEY_EXPECTED.trim() }
@@ -596,7 +615,8 @@ const tokenProviderConfigs: BrokerProviderConfigs = {
     requireHttps: config.nodeEnv !== "test",
   },
   dhan: {
-    url: (process.env.DHAN_TOKEN_URL ?? "https://calspread.online/api/dhan/token").trim(),
+    /** No default, for the same reason as the Zerodha URL above. */
+    url: (process.env.DHAN_TOKEN_URL ?? "").trim(),
     passcode: process.env.DHAN_TOKEN_BROKER_PASSCODE ?? "",
     ...(process.env.DHAN_CLIENT_ID_EXPECTED?.trim()
       ? { expectedIdentity: process.env.DHAN_CLIENT_ID_EXPECTED.trim() }
@@ -1268,8 +1288,38 @@ async function boot(): Promise<void> {
      `startActiveRuntime()` is a no-op when the active broker has no session, so a first
      boot before anyone has signed in stays idle and honest rather than erroring. */
   if (brokerLoginMode === "provider") {
+    /*
+     * FAIL CLOSED ON AN UNCONFIGURED TOKEN PROVIDER.
+     *
+     * The provider route receives a BROKER ACCESS TOKEN and a passcode travels to it, so an
+     * unnamed host is not a default worth guessing — it is the one thing that must be stated
+     * explicitly. Refused here rather than at config-build time so an `in_app` deployment (which
+     * never starts the poller) is completely unaffected by this check.
+     *
+     * Only the ACTIVE broker's URL is required: a Zerodha-only deployment should not have to
+     * configure a Dhan token route it will never call.
+     */
+    const active = brokerManager.activeBroker;
+    const activeUrl = active === "dhan" ? tokenProviderConfigs.dhan.url : tokenProviderConfigs.zerodha.url;
+    const activeVar = active === "dhan" ? "DHAN_TOKEN_URL" : "KITE_TOKEN_BROKER_URL";
+    if (activeUrl === "") {
+      throw new Error(
+        `BROKER_LOGIN_MODE=provider requires ${activeVar} to be set explicitly. There is no default: ` +
+          `this route hands the backend a broker access token that will place real orders, so the host ` +
+          `must be one you control and name. Either set ${activeVar}, or use BROKER_LOGIN_MODE=in_app ` +
+          `and sign in from the workspace.`,
+      );
+    }
+    if (!tokenProviderConfigs[active].expectedIdentity) {
+      // Not fatal — but the only check that the returned token belongs to THIS deployment.
+      console.warn(
+        `[Token] ${active === "dhan" ? "DHAN_CLIENT_ID_EXPECTED" : "KITE_API_KEY_EXPECTED"} is not set, ` +
+          `so a token fetched from ${activeVar} is accepted without verifying it belongs to this ` +
+          `deployment's account. Set it before trading live through a token provider.`,
+      );
+    }
     await tokenService.start();
-    console.log("[Token] dual-broker acquisition scheduled (Asia/Kolkata).");
+    console.log(`[Token] dual-broker acquisition scheduled (Asia/Kolkata) via ${activeVar}.`);
   } else {
     await brokerManager.startActiveRuntime();
     console.log(
