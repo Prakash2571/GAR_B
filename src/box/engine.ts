@@ -246,6 +246,9 @@ import {
   type IBoxTrade,
   type PaperLeggingExecutionRecord,
   type ResidualLegExposure,
+  isPaperExecutionMode,
+  statedExecutionMode,
+  type ExecutionMode,
 } from "./types.js";
 import type { BoxExecutionFailureReason } from "./types.js";
 import type { BoxEntryOutcomeClass } from "./types.js";
@@ -665,6 +668,45 @@ export class BoxEngine {
    * underlying lock's answer survives a restart.
    */
   private residualUnderlyingByAttempt = new Map<string, string>();
+  /**
+   * WHOSE residual each attempt is: the execution mode and broker it was created under.
+   *
+   * Recorded because residual legs are worked by a periodic loop that reached the gateway with only
+   * `{ residual, keyPrefix }` — no ownership at all — so the gateway forked on the PROCESS mode and
+   * a `paper_legging` attempt's residual legs became real broker orders in a live process (and a
+   * live attempt's real legs were "flattened" by simulation in a paper one).
+   *
+   * Durable rows state their own mode/broker, so reconciliation passes theirs through verbatim.
+   * Anything registered by this process's own execution belongs to this process, which is the
+   * default. Entries are NEVER removed for being foreign: `residualLegCount()` is what the
+   * broker-switch guard and the exposure probe read, and under-reporting exposure there would be a
+   * worse bug than the one being fixed. Foreign residuals are held, reported and not acted on.
+   */
+  private residualOwnershipByAttempt = new Map<string, { mode: ExecutionMode; broker: BrokerId }>();
+  /**
+   * Why residual exposure could not be READ, or null when it is known.
+   *
+   * Non-null means the durable residual picture is UNKNOWN — which is emphatically not the same as
+   * empty, and is the state the old `catch { return []; }` was indistinguishable from. While set:
+   * new entry is refused (an unknown amount of exposure may already be on), an `entry`-scoped
+   * readiness blocker names the condition, and a bounded retry keeps trying to establish the truth.
+   *
+   * Deliberately `entry` and not `both`: not knowing what exposure exists makes taking MORE unsafe,
+   * but it must never become a reason the exposure this process already holds cannot be reduced.
+   */
+  private residualRecoveryLoadError: string | null = null;
+  /** Retry timer for an unreadable residual picture. Cleared the moment a read succeeds. */
+  private residualRecoveryRetryTimer: NodeJS.Timeout | null = null;
+  private static readonly RESIDUAL_RECOVERY_RETRY_MS = 15_000;
+  /**
+   * Restored positions this process must not execute against, keyed by trade id.
+   *
+   * Populated at adoption by comparing the position's own `execution_mode` against this process's.
+   * The positions STAY in the book — the broker-switch guard, the delete guard and the margin totals
+   * all read it, and hiding a position from them would be a worse bug. This is the visible record
+   * that they exist and why they cannot be worked here.
+   */
+  private readonly modeMismatchedPositions = new Map<string, string>();
   /**
    * The armed trading session (`BOX_SESSION_MAX_COMPLETED_TRADES`).
    *
@@ -1162,6 +1204,20 @@ export class BoxEngine {
       // Attributes a per-Box capital refusal to the broker it was judged against. Diagnostics
       // only: the capital metric itself is broker-independent.
       broker: () => this.deps.activeBroker(),
+      /*
+       * A restored record was refused at the submission boundary because its execution mode is not
+       * this process's. Recorded so the READINESS surface names it as a `reduction` blocker: a refused
+       * exit means exposure this process cannot close, which an operator must be told about rather
+       * than discovering from an unchanged position. Keyed by trade id so repeated monitor passes
+       * report the condition once rather than growing without bound.
+       */
+      onExecutionModeMismatch: (detail) => {
+        const id = detail.match(/^Position (\S+) /)?.[1] ?? detail;
+        if (!this.modeMismatchedPositions.has(id)) {
+          this.modeMismatchedPositions.set(id, detail);
+          console.error(`[Box] EXIT REFUSED — execution-mode mismatch: ${detail}`);
+        }
+      },
       isTokenWarm: (token) => this.tokenFeedGeneration.get(token) === this.feedGeneration,
       feedGeneration: () => this.feedGeneration,
       // COMBINED READINESS gate for NEW ENTRY (GAP 1 + D1). Live only: the market-data machine is
@@ -1346,8 +1402,9 @@ export class BoxEngine {
       // LAYER 1a of the underlying lock. Synchronous and durable-state derived, so the lock
       // cannot be lost by a lease expiring while a position is still open.
       activeUnderlyings: () => this.activeUnderlyings(),
-      // The session cycle budget. ENTRY only; every reduction path bypasses it.
-      sessionEntryGate: () => this.session.evaluateEntry(this.recoveryActive()),
+      // The session cycle budget, INTERSECTED with "is the residual picture known?". ENTRY only;
+      // every reduction path bypasses it.
+      sessionEntryGate: () => this.entryGateVerdict(),
       // CONSUME AN ATTEMPT AT ADMISSION. Called by the coordinator after every cheap gate has
       // passed and BEFORE any reservation or broker POST, so an attempt that then fails has still
       // spent its budget — which is the entire point of bounding attempts rather than completions.
@@ -1734,8 +1791,9 @@ export class BoxEngine {
       console.warn("[Box] closed-today seed failed:", err),
     );
     this.pnlArchiver.start();
-    // Open positions need live books even with the scanner stopped.
-    if (this.positions.size > 0) this.ensureFeed();
+    // Open positions AND residual legs need live books even with the scanner stopped. Residual
+    // reconciliation has already run by this point, so `residualLegCount()` is authoritative here.
+    if (this.positions.size > 0 || this.residualLegCount() > 0) this.ensureFeed();
     // Track market hours from boot, not only from RUN. Two things depend on it
     // whether or not anyone presses RUN: the monitor's view of tradability, and
     // the last-close view — which is the ONLY way to see how boxes were priced at
@@ -1748,7 +1806,12 @@ export class BoxEngine {
       await this.refreshClosedMarketView().catch((err) =>
         console.warn("[Box] last-close view failed at boot:", err),
       );
-    } else if (this.positions.size > 0) {
+    } else if (this.positions.size > 0 || this.residualLegCount() > 0) {
+      // Residual-only restarts included. Gating this on open positions alone meant a process that
+      // came back holding nothing but residual exposure never ran a universe pass, so it never
+      // placed a window, never subscribed anything, and — because an empty token set produces no
+      // 0→1 refcount edge — never even constructed the box-lane socket. It would then start its
+      // flatten timer against a feed that did not exist.
       await this.refreshUniverse().catch((err) =>
         console.warn("[Box] universe refresh failed at boot:", err),
       );
@@ -2396,6 +2459,7 @@ export class BoxEngine {
       this.universeTimer,
       this.ownedRetryTimer,
       this.residualFlattenTimer,
+      this.residualRecoveryRetryTimer,
     ]) {
       if (t) clearInterval(t);
     }
@@ -2405,6 +2469,7 @@ export class BoxEngine {
     this.universeTimer = null;
     this.ownedRetryTimer = null;
     this.residualFlattenTimer = null;
+    this.residualRecoveryRetryTimer = null;
     this.orderManager?.dispose();
     // The reservation heartbeat. It only exists while a lease is held, and it is
     // unref'd, but stopping it explicitly keeps the "every timer the engine owns is
@@ -2651,9 +2716,19 @@ export class BoxEngine {
     }
   }
 
-  /** Let the feed go when neither discovery nor any open position needs it. */
+  /**
+   * Let the feed go when neither discovery, nor any open position, nor any OUTSTANDING RESIDUAL
+   * needs it.
+   *
+   * The residual clause is not defensive tidying. Residual legs are exposure without an open
+   * position, so this guard used to release the tick listener, the connection listener and the
+   * retainer while the flatten loop was still trying to work them — `registerResidual` called
+   * `ensureFeed()`, and this method undid it on the next STOP, trade deletion, exit or SSE detach.
+   * With no ticks arriving, the flatten loop can never see a priceable book, so exposure stays on
+   * indefinitely with nothing reporting why.
+   */
   private maybeReleaseFeed(): void {
-    if (this.running || this.positions.size > 0) return;
+    if (this.running || this.positions.size > 0 || this.residualLegCount() > 0) return;
     if (this.removeConnectionListener) {
       this.removeConnectionListener();
       this.removeConnectionListener = null;
@@ -2886,9 +2961,13 @@ export class BoxEngine {
       );
     }
 
-    // Underlyings of open positions must always be in the universe, whatever the
-    // budget says, so their legs keep streaming.
+    // Underlyings carrying EXPOSURE must always be in the universe, whatever the
+    // budget says, so their legs keep streaming. That is open positions AND unresolved
+    // residual legs: a residual-only underlying is exposure with no open position, and
+    // leaving it out let a routine universe pass unsubscribe the books the flatten loop
+    // needs — including the window pruning at the end of this method.
     const mustKeep = new Set(this.positions.list().map((p) => p.underlying));
+    for (const symbol of this.residualUnderlyings()) mustKeep.add(symbol);
 
     // Seed the spot values we do not have yet, so a first window can be placed.
     await this.seedSpots(all);
@@ -3033,6 +3112,10 @@ export class BoxEngine {
 
     // Open positions' legs are subscribed unconditionally.
     for (const t of this.positions.tokens()) wantOption.add(t);
+    // So are residual legs. This union is the ONLY unconditional one, so a residual whose
+    // underlying fell out of the board or lost the budget race would otherwise be dropped
+    // here even though the exposure is still on.
+    for (const t of this.residualTokens()) wantOption.add(t);
 
     // The forced rebuild (from a strike-level change) has now been applied.
     this.forceWindowRebuild = false;
@@ -3250,9 +3333,20 @@ export class BoxEngine {
     }
   }
 
-  /** After STOP: keep only what the open positions need. */
+  /**
+   * After STOP: keep only what OUTSTANDING EXPOSURE needs — open positions AND residual legs.
+   *
+   * STOP is an operator SAFETY control. It turns discovery off; it must never remove the market data
+   * that reducing existing exposure depends on. Computing the keep-set from `positions` alone meant a
+   * residual-only book (an incomplete entry that left legs behind without opening a box) had its
+   * subscriptions dropped and its quotes forgotten by the very action an operator reaches for when
+   * something looks wrong.
+   */
   private shrinkToOpenPositions(): void {
     const keepUnderlyings = new Set(this.positions.list().map((p) => p.underlying));
+    // Residual exposure keeps its underlying's window and spot alive too, so the flatten loop can
+    // still centre and price the contracts it is unwinding.
+    for (const symbol of this.residualUnderlyings()) keepUnderlyings.add(symbol);
     for (const underlying of [...this.windows.keys()]) {
       if (keepUnderlyings.has(underlying)) continue;
       this.windows.delete(underlying);
@@ -3261,6 +3355,9 @@ export class BoxEngine {
     this.scanner.clearOpportunities();
 
     const wantOption = new Set<number>(this.positions.tokens());
+    // Residual legs are exposure. They are subscribed on exactly the same footing as an open
+    // position's legs, and for the same reason: they cannot be flattened from a book we dropped.
+    for (const token of this.residualTokens()) wantOption.add(token);
     const wantSpot = new Set<number>();
     for (const underlying of keepUnderlyings) {
       const w = this.windows.get(underlying);
@@ -3907,6 +4004,8 @@ export class BoxEngine {
     this.positions.remove(position.id);
     this.syncManagerExposure();
     this.marginBackfillTries.delete(position.id);
+    // The position is gone, so its unworkability is no longer a fact about this process.
+    this.modeMismatchedPositions.delete(position.id);
     // The Box is FLAT and durably closed, so the underlying-level protection must end. Doing it
     // here rather than letting a TTL lapse is what stops the lock being incorrectly retained
     // after a position is fully flat. `releaseUnderlyingForPosition` is reference-counted, so a
@@ -4240,6 +4339,27 @@ export class BoxEngine {
       last_persist_at: Date.now(),
       config: doc.scanner_config_snapshot,
     });
+    /*
+     * MODE ISOLATION, RECORDED AT ADOPTION.
+     *
+     * The position is deliberately still ADDED to the book above: the broker-switch guard, the
+     * delete guard and the per-broker margin/P&L totals all read that book, and a position hidden
+     * from them would be a worse defect than the one this guards. What changes is that a record
+     * whose fills are of a different KIND from this process's is now known to be unworkable here,
+     * so it can be reported instead of silently exited under the wrong regime. The gateway refuses
+     * it again at the submission boundary — see `executionModeMismatch` there.
+     */
+    const statedDocMode = statedExecutionMode(doc.execution_mode);
+    if (statedDocMode !== null && isPaperExecutionMode(statedDocMode) !== isPaperExecutionMode(this.cfg.executionMode)) {
+      const detail =
+        `Trade ${doc._id.toString()} was opened in ${doc.execution_mode} mode but this process runs ` +
+        `${this.cfg.executionMode}. It is monitored and reported, but this process must not exit it: ` +
+        (isPaperExecutionMode(this.cfg.executionMode)
+          ? "simulating the close would mark it closed while real exposure remained."
+          : "sending real orders for it would reduce whatever genuine exposure shares its contracts.");
+      this.modeMismatchedPositions.set(doc._id.toString(), detail);
+      console.error(`[Box] ADOPTED BUT NOT EXECUTABLE HERE: ${detail}`);
+    }
     return true;
   }
 
@@ -4349,6 +4469,7 @@ export class BoxEngine {
       /* ---- 1. in-memory position book, and everything keyed off it ---- */
       if (position) {
         this.positions.remove(id);          // also frees the byKey / reserved entry
+        this.modeMismatchedPositions.delete(id);
         this.syncManagerExposure();         // exposure counts the manager enforces
         // The record is being destroyed, so nothing could ever release the claim later.
         void this.releaseUnderlyingClaim(position.underlying, id);
@@ -4603,7 +4724,28 @@ export class BoxEngine {
    * feed is healthy, exactly like an open position.
    */
   private async reconcileResidualExposure(): Promise<void> {
-    const attempts = await loadUnresolvedBoxExecutionAttempts();
+    let attempts: Awaited<ReturnType<typeof loadUnresolvedBoxExecutionAttempts>>;
+    try {
+      attempts = await loadUnresolvedBoxExecutionAttempts();
+    } catch (err) {
+      /*
+       * RESIDUAL STATE IS UNKNOWN, WHICH IS NOT THE SAME AS EMPTY.
+       *
+       * The loader used to swallow this and answer `[]`, so boot proceeded believing there was no
+       * outstanding exposure. Recorded rather than rethrown because a read failure must NOT stop the
+       * exposure this process already owns from being reduced — it only makes taking NEW exposure
+       * unsafe, because we cannot know what is already on.
+       */
+      this.residualRecoveryLoadError = err instanceof Error ? err.message : String(err);
+      this.ensureResidualRecoveryRetry();
+      console.error(
+        `[Box] residual exposure could not be READ (${this.residualRecoveryLoadError}) — entry is ` +
+          `refused until it is known; already-owned risk reduction continues.`,
+      );
+      return;
+    }
+    // A successful read is the only thing that clears the blocker.
+    this.residualRecoveryLoadError = null;
     let total = 0;
     for (const a of attempts) {
       const residual = (a.residual_exposure ?? []) as ResidualLegExposure[];
@@ -4629,6 +4771,10 @@ export class BoxEngine {
         // Read off the durable row, so the underlying lock blocks this symbol again after a
         // restart exactly as it did before one.
         a.underlying,
+        // OWNERSHIP FROM THE ROW, never from this process's config. The row states the mode and
+        // broker the exposure was actually created under; that is precisely what decides whether this
+        // process may trade against it.
+        { mode: a.execution_mode, broker: brokerOf(a) },
       );
       total += residual.length;
     }
@@ -4640,11 +4786,148 @@ export class BoxEngine {
     }
   }
 
+  /**
+   * The ENTRY-ONLY gate the coordinator enforces: the armed session's verdict, plus the requirement
+   * that outstanding residual exposure is actually KNOWN.
+   *
+   * Hooked here rather than into a new mechanism because this gate is already, by construction,
+   * consulted on the entry path only — every protective path (exit, cancel, residual flatten,
+   * reconciliation-driven reduction) bypasses it. That is exactly the asymmetry an unknown residual
+   * picture needs: it must stop new exposure without ever stopping reduction.
+   *
+   * The coordinator maps this layer onto the single `session_limit_reached` failure reason and passes
+   * our `reason`/`detail` through verbatim, precisely so a database blip is not reported to an operator
+   * as "out of budget" — so the distinct reason code survives.
+   */
+  private entryGateVerdict(): { allowed: boolean; reason: string | null; detail: string | null } {
+    if (this.residualRecoveryLoadError !== null) {
+      return {
+        allowed: false,
+        reason: "residual_state_unknown",
+        detail:
+          `Outstanding residual exposure could not be read (${this.residualRecoveryLoadError}), so how ` +
+          `much exposure is already on is unknown. Unknown is not none: no new box is opened until the ` +
+          `read succeeds. Reduction of known exposure is unaffected.`,
+      };
+    }
+    return this.session.evaluateEntry(this.recoveryActive());
+  }
+
   /** How many residual legs are still outstanding across all attempts. */
   private residualLegCount(): number {
     let n = 0;
     for (const legs of this.residualByAttempt.values()) n += legs.length;
     return n;
+  }
+
+  /**
+   * Every instrument token that OUTSTANDING RESIDUAL EXPOSURE needs a live book for.
+   *
+   * WHY THIS EXISTS. Residual legs are real (or really simulated) exposure that no ordinary open
+   * position represents: an incomplete entry can leave them behind without ever creating a box. Every
+   * subscription decision used to be computed from `positions.tokens()` alone, so a residual-only book
+   * was invisible to all of them — STOP, the boot universe pass, a universe refresh and the SSE
+   * disposer would each drop the very instruments the flatten loop needs to price its own unwind, and
+   * `applySubscriptions` would additionally `quotes.forget()` them. The flatten loop then could not
+   * act, silently, for as long as the process lived.
+   *
+   * `token` is present on every {@link ResidualLegExposure}, so this needs no lookup and cannot fail.
+   */
+  private residualTokens(): Set<number> {
+    const out = new Set<number>();
+    for (const legs of this.residualByAttempt.values()) {
+      for (const leg of legs) out.add(leg.token);
+    }
+    return out;
+  }
+
+  /**
+   * The underlyings that outstanding residual exposure belongs to.
+   *
+   * Kept alongside {@link residualTokens} because a window (and therefore a spot subscription) is
+   * placed per underlying, not per contract. Deliberately NOT the primary mechanism: the boot
+   * recovery call site historically registered residuals without an underlying, so an
+   * underlying-only fix would miss exactly the crash-recovery case that matters most. Tokens are
+   * authoritative; this only widens the window/spot keep-set.
+   */
+  private residualUnderlyings(): Set<string> {
+    const out = new Set<string>();
+    for (const [attemptId, symbol] of this.residualUnderlyingByAttempt) {
+      if (this.residualByAttempt.has(attemptId)) out.add(symbol);
+    }
+    return out;
+  }
+
+  /**
+   * Why this process must not FLATTEN this residual attempt, or null when it may.
+   *
+   * The paper/live boundary only — `paper_touch` and `paper_latency` are interchangeable, so exact
+   * equality would refuse work this process is perfectly entitled to do. Broker is compared too:
+   * Dhan and Zerodha order ids are unrelated identifier spaces, so "flattening" a Dhan residual
+   * through Zerodha either 404s or collides with an unrelated real order.
+   *
+   * An attempt with no recorded ownership is treated as THIS process's, which preserves the previous
+   * behaviour exactly for anything registered before this map existed.
+   */
+  private residualOwnershipMismatch(attemptId: string): string | null {
+    const owner = this.residualOwnershipByAttempt.get(attemptId);
+    if (!owner) return null;
+    // NO CLAIM ⇒ NO REFUSAL, for the same reason as the gateway's position check: a durable row that
+    // does not state its mode cannot contradict this process, and refusing to flatten on the strength
+    // of missing data would leave exposure on. See `statedExecutionMode`.
+    const stated = statedExecutionMode(owner.mode);
+    if (stated !== null && isPaperExecutionMode(stated) !== isPaperExecutionMode(this.cfg.executionMode)) {
+      return (
+        `residual ${attemptId} was created in ${owner.mode} mode but this process runs ` +
+        `${this.cfg.executionMode}` +
+        (isPaperExecutionMode(this.cfg.executionMode)
+          ? " — refusing to SIMULATE flattening real broker exposure"
+          : " — refusing to send REAL orders for simulated exposure")
+      );
+    }
+    const active = this.deps.activeBroker();
+    if (owner.broker !== active) {
+      return (
+        `residual ${attemptId} belongs to ${owner.broker} but ${active} is active — order-id spaces ` +
+        `are unrelated, so it must be flattened by its own broker`
+      );
+    }
+    return null;
+  }
+
+  /** Residual attempts this process is holding but must not act on, with the reason. */
+  private residualOwnershipMismatches(): { attemptId: string; reason: string }[] {
+    const out: { attemptId: string; reason: string }[] = [];
+    for (const attemptId of this.residualByAttempt.keys()) {
+      const reason = this.residualOwnershipMismatch(attemptId);
+      if (reason !== null) out.push({ attemptId, reason });
+    }
+    return out;
+  }
+
+  /**
+   * Add residual legs to the CURRENT subscription set without disturbing anything else.
+   *
+   * `registerResidual` retained the feed but never asked for the instruments — it held a transport
+   * with nothing on it. This closes that asymmetry at the moment exposure is registered, which is the
+   * only point at which the engine learns the tokens exist. Additive on purpose: `applySubscriptions`
+   * has REPLACE semantics, so it is handed the existing set plus the residual tokens rather than a
+   * freshly computed universe, which this method has no business recomputing.
+   */
+  private ensureResidualSubscriptions(): void {
+    const residual = this.residualTokens();
+    if (residual.size === 0) return;
+    let missing = false;
+    for (const token of residual) {
+      if (!this.subscribedOptionTokens.has(token)) {
+        missing = true;
+        break;
+      }
+    }
+    if (!missing) return;
+    const wantOption = new Set<number>(this.subscribedOptionTokens);
+    for (const token of residual) wantOption.add(token);
+    this.applySubscriptions(wantOption, new Set<number>(this.subscribedSpotTokens));
   }
 
   /**
@@ -4694,6 +4977,13 @@ export class BoxEngine {
     projectionVersion = 0,
     projectionIdentity = residualProjectionIdentity(residual),
     underlying?: string,
+    /**
+     * The mode/broker this residual was created under. Omitted ⇒ THIS process, which is correct for
+     * every in-process registration (a residual produced by this engine's own execution). Boot
+     * reconciliation passes the durable row's own values instead, so a restored residual is worked
+     * only by a process that matches it.
+     */
+    ownership?: { mode: ExecutionMode; broker: BrokerId },
   ): void {
     this.residualProjectionVersion.set(attemptId, projectionVersion);
     this.residualProjectionIdentity.set(attemptId, projectionIdentity);
@@ -4703,6 +4993,7 @@ export class BoxEngine {
       const resolved = this.residualUnderlyingByAttempt.get(attemptId);
       this.residualByAttempt.delete(attemptId);
       this.residualUnderlyingByAttempt.delete(attemptId);
+      this.residualOwnershipByAttempt.delete(attemptId);
       if (resolved) {
         void this.coordinator
           .releaseUnderlyingForResidual(resolved, attemptId)
@@ -4710,6 +5001,10 @@ export class BoxEngine {
       }
     } else {
       this.residualByAttempt.set(attemptId, residual);
+      this.residualOwnershipByAttempt.set(attemptId, {
+        mode: ownership?.mode ?? this.cfg.executionMode,
+        broker: ownership?.broker ?? this.deps.activeBroker(),
+      });
       if (underlying) {
         const symbol = underlying.trim().toUpperCase();
         this.residualUnderlyingByAttempt.set(attemptId, symbol);
@@ -4718,6 +5013,10 @@ export class BoxEngine {
         void this.coordinator.claimUnderlyingForResidual(symbol, attemptId).catch(() => undefined);
       }
       this.ensureFeed(); // outstanding exposure needs live books to flatten
+      // ...and RETAINING the transport is not the same as asking for the instruments. Without this
+      // the engine held a feed carrying none of the residual contracts, so the flatten loop had a
+      // healthy socket and no book to price against.
+      this.ensureResidualSubscriptions();
       this.ensureResidualFlattenTimer();
     }
     this.orderManager?.setExposure({ residualLegs: this.residualLegCount() });
@@ -4845,6 +5144,38 @@ export class BoxEngine {
     if (this.residualFlattenTimer) return;
     this.residualFlattenTimer = setInterval(() => void this.flattenResiduals(), BoxEngine.RESIDUAL_FLATTEN_MS);
     this.residualFlattenTimer.unref?.();
+  }
+
+  /**
+   * Keep retrying the residual READ until it succeeds.
+   *
+   * Recovery discovery ran exactly once, at boot, and the flatten loop only ever retries legs it
+   * already holds in memory — so a read that failed was never re-attempted, and the process stayed
+   * blind for its whole life. This is the missing retry: it re-reads the durable picture, and a
+   * success clears both the blocker and this timer. It never touches already-owned exposure, so it
+   * cannot interfere with reduction in progress.
+   */
+  private ensureResidualRecoveryRetry(): void {
+    if (this.residualRecoveryRetryTimer || this.disposed) return;
+    this.residualRecoveryRetryTimer = setInterval(() => {
+      if (this.residualRecoveryLoadError === null || this.disposed) {
+        if (this.residualRecoveryRetryTimer) {
+          clearInterval(this.residualRecoveryRetryTimer);
+          this.residualRecoveryRetryTimer = null;
+        }
+        return;
+      }
+      void this.reconcileResidualExposure()
+        .then(() => {
+          if (this.residualRecoveryLoadError === null && this.residualRecoveryRetryTimer) {
+            clearInterval(this.residualRecoveryRetryTimer);
+            this.residualRecoveryRetryTimer = null;
+            console.log("[Box] residual exposure is readable again — entry is no longer refused for it.");
+          }
+        })
+        .catch(() => undefined);
+    }, BoxEngine.RESIDUAL_RECOVERY_RETRY_MS);
+    this.residualRecoveryRetryTimer.unref?.();
   }
 
   /**
@@ -5230,6 +5561,14 @@ export class BoxEngine {
     for (const [attemptId, residual] of [...this.residualByAttempt]) {
       if (this.pendingResidualPersists.has(attemptId)) continue;
       if (this.residualFlattenInFlight.has(attemptId)) continue; // no concurrent flatten
+      /*
+       * OWNERSHIP BEFORE ACTION. A restored residual states the mode and broker it was created
+       * under; this process must match both before it may trade against it. Skipped — never
+       * deleted — so `residualLegCount()` keeps reporting the exposure to the broker-switch guard
+       * and the exposure probe, and the readiness surface keeps naming it as a reduction blocker.
+       */
+      const foreign = this.residualOwnershipMismatch(attemptId);
+      if (foreign !== null) continue;
       this.residualFlattenInFlight.add(attemptId);
       this.metrics.recordResidualFlattenAttempt();
       try {
@@ -6554,6 +6893,45 @@ export class BoxEngine {
           `unknown, not zero, so no new exposure is taken on top of them.`,
       });
     }
+    /*
+     * RESIDUAL STATE UNREADABLE. Scoped `entry`, not `both`: not knowing what residual exposure
+     * exists makes taking NEW exposure unsafe, but it must never be a reason the exposure this
+     * process already holds cannot be reduced. Worded after `readiness_evidence_unavailable` — the
+     * point is that unverified is not the same as verified.
+     */
+    if (this.residualRecoveryLoadError !== null) {
+      engineBlockers.push({
+        code: "residual_state_unknown",
+        scope: "entry",
+        detail:
+          `Outstanding residual exposure could not be READ (${this.residualRecoveryLoadError}). ` +
+          `Unknown is not the same as none, so no new exposure is taken until it is established. ` +
+          `Reduction of known exposure continues, and the read is retried automatically.`,
+      });
+    }
+    /*
+     * EXPOSURE THIS PROCESS MUST NOT EXECUTE. Scoped `reduction` — the most serious scope — because
+     * that is precisely what it means: a real position or residual is on, and this process is the
+     * wrong kind of process to close it. Naming it is the whole point; the previous behaviour was to
+     * exit it under the wrong regime without a word.
+     */
+    const foreignResiduals = this.residualOwnershipMismatches();
+    const mismatchedPositions = [...this.modeMismatchedPositions.values()];
+    if (foreignResiduals.length > 0 || mismatchedPositions.length > 0) {
+      const parts = [
+        ...mismatchedPositions,
+        ...foreignResiduals.map((m) => m.reason),
+      ].slice(0, 3);
+      engineBlockers.push({
+        code: "execution_mode_mismatch",
+        scope: "reduction",
+        detail:
+          `${mismatchedPositions.length} restored position(s) and ${foreignResiduals.length} residual ` +
+          `attempt(s) were created under a different execution mode or broker than this process, so it ` +
+          `must not trade against them: ${parts.join(" | ")}` +
+          (mismatchedPositions.length + foreignResiduals.length > parts.length ? " …" : ""),
+      });
+    }
     // FUNDING ADMISSION, surfaced in the ONE authoritative readiness decision.
     //
     // Previously a funding refusal existed only inside the OPEN `economic_admission` blob, so the
@@ -7286,7 +7664,14 @@ export class BoxEngine {
     this.writeFrame(client, "snapshot", this.snapshot());
     return () => {
       this.sseClients.delete(client);
-      if (this.sseClients.size === 0 && !this.running && this.positions.size === 0) {
+      // `maybeReleaseFeed` now guards residuals itself; this pre-check is kept in step with it so
+      // the two can never disagree about whether the feed is still needed.
+      if (
+        this.sseClients.size === 0 &&
+        !this.running &&
+        this.positions.size === 0 &&
+        this.residualLegCount() === 0
+      ) {
         this.maybeReleaseFeed();
       }
     };

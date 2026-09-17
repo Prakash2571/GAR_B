@@ -643,7 +643,32 @@ export type BoxExecutionFailureReason =
    * Blocks NEW ENTRY ONLY. Monitoring, exit, residual flattening, reconciliation and recovery
    * all continue — a spent session budget must never be a reason exposure cannot be reduced.
    */
-  | "session_limit_reached";
+  | "session_limit_reached"
+  /**
+   * The RECORD and the PROCESS disagree about whether the fills are real.
+   *
+   * Restored state carries the execution mode it was actually created under
+   * (`IBoxTrade.execution_mode`, `IBoxExecutionAttempt.execution_mode`) precisely so it can be
+   * compared against the running process — but nothing compared them, and the exit/flatten path
+   * forked on the PROCESS mode alone. Both directions were unsafe:
+   *
+   *   live process + paper record — a simulated position drives REAL broker orders. The manager's
+   *                                attributed-position check is keyed by `exchange:tradingsymbol`,
+   *                                so when a genuine live box holds the same contract the paper
+   *                                record's exit passes every side/size test and reduces the LIVE
+   *                                box's exposure.
+   *   paper process + live record — the close is SIMULATED and the row is marked closed while real
+   *                                broker exposure remains. No order is ever sent, and nothing says so.
+   *
+   * Refusing is the safe answer in both directions, because the refusal strands nothing this process
+   * could legitimately have acted on: a paper record has no real exposure to leave behind, and a live
+   * record's real exposure must be reduced by a live process, never simulated away. The refusal is
+   * always accompanied by a `reduction`-scoped readiness blocker, so it can never be silent.
+   *
+   * Compared on the PAPER/LIVE BOUNDARY only (see `isPaperExecutionMode`), never by exact equality —
+   * `paper_touch` and `paper_latency` are freely interchangeable and must stay so.
+   */
+  | "execution_mode_mismatch";
 
 /** One leg's detection → execution comparison. */
 export interface BoxExecutionLeg {
@@ -1913,4 +1938,28 @@ export type { BrokerId } from "../brokers/types.js";
 /** True for every simulated execution mode — i.e. anything that is not live. */
 export function isPaperExecutionMode(mode: ExecutionMode): boolean {
   return mode !== "live";
+}
+
+/**
+ * The execution mode a record actually STATES, or null when it makes no claim.
+ *
+ * WHY THIS IS NOT `?? "paper_touch"`. Mode isolation refuses to act on a record whose fills are of a
+ * different KIND from the running process. That refusal must rest on a mode the record genuinely
+ * asserts — never on the ABSENCE of one. Defaulting a missing value to any paper mode would turn
+ * "we cannot tell" into the positive claim "this is simulated", and a live process would then refuse
+ * to exit it: a REDUCTION blocker manufactured out of missing data, which is the one direction this
+ * codebase never fails in ("a blocked exit guarantees exposure stays").
+ *
+ * `null` therefore means NO CLAIM, and every caller treats it as "no mismatch" — i.e. exactly the
+ * behaviour that existed before mode isolation. Real records are unaffected: `box_trades.execution_mode`
+ * and `box_execution_attempts.execution_mode` are both `NOT NULL`, so a restored position or attempt
+ * always states its mode and is always checked.
+ *
+ * Deliberately validates against {@link EXECUTION_MODES} rather than trusting the declared type: this
+ * reads values that crossed a database or process boundary, where the compiler guarantees nothing.
+ */
+export function statedExecutionMode(value: unknown): ExecutionMode | null {
+  return typeof value === "string" && (EXECUTION_MODES as readonly string[]).includes(value)
+    ? (value as ExecutionMode)
+    : null;
 }
