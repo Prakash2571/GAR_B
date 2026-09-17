@@ -1228,7 +1228,19 @@ export function loadBoxConfig(): BoxConfig {
      * attempt budget bounds RISK-TAKING, including attempts that took real exposure and were then
      * unwound. A trial wants both.
      */
-    maxOpenBoxes: clampInt("BOX_MAX_OPEN_BOXES", 0, 0, 50),
+    /*
+     * `strictLimitInt`, NOT `clampInt` — and this setting is the textbook case for it.
+     *
+     * `fallback === min === 0` AND `0` means UNLIMITED, which is exactly the combination
+     * `strictLimitInt`'s own doc comment names: with `clampInt`, `BOX_MAX_OPEN_BOXES="one"` (NaN →
+     * fallback), `"-1"` (clamped up to the minimum) and `"0.5"` (rounded down) would ALL silently
+     * resolve to 0 = unlimited. An operator hand-typing the one ceiling that stops a second box from
+     * opening would have removed it, and nothing anywhere would have said so.
+     *
+     * The first draft of this setting used `clampInt`. It was wrong for the same reason the session
+     * ceilings were wrong before `strictLimitInt` was introduced for them.
+     */
+    maxOpenBoxes: strictLimitInt("BOX_MAX_OPEN_BOXES", 0, 0, 50),
     conflictRevalidateMinEdgeRatio: num("BOX_CONFLICT_REVALIDATE_MIN_EDGE_RATIO", 0.8),
     // Default FALSE, preserving today's single-process semantics exactly. Multi-worker
     // deployments (PM2 cluster mode, several replicas) must set it true so live
@@ -1361,7 +1373,16 @@ export function loadBoxConfig(): BoxConfig {
     liveRequireStageFunding: bool("BOX_LIVE_REQUIRE_STAGE_FUNDING", false),
     liveRecoveryReserveRupees: strictLimitInt("BOX_LIVE_RECOVERY_RESERVE_RUPEES", 0, 0, 100_000_000),
 
-    oneActiveBoxPerUnderlying: bool("BOX_ONE_ACTIVE_BOX_PER_UNDERLYING", false),
+    /*
+     * `strictBool`, NOT `bool` — because this switch's default is the UNSAFE direction.
+     *
+     * `bool()` resolves an unrecognised value to the fallback, and the fallback here is `false` =
+     * protection OFF. So `BOX_ONE_ACTIVE_BOX_PER_UNDERLYING=ture` silently disabled the per-underlying
+     * lock, on a deployment whose operator had explicitly asked for it. A safety switch must never
+     * resolve a typo to the permissive setting; `BOX_ENABLE_SHORT_BOX` already uses `strictBool` for
+     * exactly this reason, and this one was inconsistent with it.
+     */
+    oneActiveBoxPerUnderlying: strictBool("BOX_ONE_ACTIVE_BOX_PER_UNDERLYING", false),
     sessionMaxCompletedTrades: strictLimitInt("BOX_SESSION_MAX_COMPLETED_TRADES", 0, 0, 10_000),
     sessionMaxEntryAttempts: strictLimitInt("BOX_SESSION_MAX_ENTRY_ATTEMPTS", 0, 0, 10_000),
     paperMaxBoxCapitalRupees: clampInt("BOX_PAPER_MAX_BOX_CAPITAL_RUPEES", 0, 0, 1_000_000_000),

@@ -261,6 +261,58 @@ test("an unresolved PARTIAL entry still counts — a half-filled box is capital 
 
 /* ─────────────────────────── and does not over-refuse ─────────────────────────── */
 
+/* ───────────── the ceiling cannot be removed by a typo ───────────── */
+
+test("a malformed BOX_MAX_OPEN_BOXES is REFUSED at boot, never defaulted to unlimited", async () => {
+  // `fallback === min === 0` and 0 means UNLIMITED, so `clampInt` would have turned every one of
+  // these into "no ceiling at all" — silently, on the single control an operator relies on to stop a
+  // second box. `strictLimitInt` refuses instead. This is the property, not an implementation detail.
+  const { loadBoxConfig } = await import("../../dist/box/config.js");
+  const saved = process.env.BOX_MAX_OPEN_BOXES;
+  try {
+    for (const bad of ["one", "-1", "0.5", "1e", "51"]) {
+      process.env.BOX_MAX_OPEN_BOXES = bad;
+      assert.throws(
+        () => loadBoxConfig(),
+        /BOX_MAX_OPEN_BOXES/,
+        `BOX_MAX_OPEN_BOXES="${bad}" must be refused, not silently resolved to unlimited`,
+      );
+    }
+    // And the values an operator actually means still work.
+    for (const good of ["1", "0", "50"]) {
+      process.env.BOX_MAX_OPEN_BOXES = good;
+      assert.equal(loadBoxConfig().maxOpenBoxes, Number(good));
+    }
+  } finally {
+    if (saved === undefined) delete process.env.BOX_MAX_OPEN_BOXES;
+    else process.env.BOX_MAX_OPEN_BOXES = saved;
+  }
+});
+
+test("a malformed BOX_ONE_ACTIVE_BOX_PER_UNDERLYING is REFUSED, not resolved to OFF", async () => {
+  // The fallback is `false` = protection off, so `bool()` turned a typo into a silently disabled
+  // per-underlying lock on a deployment that had explicitly asked for it.
+  const { loadBoxConfig } = await import("../../dist/box/config.js");
+  const saved = process.env.BOX_ONE_ACTIVE_BOX_PER_UNDERLYING;
+  try {
+    for (const bad of ["ture", "on", "TRUE!", "y"]) {
+      process.env.BOX_ONE_ACTIVE_BOX_PER_UNDERLYING = bad;
+      assert.throws(
+        () => loadBoxConfig(),
+        /BOX_ONE_ACTIVE_BOX_PER_UNDERLYING/,
+        `"${bad}" must be refused rather than silently disabling the lock`,
+      );
+    }
+    for (const [good, expected] of [["true", true], ["1", true], ["yes", true], ["false", false], ["no", false]]) {
+      process.env.BOX_ONE_ACTIVE_BOX_PER_UNDERLYING = good;
+      assert.equal(loadBoxConfig().oneActiveBoxPerUnderlying, expected);
+    }
+  } finally {
+    if (saved === undefined) delete process.env.BOX_ONE_ACTIVE_BOX_PER_UNDERLYING;
+    else process.env.BOX_ONE_ACTIVE_BOX_PER_UNDERLYING = saved;
+  }
+});
+
 test("0 means UNLIMITED, so an existing deployment is unaffected", async () => {
   const gateway = controllableGateway();
   const { coordinator, inventory } = makeCoordinator({ gateway, config: { maxOpenBoxes: 0 } });
