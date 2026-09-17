@@ -416,6 +416,58 @@ test("B5: the non-legging exit path is guarded too, with a correctly shaped reco
   assert.deepEqual(result.record.legs, []);
 });
 
+test("B9: a record that states NO mode is NOT refused — missing data must not block a reduction", async () => {
+  let simulatorCalls = 0;
+  const { gateway, mismatches } = await makeGateway("live", {
+    simulateLeggingExit: async () => {
+      simulatorCalls++;
+      return { ok: true, legs: [], record: {}, booksAtFill: new Map() };
+    },
+  });
+
+  const noClaim = position("live");
+  delete noClaim.execution_mode;
+
+  const result = await gateway.simulateLeggingExit({
+    position: noClaim,
+    detectionLegs: detectionLegs(),
+    detectedAt: 1_000,
+  });
+
+  /*
+   * The refusal must rest on a mode the record ASSERTS, never on the absence of one. Defaulting a
+   * missing value to "paper" would turn "cannot tell" into a positive claim and a live process would
+   * refuse to exit it — a reduction blocker manufactured from missing data, which is the one
+   * direction this codebase never fails in. Real rows are unaffected: both execution_mode columns
+   * are NOT NULL, so a restored position always states its mode and is always checked.
+   */
+  assert.notEqual(result.reason, "execution_mode_mismatch", "an unstated mode must not be treated as a mismatch");
+  assert.equal(mismatches.length, 0, "no claim means nothing to report");
+  assert.equal(simulatorCalls, 1, "the exit must proceed exactly as it did before mode isolation existed");
+});
+
+test("B10: an unrecognised mode string is also treated as NO CLAIM, not as paper", async () => {
+  let simulatorCalls = 0;
+  const { gateway } = await makeGateway("live", {
+    simulateLeggingExit: async () => {
+      simulatorCalls++;
+      return { ok: true, legs: [], record: {}, booksAtFill: new Map() };
+    },
+  });
+
+  const garbage = position("live");
+  garbage.execution_mode = "not_a_real_mode";
+
+  const result = await gateway.simulateLeggingExit({
+    position: garbage,
+    detectionLegs: detectionLegs(),
+    detectedAt: 1_000,
+  });
+
+  assert.notEqual(result.reason, "execution_mode_mismatch");
+  assert.equal(simulatorCalls, 1, "a value that crossed a database boundary and is not a known mode states nothing");
+});
+
 /* ═════════════ B'. RESIDUAL OWNERSHIP IS CARRIED AND HONOURED ═════════════ */
 
 test("B6: a residual restored from another MODE is held and reported, but never flattened here", async () => {

@@ -86,6 +86,7 @@ import {
   BOX_LEG_ROLES,
   directionSign,
   isPaperExecutionMode,
+  statedExecutionMode,
   type BoxCandidate,
   type BoxDirection,
   type BoxEntryDecision,
@@ -925,8 +926,13 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
    * broker-switch guard, the delete guard and the margin totals to stay truthful.
    */
   private executionModeMismatch(position: BoxOpenPosition): string | null {
+    // NO CLAIM ⇒ NO REFUSAL. A record that does not state its mode cannot contradict this process,
+    // and inventing a contradiction from missing data would block a reduction — see
+    // `statedExecutionMode`. Real restored positions always state it (the column is NOT NULL).
+    const stated = statedExecutionMode(position.execution_mode);
+    if (stated === null) return null;
     const processIsPaper = isPaperExecutionMode(this.mode);
-    const recordIsPaper = isPaperExecutionMode(position.execution_mode);
+    const recordIsPaper = isPaperExecutionMode(stated);
     if (processIsPaper === recordIsPaper) return null;
     return processIsPaper
       ? `Position ${position.id} was opened in ${position.execution_mode} mode, but this process runs ` +

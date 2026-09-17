@@ -247,6 +247,7 @@ import {
   type PaperLeggingExecutionRecord,
   type ResidualLegExposure,
   isPaperExecutionMode,
+  statedExecutionMode,
   type ExecutionMode,
 } from "./types.js";
 import type { BoxExecutionFailureReason } from "./types.js";
@@ -4348,7 +4349,8 @@ export class BoxEngine {
      * so it can be reported instead of silently exited under the wrong regime. The gateway refuses
      * it again at the submission boundary — see `executionModeMismatch` there.
      */
-    if (isPaperExecutionMode(doc.execution_mode) !== isPaperExecutionMode(this.cfg.executionMode)) {
+    const statedDocMode = statedExecutionMode(doc.execution_mode);
+    if (statedDocMode !== null && isPaperExecutionMode(statedDocMode) !== isPaperExecutionMode(this.cfg.executionMode)) {
       const detail =
         `Trade ${doc._id.toString()} was opened in ${doc.execution_mode} mode but this process runs ` +
         `${this.cfg.executionMode}. It is monitored and reported, but this process must not exit it: ` +
@@ -4870,7 +4872,11 @@ export class BoxEngine {
   private residualOwnershipMismatch(attemptId: string): string | null {
     const owner = this.residualOwnershipByAttempt.get(attemptId);
     if (!owner) return null;
-    if (isPaperExecutionMode(owner.mode) !== isPaperExecutionMode(this.cfg.executionMode)) {
+    // NO CLAIM ⇒ NO REFUSAL, for the same reason as the gateway's position check: a durable row that
+    // does not state its mode cannot contradict this process, and refusing to flatten on the strength
+    // of missing data would leave exposure on. See `statedExecutionMode`.
+    const stated = statedExecutionMode(owner.mode);
+    if (stated !== null && isPaperExecutionMode(stated) !== isPaperExecutionMode(this.cfg.executionMode)) {
       return (
         `residual ${attemptId} was created in ${owner.mode} mode but this process runs ` +
         `${this.cfg.executionMode}` +

@@ -1939,3 +1939,27 @@ export type { BrokerId } from "../brokers/types.js";
 export function isPaperExecutionMode(mode: ExecutionMode): boolean {
   return mode !== "live";
 }
+
+/**
+ * The execution mode a record actually STATES, or null when it makes no claim.
+ *
+ * WHY THIS IS NOT `?? "paper_touch"`. Mode isolation refuses to act on a record whose fills are of a
+ * different KIND from the running process. That refusal must rest on a mode the record genuinely
+ * asserts — never on the ABSENCE of one. Defaulting a missing value to any paper mode would turn
+ * "we cannot tell" into the positive claim "this is simulated", and a live process would then refuse
+ * to exit it: a REDUCTION blocker manufactured out of missing data, which is the one direction this
+ * codebase never fails in ("a blocked exit guarantees exposure stays").
+ *
+ * `null` therefore means NO CLAIM, and every caller treats it as "no mismatch" — i.e. exactly the
+ * behaviour that existed before mode isolation. Real records are unaffected: `box_trades.execution_mode`
+ * and `box_execution_attempts.execution_mode` are both `NOT NULL`, so a restored position or attempt
+ * always states its mode and is always checked.
+ *
+ * Deliberately validates against {@link EXECUTION_MODES} rather than trusting the declared type: this
+ * reads values that crossed a database or process boundary, where the compiler guarantees nothing.
+ */
+export function statedExecutionMode(value: unknown): ExecutionMode | null {
+  return typeof value === "string" && (EXECUTION_MODES as readonly string[]).includes(value)
+    ? (value as ExecutionMode)
+    : null;
+}
