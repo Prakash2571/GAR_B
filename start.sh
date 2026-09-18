@@ -946,15 +946,24 @@ if (( FRONTEND_ONLY )); then
     printf '%s      would read:%s %s/api/box/status and compare its contract digest\n' \
       "$C_DIM" "$C_RESET" "$LOCAL_API"
   else
-    running_digest="$(curl -fsS --max-time 10 "${LOCAL_API}/api/box/status" 2>/dev/null \
+    # READ /api/health, NOT /api/box/status.
+    #
+    # This check is described above as "the check that makes --frontend-only safe", and until now it
+    # could not run at all: it read `.contract.schemas_sha256` from /api/box/status, and NOTHING ever
+    # published a `contract` field there. `schemas_sha256` appeared nowhere in src/, and box-status is
+    # an `additionalProperties: false` schema so it could not have been added without failing the
+    # contract suite. The read always produced "", the `-z` branch below always fired, and the mode
+    # published anyway with a warning — in the one mode that deliberately does NOT restart the backend,
+    # i.e. the only mode where the live process can genuinely be older than the frontend.
+    #
+    # /api/health is unauthenticated, so unlike the old target it can be read without the access gate.
+    running_digest="$(curl -fsS --max-time 10 "${LOCAL_API}/api/health" 2>/dev/null \
       | node -pe 'try{JSON.parse(require("fs").readFileSync(0,"utf8")).contract?.schemas_sha256??""}catch{""}' 2>/dev/null || true)"
     if [[ -z "$running_digest" ]]; then
-      # The status surface is behind the access gate, so an empty answer can mean "not authorised"
-      # just as easily as "not running". Either way it is unknowable from here, and this must not be
-      # reported as a mismatch.
-      warn "could not read the running backend's contract digest from ${LOCAL_API}/api/box/status"
-      warn "(it may be down, or the status surface may require the access gate). Publishing anyway"
-      warn "because --frontend-only was requested. If the UI shows shape errors, run a full release."
+      # Now genuinely means "the process did not answer, or predates the digest being published".
+      warn "could not read the running backend's contract digest from ${LOCAL_API}/api/health"
+      warn "(it may be down, or it may predate publishing the digest). Publishing anyway because"
+      warn "--frontend-only was requested. If the UI shows shape errors, run a full release."
     elif [[ "$running_digest" != "${frontend_pin:-}" ]]; then
       printf '    running backend serves : %s\n' "$running_digest" >&2
       printf '    frontend pinned        : %s\n' "${frontend_pin:-<unread>}" >&2
@@ -1159,19 +1168,20 @@ if ! (( DRY_RUN )); then
   # The UI is only usable if it was built against the contract this backend serves. Compare the
   # digest the running backend reports with what the frontend pinned.
   #
-  # ALSO MOVED TO THE ORIGIN, and this one mattered most of the three. It used `curl -fsS`, so a CDN
-  # challenge (or any non-2xx) produced an EMPTY string, the `-n "$served"` guard skipped the
-  # comparison, and the release reported success having verified nothing. A check that silently passes
-  # when it cannot run is worse than no check, because it is mistaken for evidence.
-  served="$(origin_curl "${PUBLIC_BASE}/api/box/status" 2>/dev/null \
+  # ALSO MOVED TO /api/health, AND THAT FIX MATTERED MORE THAN THE ORIGIN ONE.
+  #
+  # This read was pointed at /api/box/status, which never carried a `contract` field — see the longer
+  # note on the --frontend-only path above. So it produced "" on every release ever run, and `curl
+  # -fsS` plus the `-n "$served"` guard turned that into a silent pass. Two independent reasons the
+  # same check could not work, and neither was visible.
+  #
+  # /api/health is unauthenticated AND now publishes the digest, so this finally compares something.
+  served="$(origin_curl "${PUBLIC_BASE}/api/health" 2>/dev/null \
     | node -pe 'try{JSON.parse(require("fs").readFileSync(0,"utf8")).contract?.schemas_sha256??""}catch{""}' 2>/dev/null || true)"
   if [[ -z "$served" ]]; then
-    # Legitimately possible: /api/box/status sits behind the site access gate, so an unauthenticated
-    # probe cannot read it. That is not a fault, but it does mean this comparison did not happen — and
-    # after the silent-pass bug above, saying so out loud is the whole point.
-    warn "could not read the served contract digest from ${PUBLIC_BASE}/api/box/status at the origin"
-    warn "  (most likely the access gate). The frontend/backend contract match was NOT verified here;"
-    warn "  step 05 did verify the frontend against the backend SOURCE that was checked out."
+    warn "could not read the served contract digest from ${PUBLIC_BASE}/api/health at the origin"
+    warn "  (the running process may predate publishing it). The frontend/backend contract match was"
+    warn "  NOT verified here; step 05 did verify the frontend against the backend SOURCE checked out."
   elif [[ -n "${frontend_pin:-}" && "$served" != "$frontend_pin" ]]; then
     die "the RUNNING backend serves contract ${served:0:12}… but the frontend pinned ${frontend_pin:0:12}…"
   else
