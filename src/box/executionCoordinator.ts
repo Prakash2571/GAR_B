@@ -70,6 +70,7 @@
  */
 
 import { entrySideFor, evaluateCandidate } from "./math.js";
+import { BOX_ENTRY_LEG_COUNT } from "./universeView.js";
 import {
   boxInstrumentRefs,
   classifyConflict,
@@ -150,6 +151,8 @@ export interface CoordinatorMetricsSnapshot {
   duplicateSuppressed: number;
   /** Entries refused because the underlying is on the operator blocklist, or it was unreadable. */
   underlyingExcluded: number;
+  /** Entries refused because the instrument's lot cannot satisfy the live quantity envelope. */
+  quantityCapRefusals: number;
   /** Entries refused because `BOX_MAX_OPEN_BOXES` (all modes) was already met. */
   inventoryLimitRefusals: number;
   expiredWhileWaiting: number;
@@ -425,6 +428,7 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
     underlyingAlreadyActive: 0,
     sessionLimitRefusals: 0,
     underlyingExcluded: 0,
+    quantityCapRefusals: 0,
     inventoryLimitRefusals: 0,
     positionClaimsHeld: 0,
     positionClaimsReleased: 0,
@@ -845,6 +849,72 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
         reason: exclusion.code,
       });
       return { ok: false, reason: "underlying_excluded", detail: exclusion.detail };
+    }
+
+    /*
+     * ── PER-LEG / GROSS QUANTITY CAP — REFUSED HERE, WHERE IT COSTS NOTHING ─────────────
+     *
+     * WHY THIS MOVED. The caps are enforced in BoxOrderManager (`quantityLimitBlockReason` →
+     * `entryQuantityEnvelopeBlockReason`), which is three layers down and — critically — AFTER
+     * `sessionConsumeAttempt()` below. A candidate whose lot size simply exceeds the configured cap
+     * therefore used to:
+     *
+     *   1. SPEND a session entry attempt. On a supervised one-attempt live test that ends the test
+     *      before a single byte reaches the broker.
+     *   2. Take the underlying hold and the contract reservations, then give them back.
+     *   3. Run coherence, capital and the ECONOMIC admission — which performs real broker
+     *      round-trips for funds and margin evidence — all for an entry that could never be sent.
+     *   4. Worst of all: `submit()` refuses with a plain `Error`, and the entry path's
+     *      `provenNoExposure` test recognises only `BrokerPreSubmitRefusedError` and
+     *      `BrokerOrderRejectedError`. A plain Error is therefore treated as UNPROVEN, so all four
+     *      legs rejecting made `uncertain` true → `manager.invariantViolation(...)` → which sets
+     *      `recoveryActive = true` AND trips the STICKY circuit breaker. A statically-knowable
+     *      configuration mismatch thus reported "broker terminal quantity is uncertain" and bricked
+     *      the entry path, having sent nothing to any broker.
+     *
+     * Everything needed to decide this is known before any await: the lot size is a property of the
+     * candidate and the caps are configuration. So it belongs beside the blocklist, for exactly the
+     * reason stated there — a name that cannot be entered must not spend an attempt, take a
+     * reservation or hold a claim it will immediately give back.
+     *
+     * LIVE ONLY, deliberately. These are `BOX_LIVE_*` limits enforced by the order manager, which
+     * paper never constructs, so applying them in paper would refuse names that paper can legitimately
+     * simulate and would change which names a rehearsal covers. The universe board already reports
+     * `lot_exceeds_per_leg_cap` in every mode for pre-live screening.
+     *
+     * This does NOT remove the manager's own checks. They remain the authority at the send boundary,
+     * where a request's quantity can differ from one lot; this is a cheap, earlier refusal of the case
+     * that is decidable from the candidate alone.
+     */
+    if (this.mode === "live") {
+      const lotSize = candidate.lot_size;
+      const perLegCap = this.deps.cfg.liveMaxOpenLegQuantity;
+      const grossCap = this.deps.cfg.liveMaxGrossOpenLegQuantity;
+      const fourLegs = lotSize * BOX_ENTRY_LEG_COUNT;
+      const capDetail =
+        perLegCap > 0 && lotSize > perLegCap
+          ? `one lot of ${candidate.underlying} is ${lotSize} unit(s), above ` +
+            `BOX_LIVE_MAX_OPEN_LEG_QUANTITY=${perLegCap}. No leg of this box can be sent, so the ` +
+            `attempt is refused before it costs an attempt, a reservation or a broker round trip. ` +
+            `Raise the cap only if you intend to carry that much per leg, or exclude this underlying.`
+          : grossCap > 0 && fourLegs > grossCap
+            ? `four legs of one lot of ${candidate.underlying} need ${fourLegs} unit(s), above ` +
+              `BOX_LIVE_MAX_GROSS_OPEN_LEG_QUANTITY=${grossCap}. The whole attempt is refused before ` +
+              `it costs an attempt, a reservation or a broker round trip.`
+            : null;
+      if (capDetail !== null) {
+        this.stats.quantityCapRefusals++;
+        this.log({
+          execution: executionId,
+          broker,
+          underlying: candidate.underlying,
+          status: "suppressed_quantity_cap",
+          lot: lotSize,
+          per_leg_cap: perLegCap,
+          gross_cap: grossCap,
+        });
+        return { ok: false, reason: "lot_exceeds_quantity_cap", detail: capDetail };
+      }
     }
 
     // ── UNDERLYING LOCK, LAYER 1a: DURABLE POSITION OWNERSHIP ──────────────────────────
@@ -2230,6 +2300,7 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
       reservationConflicts: this.stats.reservationConflicts,
       duplicateSuppressed: this.stats.duplicateSuppressed,
       underlyingExcluded: this.stats.underlyingExcluded,
+      quantityCapRefusals: this.stats.quantityCapRefusals,
       inventoryLimitRefusals: this.stats.inventoryLimitRefusals,
       expiredWhileWaiting: this.stats.expiredWhileWaiting,
       revalidationRejected: this.stats.revalidationRejected,

@@ -179,6 +179,15 @@ const REASON_META: Record<
       "partial position, residual or in-flight entry. Disable that setting only if you intend to run " +
       "concurrent boxes on one underlying.",
   },
+  lot_exceeds_quantity_cap: {
+    category: "operator_action",
+    remedy:
+      "This instrument's LOT SIZE is too large for your live quantity envelope — not a liquidity " +
+      "problem, so the order book is the wrong place to look. Either raise " +
+      "BOX_LIVE_MAX_OPEN_LEG_QUANTITY / BOX_LIVE_MAX_GROSS_OPEN_LEG_QUANTITY to carry that much per " +
+      "leg, or exclude this underlying so the caps and the blocklist agree. Excluding is usually " +
+      "right: a large lot means a proportionally larger naked position if one leg fails to fill.",
+  },
   box_capital_limit: {
     category: "operator_action",
     remedy:

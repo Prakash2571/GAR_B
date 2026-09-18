@@ -692,7 +692,22 @@ export type BoxExecutionFailureReason =
    * Compared on the PAPER/LIVE BOUNDARY only (see `isPaperExecutionMode`), never by exact equality —
    * `paper_touch` and `paper_latency` are freely interchangeable and must stay so.
    */
-  | "execution_mode_mismatch";
+  | "execution_mode_mismatch"
+  /**
+   * The instrument's LOT SIZE cannot satisfy the live quantity envelope — one lot exceeds
+   * `BOX_LIVE_MAX_OPEN_LEG_QUANTITY`, or four legs of one lot exceed
+   * `BOX_LIVE_MAX_GROSS_OPEN_LEG_QUANTITY`.
+   *
+   * DELIBERATELY DISTINCT FROM `insufficient_quantity`, which means the executable DEPTH could not
+   * fill one lot. This is the opposite problem: the market is irrelevant, the instrument is simply
+   * too large for the configured envelope, and no amount of liquidity changes that. Reporting it as
+   * a liquidity refusal sent an operator to look at the order book for a configuration mismatch.
+   *
+   * Decided in the coordinator's synchronous prologue from the candidate's own lot size, BEFORE the
+   * session attempt is consumed — see the long note at that gate for what this previously cost.
+   * LIVE ONLY: the caps live in BoxOrderManager, which paper never constructs.
+   */
+  | "lot_exceeds_quantity_cap";
 
 /** One leg's detection → execution comparison. */
 export interface BoxExecutionLeg {
