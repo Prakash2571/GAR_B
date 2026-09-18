@@ -45,9 +45,17 @@ the worst-case wall clock for an attempt is closer to their sum than to any sing
 The defaults above do not constitute a supervised envelope. To get one, all of these must be set —
 setting only some of them leaves a gap that the others do not cover:
 
-1. `BOX_SESSION_MAX_ENTRY_ATTEMPTS=1` **and** `BOX_SESSION_MAX_COMPLETED_TRADES=1`. Both: the first
-   bounds attempts, the second bounds completions, and neither implies the other.
-2. Restrict to one underlying, one box attempt, one current lot per leg.
+1. `BOX_MAX_OPEN_BOXES=1`, `BOX_SESSION_MAX_ENTRY_ATTEMPTS=1` **and**
+   `BOX_SESSION_MAX_COMPLETED_TRADES=1`. These are separate containment controls: the inventory
+   ceiling counts open, in-flight and unresolved exposure globally; the first session limit bounds
+   attempts and the second bounds completed lifecycles. None implies another.
+2. Keep all desired underlyings monitored with `BOX_MAX_UNDERLYINGS=0`; use the durable exclusion
+   list to prohibit entry on names you have screened out. There is no automatic “most liquid stock”
+   selector: fresh executable one-lot depth is a minimum admission condition, not a ranking promise.
+   For a deterministic one-stock trial, leave only the deliberately screened liquid underlying
+   entry-allowed, while the other names remain observable. Configure the per-leg and gross quantity
+   ceilings to exactly that current lot. A cap mismatch must refuse before any order, never be solved
+   by widening a global cap.
 3. Enable and satisfy the funds, planned-margin and stage-funding checks, and justify the capital cap
    and the recovery reserve rather than leaving them at zero.
 4. Confirm zero unresolved orders/residuals and a reconciled broker position set **before** arming.
