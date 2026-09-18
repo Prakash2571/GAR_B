@@ -306,9 +306,36 @@ test("the engine adds an entry blocker when the boot ordinal is unknown", async 
   const idx = engine.indexOf('code: "instance_epoch_unknown"');
   const block = engine.slice(idx, idx + 400);
   assert.ok(block.includes('scope: "entry"'), "the blocker must be ENTRY-scoped, never exposure-scoped");
+  // THE ORDINAL MUST ACTUALLY BE CLAIMED — and this assertion used to pin the literal
+  // `void this.backendInstance.resolveBootOrdinal()`, which tied it to one call site inside
+  // `start()`. That was the defect: claimed only on RUN, so a booted-but-stopped process published a
+  // null ordinal, a client refused the whole status payload, and the dashboard read MODE UNKNOWN with
+  // an empty board until someone pressed RUN — including the pre-run dialog, which therefore could not
+  // name the execution mode until after the thing it was confirming had happened.
+  //
+  // So the assertion now pins the INTENT rather than the expression: claimed from boot(), and retried.
   assert.ok(
-    engine.includes("void this.backendInstance.resolveBootOrdinal()"),
-    "and the ordinal must actually be claimed at startup",
+    engine.includes("this.ensureBootOrdinalClaim()"),
+    "the ordinal must be claimed through the claim driver",
+  );
+  const bootBody = engine.slice(engine.indexOf("async boot()"), engine.indexOf("async start()"));
+  assert.ok(bootBody.length > 0, "boot() must precede start() for this slice to mean anything");
+  assert.match(
+    bootBody,
+    /ensureBootOrdinalClaim\(\)/,
+    "claimed at BOOT, not only on RUN — a stopped process must still be orderable",
+  );
+  assert.match(
+    engine,
+    /private ensureBootOrdinalClaim\(\)/,
+    "the driver itself must live on the engine",
+  );
+  // A transient failure left the process unorderable and refusing entry for its whole life, because
+  // nothing ever retried despite resolveBootOrdinal() deliberately staying unresolved for that purpose.
+  assert.match(
+    engine,
+    /BOOT_ORDINAL_RETRY_MS/,
+    "a transient claim failure must be retried, not permanent for the process lifetime",
   );
 });
 
