@@ -80,6 +80,7 @@
     "execution_funnel",
     "economic_admission",
     "account_funds",
+    "entry_alerts",
     "market_data_state",
     "market_data_health",
     "operational_readiness",
@@ -185,6 +186,10 @@
     "account_funds": {
       "$comment": "FREE CAPITAL, published continuously — distinct from economic_admission.picture.available_funds, which only exists as a by-product of live entry admission and is null in paper, null with the funding gates off, and null before the first entry. Never null itself: when no figure is known it carries an unavailable_reason naming why, so an unread balance can never be rendered as a zero account.",
       "$ref": "account-funds.schema.json"
+    },
+    "entry_alerts": {
+      "$comment": "WHICH UNDERLYING WAS REFUSED, AND WHY. The named-symbol counterpart to metrics.execution.rejection_categories, which can only ever carry counts per reason because a metric label space must stay bounded. Carried in the status the dashboard already polls so the notification surface needs no second request.",
+      "$ref": "entry-alerts.schema.json"
     },
     "market_data_state": {
       "$comment": "MARKET-DATA transport health, DISTINCT from order-stream health and from the crude market_data_healthy boolean. READY is reachable only after fresh usable depth per traded instrument in the current connection generation; a socket merely being open is not READY. Source: MarketDataStateMachine.state().",

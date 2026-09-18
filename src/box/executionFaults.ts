@@ -283,21 +283,53 @@ export type BoxParentAttemptReason =
   | "persistence_unavailable"
   | "internal_error";
 
-const MARKET_REASONS: readonly BoxExecutionFailureReason[] = [
-  "price_moved",
-  "insufficient_quantity",
-  "missing_book",
-  "feed_unhealthy",
-  "market_closed",
-  "edge_disappeared",
-  "below_expected_net_profit",
-  "discovery_stopped",
-  "duplicate",
-  "legging_incomplete",
-  "unwind_failed",
-  "cross_leg_time_skew",
-  "abort_after_fill",
-];
+/**
+ * EVERY market/admission refusal reason, as an EXHAUSTIVE map rather than a hand-written list.
+ *
+ * WHY A MAP AND NOT AN ARRAY. This used to be `readonly BoxExecutionFailureReason[]`, which type-checks
+ * a list that is missing entries just as happily as a complete one. Six reasons had been added to
+ * `BoxExecutionFailureReason` over time without being added here — `box_capital_limit`,
+ * `underlying_already_active`, `underlying_excluded`, `box_inventory_limit`, `session_limit_reached`
+ * and `execution_mode_mismatch`. Every one of them is a REAL, correctly-reported refusal, and every
+ * one of them was silently rewritten to `unknown_internal_error` by the cardinality backstop in
+ * `BoxMetrics.finishLogicalAttempt`.
+ *
+ * The visible consequence was a dashboard reporting `UNKNOWN_INTERNAL_ERROR: 354` for a deployment
+ * whose session attempt budget was simply spent — sending an operator hunting a crash that never
+ * happened, while the one fact that would have explained it (`session_limit_reached`) was the one
+ * fact being discarded. An honest "the session budget is used up" is actionable; "unknown internal
+ * error" is not merely unhelpful, it is misleading about the KIND of problem.
+ *
+ * `Record<BoxExecutionFailureReason, true>` makes that class of drift a COMPILE ERROR: adding a member
+ * to the union without adding it here fails the build. Do not replace this with an array.
+ */
+const MARKET_REASON_MAP: Record<BoxExecutionFailureReason, true> = {
+  price_moved: true,
+  insufficient_quantity: true,
+  missing_book: true,
+  feed_unhealthy: true,
+  market_closed: true,
+  edge_disappeared: true,
+  below_expected_net_profit: true,
+  discovery_stopped: true,
+  duplicate: true,
+  legging_incomplete: true,
+  unwind_failed: true,
+  cross_leg_time_skew: true,
+  abort_after_fill: true,
+  // The six that were missing. Each is an ADMISSION refusal decided before or instead of a fill,
+  // and each names a different remedy, which is exactly why they must not share a bucket.
+  box_capital_limit: true,
+  underlying_already_active: true,
+  underlying_excluded: true,
+  box_inventory_limit: true,
+  session_limit_reached: true,
+  execution_mode_mismatch: true,
+};
+
+const MARKET_REASONS: readonly BoxExecutionFailureReason[] = Object.keys(
+  MARKET_REASON_MAP,
+) as BoxExecutionFailureReason[];
 
 /** The complete, closed set of admissible parent-attempt labels. */
 export const BOX_PARENT_ATTEMPT_REASONS: readonly BoxParentAttemptReason[] = [
