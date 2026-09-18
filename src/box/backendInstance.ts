@@ -61,6 +61,18 @@ import { randomUUID } from "node:crypto";
 
 import { query } from "../pg/pool.js";
 
+/**
+ * The only shape of the epoch query this class reads.
+ *
+ * Narrowed to exactly what is used, and injectable, so the behaviours that matter — the single-flight
+ * guard, the transient/permanent split, and that a settled claim never issues a second `UPDATE` — are
+ * unit-testable without PostgreSQL. Those are precisely the properties a DB-backed test cannot force
+ * on demand: a real database will not fail when you need it to.
+ */
+export type EpochQuery = (
+  sql: string,
+) => Promise<{ readonly rows: readonly { readonly last_ordinal: string | number }[] }>;
+
 /** The identity a client needs in order to place a readiness decision in a total order. */
 export interface BackendInstanceIdentity {
   /**
@@ -94,10 +106,36 @@ export class BackendInstance {
   private bootOrdinal: number | null = null;
   private resolved = false;
   private lastError: string | null = null;
+  /**
+   * The claim currently in flight, so concurrent callers share one attempt.
+   *
+   * REQUIRED ONCE THERE IS A RETRY. The class documents itself as "idempotent per process — it can
+   * never consume a second ordinal and make this process look newer than itself", and that held only
+   * because there was exactly ONE call site. `this.resolved` cannot provide the guarantee on its own:
+   * it stays false for the whole duration of an attempt AND after a transient failure, so two
+   * overlapping calls would both reach the `UPDATE … last_ordinal + 1` and consume two ordinals. That
+   * would not merely waste a number — the process would hold the lower one while the database had
+   * advanced past it, so a later boot could mint an ordinal this process has already published.
+   */
+  private inFlight: Promise<number | null> | null = null;
+  /**
+   * The last failure text actually written to the log, so a slow retry loop reports a NEW problem and
+   * stays quiet about an unchanged one. Without this, an hour of unreachable PostgreSQL would be
+   * hundreds of identical lines and the one line that mattered would be buried.
+   */
+  private lastLoggedError: string | null = null;
 
-  constructor(opts?: { readonly instanceId?: string; readonly startedAt?: number }) {
+  /** The epoch query. Production uses the real pool; tests inject to force failure modes. */
+  private readonly runQuery: EpochQuery;
+
+  constructor(opts?: {
+    readonly instanceId?: string;
+    readonly startedAt?: number;
+    readonly query?: EpochQuery;
+  }) {
     this.instanceId = opts?.instanceId ?? randomUUID();
     this.startedAt = opts?.startedAt ?? Date.now();
+    this.runQuery = opts?.query ?? ((sql) => query<{ last_ordinal: string | number }>(sql));
   }
 
   identity(): BackendInstanceIdentity {
@@ -119,6 +157,23 @@ export class BackendInstance {
   }
 
   /**
+   * True when the ordinal will NEVER be established by this process, so retrying is pointless.
+   *
+   * Distinguishes the two failure kinds a caller must treat differently:
+   *
+   *   DEPLOYMENT ERROR — migration 009 not applied, or the row holds an unusable value. Both mark
+   *                      themselves resolved, because no amount of retrying fixes an absent row.
+   *   TRANSIENT        — PostgreSQL was unreachable. Deliberately NOT resolved, so a retry can
+   *                      succeed and this process can stop being unorderable.
+   *
+   * Exposed so a retry driver can stop on the first kind instead of hammering the database forever
+   * over a condition only a deployment can fix.
+   */
+  permanentlyUnavailable(): boolean {
+    return this.resolved && this.bootOrdinal === null;
+  }
+
+  /**
    * Claim this boot's ordinal from PostgreSQL. Idempotent per process: the ordinal is claimed ONCE,
    * so a retried or repeated call cannot consume a second ordinal and make this process look newer
    * than itself.
@@ -129,10 +184,28 @@ export class BackendInstance {
    */
   async resolveBootOrdinal(): Promise<number | null> {
     if (this.resolved) return this.bootOrdinal;
+    // Share one attempt. See `inFlight` for why `resolved` alone cannot guarantee this.
+    if (this.inFlight !== null) return this.inFlight;
+    this.inFlight = this.claimOnce().finally(() => {
+      this.inFlight = null;
+    });
+    return this.inFlight;
+  }
+
+  /**
+   * One claim attempt. Never throws; the caller decides whether to try again.
+   *
+   * REPORTS ITSELF TO THE LOG, which it previously did not. The failure text was stored in
+   * `lastError` and surfaced only inside the `instance_epoch_unknown` readiness blocker, so
+   * `pm2 logs … | grep "boot ordinal"` found nothing and an operator investigating "new entry is
+   * disabled" had no way to see the cause from the log at all. A fail-closed condition that refuses
+   * trading must say so where failures are read.
+   */
+  private async claimOnce(): Promise<number | null> {
     try {
       // Atomic read-modify-write. Two concurrent boots serialise on the row lock and receive
       // DISTINCT ordinals; neither can observe the other's value or reuse it.
-      const result = await query<{ last_ordinal: string | number }>(
+      const result = await this.runQuery(
         `UPDATE backend_instance_epoch
             SET last_ordinal = last_ordinal + 1,
                 updated_at = now()
@@ -147,26 +220,54 @@ export class BackendInstance {
           "backend_instance_epoch has no row: migration 009_backend_instance_epoch.sql has not been applied, " +
           "so readiness decisions from this process cannot be ordered against a previous instance";
         this.resolved = true;
+        this.report();
         return null;
       }
       const ordinal = typeof row.last_ordinal === "number" ? row.last_ordinal : Number(row.last_ordinal);
       if (!Number.isFinite(ordinal) || ordinal <= 0) {
         this.lastError = `backend_instance_epoch returned an unusable ordinal (${String(row.last_ordinal)})`;
         this.resolved = true;
+        this.report();
         return null;
       }
       this.bootOrdinal = ordinal;
       this.lastError = null;
       this.resolved = true;
+      // Say so when a RETRY is what got us here, so the log shows entry becoming possible rather
+      // than only showing that it was refused.
+      if (this.lastLoggedError !== null) {
+        console.log(
+          `[Box] durable boot ordinal CLAIMED (${ordinal}) after an earlier failure — readiness ` +
+            `decisions from this process are now orderable and new entry is no longer refused for ` +
+            `this reason.`,
+        );
+        this.lastLoggedError = null;
+      }
       return ordinal;
     } catch (err) {
       this.lastError =
         `could not claim a boot ordinal from PostgreSQL (${err instanceof Error ? err.message : String(err)}); ` +
         `readiness decisions from this process cannot be ordered against a previous instance`;
       // Deliberately NOT marked resolved: a later attempt may succeed once the database is reachable,
-      // and this process should stop being unorderable as soon as it can.
+      // and this process should stop being unorderable as soon as it can. That sentence was aspirational
+      // until BoxEngine.ensureBootOrdinalClaim() existed — there was one fire-and-forget call site, so
+      // a single transient failure left the process unorderable, refusing entry, for its whole life.
+      this.report();
       return null;
     }
+  }
+
+  /** Write a failure to the log, but only when it is not the one already reported. */
+  private report(): void {
+    if (this.lastError === null || this.lastError === this.lastLoggedError) return;
+    this.lastLoggedError = this.lastError;
+    console.warn(
+      `[Box] NEW ENTRY IS REFUSED: ${this.lastError}. Exposure management is unaffected — exits, ` +
+        `reductions and protective cancels do not depend on this. ` +
+        (this.permanentlyUnavailable()
+          ? "This will NOT retry: apply the migration and restart."
+          : "This will keep retrying until PostgreSQL answers."),
+    );
   }
 }
 
