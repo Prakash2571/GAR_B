@@ -397,6 +397,17 @@ function zeroPostReasonFor(reason: BoxExecutionFailureReason | null | undefined)
   }
 }
 
+/**
+ * How often to retry claiming the durable boot ordinal after a transient failure.
+ *
+ * 15s: while it is unclaimed NEW ENTRY IS REFUSED, so recovering promptly matters — but the only thing
+ * that can fix it is PostgreSQL becoming reachable, and hammering a database that is already
+ * struggling is how a recovery poll becomes part of the outage. Deliberately not configurable: it is
+ * an internal recovery cadence, not a risk control, and one more env var on this surface is a worse
+ * trade than a sensible fixed value.
+ */
+const BOOT_ORDINAL_RETRY_MS = 15_000;
+
 export class BoxEngine {
   private cfg: BoxConfig;
   private quotes = new BoxQuoteStore();
@@ -1721,6 +1732,24 @@ export class BoxEngine {
     // Verify PostgreSQL — this backend's operational authority — is up and migrated
     // before the positions below are read from it.
     await ensureBoxPersistenceReady();
+    /*
+     * CLAIM THE DURABLE BOOT ORDINAL HERE, AT BOOT — not only when the scanner starts.
+     *
+     * It used to be claimed exclusively inside `start()`, i.e. on RUN. The consequence was a
+     * chicken-and-egg that made a freshly booted deployment unreadable: with no ordinal the readiness
+     * decision is unorderable, a client refuses the WHOLE status payload rather than adopt a verdict
+     * it cannot place in order, and the dashboard therefore showed `MODE UNKNOWN`, an empty board and
+     * zeroed counts until the operator pressed RUN. The pre-run confirmation dialog — whose entire
+     * purpose is to state whether real orders are about to be placed — could not name the execution
+     * mode until after the thing it was confirming had already happened.
+     *
+     * Ordering is deliberate: immediately after `ensureBoxPersistenceReady()`, so the authority is
+     * known to be up before the first attempt, exactly as the `start()` call site relied on.
+     *
+     * `start()` still calls this too. It is idempotent, and pressing RUN should force an immediate
+     * attempt rather than waiting out the retry interval.
+     */
+    this.ensureBootOrdinalClaim();
     // Crash-only recovery is safe only behind its explicitly established and verified partial
     // unique index. Failure quarantines that direct path while ordinary residual exits continue.
     try {
@@ -2661,12 +2690,11 @@ export class BoxEngine {
     this.startedAt = Date.now();
     this.lastError = null;
     // CLAIM THIS BOOT'S DURABLE ORDINAL, so readiness decisions from this process can be ordered
-    // against a PREVIOUS process. Reached only after the PostgreSQL readiness check above, so the
-    // authority is known to be up. Not awaited: readiness must be publishable immediately, and until
-    // the ordinal lands the decision honestly reports a null ordinal (which a client treats as
-    // unorderable and therefore refuses to act on). Idempotent per process — it can never consume a
-    // second ordinal and make this process look newer than itself.
-    void this.backendInstance.resolveBootOrdinal();
+    // against a PREVIOUS process. Normally already claimed in `boot()`; this call makes RUN force an
+    // immediate attempt when an earlier one failed, rather than waiting out the retry interval.
+    // Idempotent per process — it can never consume a second ordinal and make this process look newer
+    // than itself, and concurrent attempts share one claim (see BackendInstance.inFlight).
+    this.ensureBootOrdinalClaim();
     // Event-loop / process diagnostics. Idempotent and fail-open: if it cannot attach it reports
     // `enabled: false` and the engine carries on regardless.
     this.environmentMonitor.start();
@@ -3045,6 +3073,7 @@ export class BoxEngine {
     // Set FIRST, so anything that re-arms a timer during teardown sees the shutdown.
     this.disposed = true;
     this.cancelUniverseRetry();
+    this.stopBootOrdinalClaim();
     this.orderManager?.setControls({ entryEnabled: false });
     this.stop();
     this.monitor.stop();
@@ -5523,6 +5552,55 @@ export class BoxEngine {
     if (typeof this.fundsTimer.unref === "function") this.fundsTimer.unref();
   }
 
+  /* --------------------------- durable boot ordinal --------------------------- */
+
+  /**
+   * Keep trying to claim the durable boot ordinal until it settles. Idempotent.
+   *
+   * WHY A RETRY EXISTS AT ALL. `resolveBootOrdinal()` deliberately does not mark itself resolved on a
+   * transient failure, with the comment "a later attempt may succeed once the database is reachable,
+   * and this process should stop being unorderable as soon as it can". Nothing performed that later
+   * attempt: there was one fire-and-forget call site, so a single blip while claiming left the process
+   * permanently unorderable — refusing all new entry for its whole life, with only a restart to clear
+   * it, which is the opposite of what the comment promised.
+   *
+   * Stops on EITHER outcome, so it cannot hammer the database over a condition retrying cannot fix:
+   * success, or `permanentlyUnavailable()` (migration 009 absent, or an unusable row).
+   */
+  private ensureBootOrdinalClaim(): void {
+    if (this.disposed) return;
+    if (this.backendInstance.hasOrdinal() || this.backendInstance.permanentlyUnavailable()) return;
+    // Attempt now; the timer only covers the case where this one fails.
+    void this.claimBootOrdinalOnce();
+    if (this.bootOrdinalTimer !== null) return;
+    this.bootOrdinalTimer = setInterval(() => {
+      void this.claimBootOrdinalOnce();
+    }, BOOT_ORDINAL_RETRY_MS);
+    // Never hold the process open for a recovery poll.
+    if (typeof this.bootOrdinalTimer.unref === "function") this.bootOrdinalTimer.unref();
+  }
+
+  /** One attempt, stopping the retry as soon as the outcome is settled either way. */
+  private async claimBootOrdinalOnce(): Promise<void> {
+    if (this.disposed) {
+      this.stopBootOrdinalClaim();
+      return;
+    }
+    // Never throws, by contract — it is a recovery poll and must not become an unhandled rejection.
+    await this.backendInstance.resolveBootOrdinal();
+    if (this.backendInstance.hasOrdinal() || this.backendInstance.permanentlyUnavailable()) {
+      this.stopBootOrdinalClaim();
+    }
+  }
+
+  /** Stop the claim retry. Called when it settles and on shutdown. */
+  private stopBootOrdinalClaim(): void {
+    if (this.bootOrdinalTimer !== null) {
+      clearInterval(this.bootOrdinalTimer);
+      this.bootOrdinalTimer = null;
+    }
+  }
+
   /** Stop the poller and forget the figure. Called on shutdown and on a broker switch. */
   private stopAccountFundsTimer(forget: boolean): void {
     if (this.fundsTimer !== null) {
@@ -7556,6 +7634,8 @@ export class BoxEngine {
    * minted by PostgreSQL, which is what makes "newer" mean something. See box/backendInstance.ts.
    */
   private readonly backendInstance = new BackendInstance();
+  /** Retry handle for the durable boot-ordinal claim. Null once it settles. */
+  private bootOrdinalTimer: ReturnType<typeof setInterval> | null = null;
 
   /**
    * Register the external blocker source. Called once during boot from `src/index.ts`.
