@@ -154,6 +154,28 @@ export interface BoxScannerDeps {
    * only one, because a scanner-level check alone would be bypassed by any future entry originator.
    */
   isUnderlyingExcluded?: (underlying: string) => boolean;
+  /**
+   * A PARENT ENTRY ATTEMPT WAS REFUSED — with the underlying attached.
+   *
+   * The counterpart to `metrics.finishLogicalAttempt`, which receives the same reason but CANNOT be
+   * told which name it belonged to: `rejection_categories` is a process-lifetime metric label space,
+   * and putting a symbol in it is the cardinality explosion executionFaults.ts exists to prevent.
+   * This hook feeds the bounded, aggregated `EntryAlertLedger` instead, which is where a symbol is
+   * safe to key on.
+   *
+   * Called for EVERY refused attempt, deliberately unthrottled and with no gross prefilter — unlike
+   * `logRejection`, whose per-candidate cooldown is right for an append-only event ledger and wrong
+   * here. The ledger aggregates by (underlying, reason), so 354 identical refusals cost one group
+   * with a count of 354; throttling would instead make the count a lie.
+   *
+   * Optional, so tests and pure paths need not supply it.
+   */
+  onEntryRejected?: (args: {
+    readonly underlying: string;
+    readonly reason: BoxParentAttemptReason;
+    readonly detail: string | null;
+    readonly candidateKey: string;
+  }) => void;
 }
 
 /** Counters exposed by GET /api/box/status. */
@@ -612,6 +634,16 @@ export class BoxScanner {
             );
           }
           this.recordExecutionFailure(cand, detection, legging.reason, legging.detail);
+          // WHICH NAME, AND WHY. Recorded before `finish` so the operator-facing ledger and the
+          // metric agree on the same reason for the same attempt, and recorded unconditionally —
+          // this is the branch that produced 354 invisible refusals, because it neither persists an
+          // attempt row (no legs filled) nor survives the event ledger's per-candidate throttle.
+          this.deps.onEntryRejected?.({
+            underlying: cand.underlying,
+            reason: legging.reason,
+            detail: legging.detail,
+            candidateKey: cand.key,
+          });
           finish(
             // Residual exposure outstanding is the most severe state, whatever
             // else is true. Otherwise: a clean abort-after-fill (4/4 filled, then
@@ -742,6 +774,16 @@ export class BoxScanner {
       // is not invisible everywhere except one metric. Previously the catch skipped both.
       this.stats.rejectedExecution++;
       this.logRejection("ENTRY_REJECTED_EXECUTION", cand, detection, `${faultClass}: ${stage}`);
+      // A TECHNICAL FAULT NAMES ITS UNDERLYING TOO. The bounded fault log already holds the stack,
+      // but it is keyed by nothing an operator scans by; this puts the same fault on the alert
+      // surface beside the market refusals, so "which stock failed for what reason" has one answer
+      // rather than two half-answers in two places.
+      this.deps.onEntryRejected?.({
+        underlying: cand.underlying,
+        reason: faultClass,
+        detail: `${faultClass} at stage ${stage}: ${recorded?.message ?? faultMessage(err)}`,
+        candidateKey: cand.key,
+      });
       finish("FAILED", faultClass, null, null, null);
       this.deps.positions.release(cand.key);
     } finally {

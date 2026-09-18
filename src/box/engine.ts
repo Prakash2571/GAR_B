@@ -72,6 +72,7 @@ import {
 } from "./universeView.js";
 import { BoxTradingSessionManager } from "./tradingSessionStore.js";
 import { AccountFundsTracker, unavailableFunds, type AccountFundsSnapshot } from "./accountFunds.js";
+import { EntryAlertLedger } from "./entryAlerts.js";
 import { BoxExecutionSimulator } from "./executionSimulator.js";
 import { createExecutionClock, type ExecutionClock } from "./executionClock.js";
 import { ExecutionEnvironmentMonitor } from "./executionEnvironment.js";
@@ -461,6 +462,19 @@ export class BoxEngine {
    * class counters, so neither memory nor metric cardinality grows with traffic.
    */
   private readonly entryFaults = new ExecutionFaultLog();
+  /**
+   * WHICH UNDERLYING WAS REFUSED, AND WHY — the operator-facing alert surface.
+   *
+   * Complements, and does not duplicate, the three things that already exist and each lose part of
+   * the answer: `metrics.rejection_categories` has the reason but structurally cannot carry a symbol,
+   * `entryFaults` has the stack but only for thrown faults, and `box_execution_attempts` has the
+   * symbol but is only written once legs have actually filled. This is the one place that answers
+   * "which stock failed, for what reason, how many times, and what do I do about it".
+   *
+   * Bounded and aggregated — see entryAlerts.ts for why keying by underlying is safe here and was
+   * not safe in the metric.
+   */
+  private readonly entryAlerts = new EntryAlertLedger({ now: () => Date.now() });
   /** Advisory queue/haircut recommender fed by live limit-order evidence (Phases 10, 26). */
   private readonly queueEstimator: QueueCalibrationEstimator;
   /** Most recent implementation-shortfall attribution, surfaced in diagnostics. */
@@ -1576,6 +1590,8 @@ export class BoxEngine {
       },
       onExecutionAttempt: (candidate, legging, reason, detail, detectedGrossEdge) =>
         void this.persistExecutionAttempt(candidate, legging, reason, detail, detectedGrossEdge),
+      // Every refused entry attempt, with its underlying, into the bounded alert ledger.
+      onEntryRejected: (rejection) => this.entryAlerts.record(rejection),
       // EXECUTION FUNNEL (Task 8): candidate + qualified stages, from the scanner hot path.
       onCandidateEvaluated: () => this.funnel.recordCandidateEvaluated(),
       onQualified: () => this.funnel.recordQualified(),
@@ -7027,6 +7043,14 @@ export class BoxEngine {
       economic_admission: this.economicAdmissionStatus(),
       // FREE CAPITAL, published continuously rather than as a side effect of an entry attempt.
       account_funds: this.accountFundsSnapshot(),
+      /**
+       * WHY ENTRIES ARE BEING REFUSED, PER UNDERLYING.
+       *
+       * Published in the status the dashboard already polls so the notification surface needs no
+       * second request and no extra poll. This is the named-symbol counterpart to
+       * `metrics.execution.rejection_categories`, which can only ever carry counts per reason.
+       */
+      entry_alerts: this.entryAlerts.snapshot(),
       database_healthy: isBoxDbEnabled() && (!live || live.health.persistence === "healthy"),
       daily_risk_seed_healthy: live ? live.health.daily_risk_seed === "healthy" : null,
       reconciliation_complete: live?.health.reconciliation_complete ?? true,
@@ -7241,6 +7265,10 @@ export class BoxEngine {
     // restarts on the next boot pass and re-reads against the new session.
     this.stopAccountFundsTimer(true);
     this.ensureAccountFundsTimer();
+    // FORGET THE REFUSALS TOO, for the same reason the balance is forgotten: they were decided
+    // against the OUTGOING broker's session, budget and positions. Carrying "NIFTY refused —
+    // session budget spent" across a switch would attribute one account's constraints to another.
+    this.entryAlerts.reset();
   }
 
   /**

@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "entry-alert.schema.json",
+  "title": "One aggregated entry refusal: which underlying, for what reason, how many times",
+  "description": "Source: src/box/entryAlerts.ts EntryAlertLedger. AGGREGATED BY (underlying, reason) ON PURPOSE: 354 identical refusals of one name for one reason are ONE fact with a count of 354, not 354 notifications. This is the only surface that carries BOTH the symbol and the reason — `metrics.execution.rejection_categories` is a process-lifetime metric label space and therefore structurally cannot carry a symbol (that is the cardinality explosion src/box/executionFaults.ts exists to prevent); `box_execution_attempts` rows carry the symbol but are written ONLY when filled_leg_count > 0 or an emergency unwind occurred, so a refusal that never reached the market persists nothing; and the ENTRY_REJECTED_* trade events are throttled per candidate, so a name refused hundreds of times leaves a handful of rows. Keying by underlying is bounded here (see entry-alerts.schema.json `dropped_groups`) in a way it can never be in a counter map.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "underlying",
+    "reason",
+    "category",
+    "actionable",
+    "count",
+    "first_at",
+    "last_at",
+    "last_detail",
+    "last_candidate_key",
+    "remedy"
+  ],
+  "properties": {
+    "underlying": {
+      "type": "string",
+      "description": "The underlying that was refused, as the board reports it (e.g. NIFTY, RELIANCE). Never blank — an attempt with no resolvable underlying is recorded as the literal string \"(unknown)\" rather than as an empty group nobody can act on."
+    },
+    "reason": {
+      "type": "string",
+      "description": "The refusal reason from the CLOSED parent-attempt taxonomy (BoxParentAttemptReason: every BoxExecutionFailureReason, plus the ten ExecutionFaultClass technical classes, plus persistence_unavailable and the legacy internal_error). Deliberately NOT constrained to an enum here: the taxonomy is closed in TypeScript and asserted exhaustively by the entryAlerts unit suite, and pinning the list in two places is how the two come to disagree — which is exactly the drift that caused real reasons to be reported as unknown_internal_error."
+    },
+    "category": {
+      "type": "string",
+      "enum": ["market", "operator_action", "infrastructure", "fault"],
+      "description": "WHAT KIND of problem this is, which decides whether a human must act. `market` is ordinary churn (the price moved, the edge closed) and is deliberately NOT actionable — a bell that rings for it trains an operator to ignore the bell. `operator_action` means a setting or an operator decision is refusing entry and nothing will trade until it changes (a spent session budget, a blocklisted name, a met inventory ceiling). `infrastructure` means a dependency is unhealthy (feed, database). `fault` means our own code or an unclassifiable failure."
+    },
+    "actionable": {
+      "type": "boolean",
+      "description": "True for every category except `market`. Precomputed by the backend so clients cannot each invent their own definition of urgent and then disagree about what the badge means."
+    },
+    "count": {
+      "type": "number",
+      "description": "How many times this exact (underlying, reason) pair was refused since the ledger was last reset. Never throttled or sampled: the hook that feeds this is called on every refusal precisely so the count is a count and not an estimate."
+    },
+    "first_at": {
+      "type": "number",
+      "description": "Epoch milliseconds of the FIRST occurrence. Published alongside last_at so a long-standing condition is distinguishable from one that just started — the same count means very different things across ten seconds and across four hours."
+    },
+    "last_at": {
+      "type": "number",
+      "description": "Epoch milliseconds of the most recent occurrence."
+    },
+    "last_detail": {
+      "type": ["string", "null"],
+      "description": "The refusing layer's own detail for the MOST RECENT occurrence, whitespace-collapsed and truncated to 240 characters. The newest is kept rather than the first, because a stale sentence beside a fresh timestamp is worse than none. null means the layer supplied no detail, never that there was nothing to say."
+    },
+    "last_candidate_key": {
+      "type": ["string", "null"],
+      "description": "The most recent candidate key (underlying|expiry|K1|K2|DIRECTION), so a specific strike pair can be found and checked. null when unknown."
+    },
+    "remedy": {
+      "type": "string",
+      "description": "What the operator should DO about it — always a real sentence, including an explicit \"no action\" where that is the honest answer. Derived from the reason by an exhaustive map in src/box/entryAlerts.ts, so a new reason cannot be added without someone deciding what a human is supposed to do when it fires."
+    }
+  }
+}

@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "entry-alerts.schema.json",
+  "title": "Why entries are being refused, per underlying",
+  "description": "Source: src/box/entryAlerts.ts EntryAlertLedger.snapshot(). TOP LEVEL IS CLOSED. Published in box_status in EVERY execution mode, because 'why did nothing trade?' is the same question in paper and live. THE PROBLEM THIS SOLVES: a deployment could report ATTEMPTS 355 / FAILED 355 / FAILURE RATE 100% with `UNKNOWN_INTERNAL_ERROR: 354` underneath and that was the entire account an operator was given — the reason had been folded by the metric's closed-label backstop, and the underlying had nowhere to go at all. Counts here are exact rather than throttled, and are held for the life of the process (reset only on a broker switch, where the refusals belonged to a different account, session and position set).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "alerts",
+    "total_alerts",
+    "total_rejections",
+    "actionable_alerts",
+    "actionable_rejections",
+    "dropped_groups",
+    "latest_at"
+  ],
+  "properties": {
+    "alerts": {
+      "type": "array",
+      "description": "The alert groups, ordered MOST URGENT FIRST (fault, then infrastructure, then operator_action, then market) and within a category most recent first. The sort is TOTAL — ties break on count, then underlying, then reason — so a client polling twice with unchanged data can never see rows shuffle under the cursor.",
+      "items": {
+        "$ref": "entry-alert.schema.json"
+      }
+    },
+    "total_alerts": {
+      "type": "number",
+      "description": "How many distinct (underlying, reason) groups are tracked. Equal to `alerts.length`."
+    },
+    "total_rejections": {
+      "type": "number",
+      "description": "The SUM of every group's count — every refusal observed since the ledger was last reset. Comparable with metrics.execution.failed, and a discrepancy between the two is itself worth investigating."
+    },
+    "actionable_alerts": {
+      "type": "number",
+      "description": "How many groups have `actionable: true` (everything except ordinary market churn). This is the number a notification badge should show: badging total_alerts would make the bell ring permanently for price movement, which is how an operator learns to stop reading it."
+    },
+    "actionable_rejections": {
+      "type": "number",
+      "description": "Sum of counts across actionable groups only."
+    },
+    "dropped_groups": {
+      "type": "number",
+      "description": "Groups evicted because the ledger's fixed group cap (300) was reached; eviction is least-recently-active first. NON-ZERO MEANS THE LIST IS TRUNCATED and older refusals are missing. Published rather than hidden so a partial list can never be read as a complete one — the bound is what makes keying by symbol safe here, and a silent bound would just be a different kind of lie."
+    },
+    "latest_at": {
+      "type": ["number", "null"],
+      "description": "Epoch milliseconds of the most recent refusal in the ledger, or null when there has never been one. Lets a client decide what is NEW since the operator last looked without diffing the whole array."
+    }
+  }
+}
