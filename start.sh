@@ -1030,22 +1030,98 @@ fi
 
 step "Verify the public URLs"
 
-check_url() {
+# ── WHY THESE CHECKS TALK TO THE ORIGIN, NOT THE PUBLIC EDGE ─────────────────────────────────
+#
+# This step used to curl PUBLIC_BASE directly, and a release was rolled back because
+# `https://gtsalgoresearch.online/` returned 403. Nothing was wrong with the deployment: nginx had
+# validated and reloaded, the backend was ready, the files were published. CLOUDFLARE'S BOT/CHALLENGE
+# LAYER had simply decided a command-line curl was not a human and answered 403 on its behalf.
+#
+# That is a FALSE DEPLOYMENT FAILURE, and an expensive one: it discarded a good frontend and left the
+# operator reading a rollback banner for a site that was serving perfectly in a browser. It was also
+# the LAST step, so everything before it had already succeeded.
+#
+# Worse, the same flaw was in the two API checks below. A challenged /api/health would have hit
+# `die "…could not be reached at all — nginx is not reaching the backend"`, which is a confident and
+# completely wrong diagnosis; and the contract-digest check used `curl -fsS`, so a 403 produced an
+# empty string and the check SILENTLY PASSED — a verification that cannot fail is not one.
+#
+# So the release now verifies the ORIGIN: the public hostname pinned to the loopback address with
+# `--resolve`, which exercises the real TLS vhost, the real published files, the real SPA fallback and
+# the real API proxy, while bypassing any CDN or WAF in front of them. Those are the things this
+# script actually changed, so those are the things it is entitled to fail on.
+#
+# The public edge is still probed, but as a REPORT rather than a gate — see `probe_public_url`.
+PUBLIC_HOST="${PUBLIC_BASE#*://}"; PUBLIC_HOST="${PUBLIC_HOST%%/*}"
+case "$PUBLIC_BASE" in https://*) ORIGIN_DEFAULT_PORT=443 ;; *) ORIGIN_DEFAULT_PORT=80 ;; esac
+case "$PUBLIC_HOST" in
+  *:*) PUBLIC_PORT="${PUBLIC_HOST##*:}"; PUBLIC_HOST="${PUBLIC_HOST%%:*}" ;;
+  *)   PUBLIC_PORT="$ORIGIN_DEFAULT_PORT" ;;
+esac
+# Overridable for a host where nginx does not listen on loopback (containers, a bound public IP).
+ORIGIN_ADDR="${ORIGIN_ADDR:-127.0.0.1}"
+log "origin     ${PUBLIC_HOST}:${PUBLIC_PORT} → ${ORIGIN_ADDR} (CDN bypassed for verification)"
+
+# One curl invocation shape for every origin request, so they cannot drift apart.
+#
+# `-k` IS DELIBERATE AND IS NOT A WEAKENING OF THIS GATE. Resolving to the loopback still sends the
+# real SNI, so the origin presents its own certificate — which on a Cloudflare-fronted host is
+# routinely a Cloudflare Origin CA cert that is not in the system trust store and cannot validate
+# locally. This check exists to prove CONTENT AND ROUTING, not chain-of-trust; the public probe below
+# is what exercises the real edge certificate. Verifying trust here would fail on a correct
+# deployment, which is the exact class of false failure this whole section is fixing.
+origin_curl() {
+  curl -sS -k --max-time 15 --resolve "${PUBLIC_HOST}:${PUBLIC_PORT}:${ORIGIN_ADDR}" "$@"
+}
+
+check_origin_url() {
   local url="$1" want="$2" desc="$3" code
-  if (( DRY_RUN )); then printf '%s      would check:%s %s\n' "$C_DIM" "$C_RESET" "$url"; return 0; fi
-  # Same reason as the health check below: curl prints %{http_code} (as "000") on a failed transfer,
-  # so an `|| echo 000` fallback would concatenate two codes and never compare equal to anything.
-  code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "$url" 2>/dev/null)" || true
+  if (( DRY_RUN )); then printf '%s      would check (origin):%s %s\n' "$C_DIM" "$C_RESET" "$url"; return 0; fi
+  # curl prints %{http_code} (as "000") on a failed transfer, so an `|| echo 000` fallback would
+  # concatenate two codes and never compare equal to anything.
+  code="$(origin_curl -o /dev/null -w '%{http_code}' "$url" 2>/dev/null)" || true
   code="${code:-000}"
   if [[ "$code" == "$want" ]]; then
-    ok "${code}  ${url}  (${desc})"
+    ok "${code}  ${url}  (origin — ${desc})"
   else
-    die "${url} returned ${code}, expected ${want} (${desc})"
+    die "${url} returned ${code} AT THE ORIGIN, expected ${want} (${desc}).
+    This is a real deployment fault: the CDN was bypassed, so nginx, the published files and the
+    proxy answered this themselves. Check:  sudo tail -40 /var/log/nginx/error.log"
   fi
 }
 
-check_url "${PUBLIC_BASE}/"           200 "public site"
-check_url "${PUBLIC_BASE}/box"        200 "SPA route — nginx try_files must fall back to index.html"
+# The public edge, reported and never fatal.
+#
+# A CDN challenge here says nothing about the deployment, and a genuine edge fault (DNS, CDN origin
+# settings, an expired edge certificate) is not something rolling back the frontend would repair. The
+# origin checks above already established that what this script deployed is correct, so this probe's
+# job is to tell the operator what the outside world currently sees — not to undo their release.
+probe_public_url() {
+  local url="$1" want="$2" desc="$3" hdrs code server mitigated
+  if (( DRY_RUN )); then printf '%s      would probe (public):%s %s\n' "$C_DIM" "$C_RESET" "$url"; return 0; fi
+  hdrs="$(mktemp)"
+  code="$(curl -sS -o /dev/null -D "$hdrs" -w '%{http_code}' --max-time 15 "$url" 2>/dev/null)" || true
+  code="${code:-000}"
+  server="$(grep -i '^server:' "$hdrs" 2>/dev/null | tail -1 | tr -d '\r' | cut -d' ' -f2- || true)"
+  mitigated="$(grep -i '^cf-mitigated:' "$hdrs" 2>/dev/null | tail -1 | tr -d '\r' | cut -d' ' -f2- || true)"
+  rm -f "$hdrs"
+  if [[ "$code" == "$want" ]]; then
+    ok "${code}  ${url}  (public — ${desc})"
+  elif [[ -n "$mitigated" ]] || [[ "$code" == "403" && "$server" == *[Cc]loudflare* ]] \
+       || [[ "$code" == "503" && "$server" == *[Cc]loudflare* ]]; then
+    warn "${url} returned ${code} from ${server:-the CDN}${mitigated:+ (cf-mitigated: ${mitigated})}"
+    warn "  INCONCLUSIVE, not a failure: the CDN challenged an automated request. The origin check"
+    warn "  above already proved this path serves correctly. Confirm in a browser if unsure."
+  else
+    warn "${url} returned ${code}, expected ${want} (${desc}) — but the ORIGIN served it correctly,"
+    warn "  so this is an edge/DNS/CDN condition and NOT a fault in what was just deployed. The"
+    warn "  release is being kept. Investigate the CDN configuration separately."
+  fi
+}
+
+check_origin_url "${PUBLIC_BASE}/"    200 "public site"
+check_origin_url "${PUBLIC_BASE}/box" 200 "SPA route — nginx try_files must fall back to index.html"
+probe_public_url "${PUBLIC_BASE}/"    200 "what the outside world sees"
 if ! (( DRY_RUN )); then
   # DELIBERATELY NOT `curl -f`. The backend answers /api/health with 503 AND a JSON body saying WHY
   # it is not ready. `-f` discards that body and leaves only "did not return 200", which then reads
@@ -1054,7 +1130,11 @@ if ! (( DRY_RUN )); then
   # No `|| printf '\n000'` fallback: curl writes its --write-out string even when the transfer
   # FAILS, so a fallback appended a second code and the body then rendered as a stray "000" line.
   # curl's own output already ends in "\n000" on a failure, so only its exit status is discarded.
-  health_raw="$(curl -sS -w '\n%{http_code}' --max-time 15 "${PUBLIC_BASE}/api/health" 2>/dev/null)" || true
+  # THROUGH THE ORIGIN, for the reason given above. Previously this went to the public edge, so a
+  # Cloudflare challenge landed on the `health_code == "000"`/else branches and killed the release
+  # with "nginx is not reaching the backend" — a confident, wrong, and very misleading diagnosis of a
+  # backend that was answering ready:true the whole time.
+  health_raw="$(origin_curl -w '\n%{http_code}' "${PUBLIC_BASE}/api/health" 2>/dev/null)" || true
   health_code="${health_raw##*$'\n'}"      # text after the LAST newline
   health_code="${health_code:-000}"        # curl produced nothing at all
   health="${health_raw%$'\n'*}"            # everything before it
@@ -1078,10 +1158,24 @@ if ! (( DRY_RUN )); then
 
   # The UI is only usable if it was built against the contract this backend serves. Compare the
   # digest the running backend reports with what the frontend pinned.
-  served="$(curl -fsS --max-time 15 "${PUBLIC_BASE}/api/box/status" 2>/dev/null \
+  #
+  # ALSO MOVED TO THE ORIGIN, and this one mattered most of the three. It used `curl -fsS`, so a CDN
+  # challenge (or any non-2xx) produced an EMPTY string, the `-n "$served"` guard skipped the
+  # comparison, and the release reported success having verified nothing. A check that silently passes
+  # when it cannot run is worse than no check, because it is mistaken for evidence.
+  served="$(origin_curl "${PUBLIC_BASE}/api/box/status" 2>/dev/null \
     | node -pe 'try{JSON.parse(require("fs").readFileSync(0,"utf8")).contract?.schemas_sha256??""}catch{""}' 2>/dev/null || true)"
-  if [[ -n "$served" && -n "${frontend_pin:-}" && "$served" != "$frontend_pin" ]]; then
+  if [[ -z "$served" ]]; then
+    # Legitimately possible: /api/box/status sits behind the site access gate, so an unauthenticated
+    # probe cannot read it. That is not a fault, but it does mean this comparison did not happen — and
+    # after the silent-pass bug above, saying so out loud is the whole point.
+    warn "could not read the served contract digest from ${PUBLIC_BASE}/api/box/status at the origin"
+    warn "  (most likely the access gate). The frontend/backend contract match was NOT verified here;"
+    warn "  step 05 did verify the frontend against the backend SOURCE that was checked out."
+  elif [[ -n "${frontend_pin:-}" && "$served" != "$frontend_pin" ]]; then
     die "the RUNNING backend serves contract ${served:0:12}… but the frontend pinned ${frontend_pin:0:12}…"
+  else
+    ok "the running backend serves the contract this frontend pinned (${served:0:12}…)"
   fi
 fi
 
