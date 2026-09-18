@@ -325,6 +325,7 @@ const MARKET_REASON_MAP: Record<BoxExecutionFailureReason, true> = {
   box_inventory_limit: true,
   session_limit_reached: true,
   execution_mode_mismatch: true,
+  lot_exceeds_quantity_cap: true,
 };
 
 const MARKET_REASONS: readonly BoxExecutionFailureReason[] = Object.keys(

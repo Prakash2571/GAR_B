@@ -392,6 +392,10 @@ function zeroPostReasonFor(reason: BoxExecutionFailureReason | null | undefined)
     case "market_closed":
     case "discovery_stopped":
     case "session_limit_reached":
+    // A CONFIGURATION refusal, not a market one: the instrument's lot cannot satisfy the live
+    // quantity envelope. Deliberately not `capital` (that is a ₹ notional cap) and emphatically not
+    // `depth` — the order book is irrelevant to it.
+    case "lot_exceeds_quantity_cap":
     default:
       return "entry_guard";
   }

@@ -178,6 +178,10 @@ function makeCoordinator({
   // one would make `clear()`'s owner-prefix scoping look like it deletes a sibling's
   // reservations when in reality it cannot.
   identity = IDENTITY,
+  // The durable session ATTEMPT consume. Injectable so a test can assert WHETHER an attempt was
+  // spent, which is the whole point of the gates that sit before it in the prologue. Undefined by
+  // default, exactly as a deployment with no session ceiling configured behaves.
+  sessionConsumeAttempt = undefined,
 } = {}) {
   const local = new InProcessInstrumentReservations();
   const logs = [];
@@ -212,6 +216,7 @@ function makeCoordinator({
     reservations: store,
     local,
     waitable: local,
+    ...(sessionConsumeAttempt ? { sessionConsumeAttempt } : {}),
     cfg: cfg({
       conflictWaitMaxMs: 250,
       instrumentLockTtlMs: 5000,
@@ -1372,5 +1377,164 @@ test("MPC22: an execution the coordinator no longer tracks fails CLOSED", async 
   assert.equal(handed(), false, "a broker switch must stop further legs, not permit them");
 
   gateway.finish(0, { ok: false, reason: "legging_incomplete", legging: { residual_exposure: [] } });
+  await p;
+});
+
+
+/* ═══════════════ the quantity envelope, refused before it costs an attempt ═══════════════ */
+
+/**
+ * WHY THIS GATE EXISTS, and why "before the consume" is the entire point.
+ *
+ * The per-leg and gross quantity caps are enforced by BoxOrderManager, three layers below the
+ * coordinator and — critically — AFTER `sessionConsumeAttempt()`. So an instrument whose LOT SIZE
+ * simply exceeds the configured envelope used to:
+ *
+ *   1. spend a session entry attempt (on a one-attempt supervised live test, that ends the test
+ *      before a single byte reaches the broker);
+ *   2. take the underlying hold and the contract reservations, then hand them back;
+ *   3. run the ECONOMIC admission, which performs real broker round-trips for funds and margin
+ *      evidence, for an entry that could never be sent;
+ *   4. and worst: `submit()` refuses with a plain `Error`, which the entry path's `provenNoExposure`
+ *      test does not recognise (only `BrokerPreSubmitRefusedError`/`BrokerOrderRejectedError` count).
+ *      All four legs rejecting therefore made `uncertain` true → `manager.invariantViolation(...)` →
+ *      `recoveryActive = true` AND a trip of the STICKY circuit breaker. A statically-knowable
+ *      configuration mismatch reported "broker terminal quantity is uncertain" and closed the entry
+ *      path, having posted nothing anywhere.
+ *
+ * Everything needed is known synchronously from the candidate and config, so it belongs beside the
+ * blocklist in the no-await prologue.
+ */
+
+function oversized(candidate, lotSize) {
+  // Only the lot changes; everything else must stay a genuinely qualifying candidate so the test
+  // cannot pass for an unrelated reason.
+  return { ...candidate, lot_size: lotSize };
+}
+
+test("T-CAP: a lot above the per-leg cap is refused WITHOUT consuming a session attempt (live)", async () => {
+  const gateway = controllableGateway({ mode: "live" });
+  let consumed = 0;
+  const { coordinator } = makeCoordinator({
+    gateway,
+    config: { liveMaxOpenLegQuantity: 100, liveMaxGrossOpenLegQuantity: 4000 },
+    sessionConsumeAttempt: async () => {
+      consumed++;
+      return { ok: true, detail: null };
+    },
+  });
+  const a = oversized(boxFor({ k1: 2500, k2: 2550 }), 725);
+  const r = await coordinator.simulateLeggingEntry({
+    candidate: a,
+    detection: detectionFor(a),
+    stillWanted: () => true,
+    qualify: () => ({ ok: true }),
+  });
+
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "lot_exceeds_quantity_cap", "NOT insufficient_quantity — depth is irrelevant here");
+  assert.equal(consumed, 0, "THE POINT: a statically-knowable refusal must not spend the attempt budget");
+  assert.equal(gateway.started.length, 0, "and nothing reached the executor, so no broker round trip");
+  // The message must name the number to change, and the lot that broke it.
+  assert.match(r.detail, /725/);
+  assert.match(r.detail, /BOX_LIVE_MAX_OPEN_LEG_QUANTITY=100/);
+  assert.equal(coordinator.metrics().quantityCapRefusals, 1);
+});
+
+test("T-CAP-b: four legs above the GROSS cap are refused the same way", async () => {
+  const gateway = controllableGateway({ mode: "live" });
+  let consumed = 0;
+  const { coordinator } = makeCoordinator({
+    gateway,
+    // Per-leg allows 150; four legs of 150 = 600, above the 400 gross cap.
+    config: { liveMaxOpenLegQuantity: 150, liveMaxGrossOpenLegQuantity: 400 },
+    sessionConsumeAttempt: async () => {
+      consumed++;
+      return { ok: true, detail: null };
+    },
+  });
+  const a = oversized(boxFor({ k1: 2500, k2: 2550 }), 150);
+  const r = await coordinator.simulateLeggingEntry({
+    candidate: a,
+    detection: detectionFor(a),
+    stillWanted: () => true,
+    qualify: () => ({ ok: true }),
+  });
+
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "lot_exceeds_quantity_cap");
+  assert.equal(consumed, 0);
+  assert.match(r.detail, /600 unit\(s\)/, "the four-leg total, not the lot");
+  assert.match(r.detail, /BOX_LIVE_MAX_GROSS_OPEN_LEG_QUANTITY=400/);
+});
+
+test("T-CAP-c: a lot WITHIN the envelope is unaffected — the gate is not a blanket refusal", async () => {
+  const gateway = controllableGateway({ mode: "live" });
+  let consumed = 0;
+  const { coordinator } = makeCoordinator({
+    gateway,
+    config: { liveMaxOpenLegQuantity: 100, liveMaxGrossOpenLegQuantity: 400 },
+    sessionConsumeAttempt: async () => {
+      consumed++;
+      return { ok: true, detail: null };
+    },
+  });
+  // 75 is NIFTY's lot: 75 <= 100 per leg, and 4 x 75 = 300 <= 400 gross. Both bounds are exercised.
+  const a = oversized(boxFor({ k1: 2500, k2: 2550 }), 75);
+  const p = coordinator.simulateLeggingEntry({
+    candidate: a,
+    detection: detectionFor(a),
+    stillWanted: () => true,
+    qualify: () => ({ ok: true }),
+  });
+  await flush();
+  assert.equal(gateway.started.length, 1, "an admissible lot must still reach the executor");
+  assert.equal(consumed, 1, "and it legitimately spends an attempt, because it really is an attempt");
+  assert.equal(coordinator.metrics().quantityCapRefusals, 0);
+  gateway.finish(0);
+  await p;
+});
+
+test("T-CAP-d: PAPER is untouched — these are BOX_LIVE_* caps the order manager owns", async () => {
+  // Paper never constructs BoxOrderManager, so the caps are not enforced there. Applying them in
+  // paper would change which names a rehearsal covers, and the universe board already reports
+  // lot_exceeds_per_leg_cap in every mode for pre-live screening.
+  const gateway = controllableGateway({ mode: "paper_legging" });
+  const { coordinator } = makeCoordinator({
+    gateway,
+    config: { liveMaxOpenLegQuantity: 100, liveMaxGrossOpenLegQuantity: 400 },
+  });
+  const a = oversized(boxFor({ k1: 2500, k2: 2550 }), 725);
+  const p = coordinator.simulateLeggingEntry({
+    candidate: a,
+    detection: detectionFor(a),
+    stillWanted: () => true,
+    qualify: () => ({ ok: true }),
+  });
+  await flush();
+  assert.equal(gateway.started.length, 1, "paper must still simulate a large-lot name");
+  assert.equal(coordinator.metrics().quantityCapRefusals, 0);
+  gateway.finish(0);
+  await p;
+});
+
+test("T-CAP-e: a cap of 0 disables the gate rather than refusing everything", async () => {
+  // 0 means "no cap" for both settings (strictLimitInt with min 1 makes 0 unreachable from env, but
+  // the guard must not invert if a caller ever passes it).
+  const gateway = controllableGateway({ mode: "live" });
+  const { coordinator } = makeCoordinator({
+    gateway,
+    config: { liveMaxOpenLegQuantity: 0, liveMaxGrossOpenLegQuantity: 0 },
+  });
+  const a = oversized(boxFor({ k1: 2500, k2: 2550 }), 100000);
+  const p = coordinator.simulateLeggingEntry({
+    candidate: a,
+    detection: detectionFor(a),
+    stillWanted: () => true,
+    qualify: () => ({ ok: true }),
+  });
+  await flush();
+  assert.equal(gateway.started.length, 1, "0 must mean unbounded, not impossible-to-satisfy");
+  gateway.finish(0);
   await p;
 });
