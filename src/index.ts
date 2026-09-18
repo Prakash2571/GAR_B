@@ -112,6 +112,7 @@ import { getPool } from "./pg/pool.js";
 import { ShutdownCoordinator, shutdownExitCode } from "./shutdown.js";
 import { clearTrackedIntervals } from "./trackedTimers.js";
 import { ReadinessController } from "./runtime/readiness.js";
+import { readContractIdentity } from "./runtime/contractIdentity.js";
 
 /* ========================================================================== */
 /*  1. CONFIGURATION                                                          */
@@ -368,6 +369,18 @@ app.get("/api/health", (_req: Request, res: Response) => {
     state,
     ready,
     shutting_down: state === "shutting_down",
+    /**
+     * THE WIRE CONTRACT THIS PROCESS SPEAKS — the one addition to the "NOTHING else" rule above.
+     *
+     * It is admitted because it is not what that rule protects: a digest over JSON-Schema files
+     * reveals no broker, token, position, exposure or migration state, and the same value is already
+     * vendored into the frontend bundle. What it enables is a deployment verifying that the RUNNING
+     * process speaks the contract the frontend was built for, WITHOUT the access gate — see
+     * src/runtime/contractIdentity.ts for why the previous attempt at that check could never work.
+     *
+     * Nulls mean UNVERIFIABLE, never "matching", so a consumer cannot read a failed read as a pass.
+     */
+    contract: readContractIdentity(),
   });
 });
 
