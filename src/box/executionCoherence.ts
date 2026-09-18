@@ -85,6 +85,64 @@ export const BROKER_TIMESTAMP_NOTES = {
   verified_on: "2026-09-09",
 } as const;
 
+/**
+ * Is the configured exchange-dispersion bound BELOW the active broker's stamp precision?
+ *
+ * WHY THIS EXISTS. The notes above stated the rule — "an exchange-dispersion threshold must be
+ * broker-aware and never sub-second for coarse Kite stamps" — and NOTHING READ THEM. They were
+ * documentation the code never consulted, so the rule was enforced only by whoever happened to have
+ * read this file. Two shipped deploy templates set 250ms against Kite's 1000ms stamps, one of them
+ * with a comment asserting the receive-time gate "actually governs" (it does not: the exchange bound
+ * applies whenever it is > 0 and all four legs carry a stamp, which for Kite depth packets is
+ * always). The result was a deployment refusing 100% of entries with `cross_leg_time_skew` on a
+ * perfectly healthy feed.
+ *
+ * A bound below the broker's precision is not a stricter safety setting — it is an UNSATISFIABLE one.
+ * Dispersion can only take values that are multiples of the precision, so any limit between 1 and
+ * precision-1 admits exactly the same books as 0 would while refusing every boundary-straddling set.
+ *
+ * WARNS, DOES NOT THROW. Unlike the live-mode coordinator check, this cannot silently remove a
+ * protection: the failure mode is over-refusal, which costs opportunity rather than money, and a
+ * paper run may legitimately want to observe the quantisation behaviour. Refusing boot over it would
+ * also be hostile on brokers where the bound is inert. So it is loud and non-fatal.
+ *
+ * Returns null when there is nothing to say: the bound is disabled (0), the broker publishes no book
+ * timestamp (Dhan — the check never fires), or the bound is at or above the precision.
+ */
+export function coherencePrecisionWarning(args: {
+  readonly broker: string;
+  readonly maxExchangeDispersionMs: number;
+}): string | null {
+  // 0 is an explicit, documented "disabled". An operator who chose it does not need advice.
+  if (args.maxExchangeDispersionMs <= 0) return null;
+  // Narrowed explicitly rather than indexed, because BROKER_TIMESTAMP_NOTES also carries
+  // `verified_on` and an arbitrary-string index would not typecheck against it.
+  const notes =
+    args.broker === "zerodha"
+      ? BROKER_TIMESTAMP_NOTES.zerodha
+      : args.broker === "dhan"
+        ? BROKER_TIMESTAMP_NOTES.dhan
+        : null;
+  if (notes === null) return null;
+  // No book timestamp ⇒ `temporalCoherence` leaves exchange dispersion null ⇒ the bound is never
+  // applied. Warning about it would send an operator to fix a setting that changes nothing.
+  if (!notes.exchange_ts_available) return null;
+  const precision: number | null = notes.exchange_ts_precision_ms;
+  if (precision === null || args.maxExchangeDispersionMs >= precision) return null;
+
+  return (
+    `[Box] BOX_MAX_CROSS_LEG_EXCHANGE_DISPERSION_MS=${args.maxExchangeDispersionMs} is BELOW ` +
+    `${args.broker}'s exchange-timestamp precision of ${precision}ms, so it is ` +
+    `UNSATISFIABLE-BY-QUANTISATION, not strict. ${notes.note} Cross-leg exchange dispersion can only ` +
+    `be a multiple of ${precision}ms, so four books the exchange published milliseconds apart measure ` +
+    `as either 0ms or ${precision}ms depending purely on which side of a second boundary they fell — ` +
+    `and the ${precision}ms case is then refused as cross_leg_time_skew. Expect coherent boxes to be ` +
+    `rejected. Set it to ${precision} (a coarse sanity check that still catches genuinely separated ` +
+    `stamps) or to 0 (disabled), and rely on BOX_MAX_CROSS_LEG_RECEIVE_DISPERSION_MS for sub-second ` +
+    `coherence — that gate uses our own millisecond arrival clock and is the precise one. See ${notes.source}`
+  );
+}
+
 /** One leg's evidence at the instant coherence is being judged. */
 export interface CoherenceLegObservation {
   role: string;

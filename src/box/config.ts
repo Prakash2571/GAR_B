@@ -1475,9 +1475,38 @@ export function loadBoxConfig(): BoxConfig {
     queueModel: queueModel("BOX_QUEUE_MODEL", "haircut"),
     queueLiquidityHaircutPct: clampPct("BOX_QUEUE_LIQUIDITY_HAIRCUT_PCT", 30),
 
-    // Four-leg exchange-timestamp coherence. 250ms is generous for a genuine
-    // cross-sectional snapshot yet rejects legs that are visibly out of step.
-    maxCrossLegExchangeDispersionMs: clampInt("BOX_MAX_CROSS_LEG_EXCHANGE_DISPERSION_MS", 250, 0, 60_000),
+    /**
+     * Four-leg EXCHANGE-timestamp coherence.
+     *
+     * 1000ms, NOT 250ms — and the difference is not conservatism, it is arithmetic.
+     *
+     * WHY 250 WAS A BUG, not a tighter setting. Kite's book timestamp is EPOCH SECONDS (see
+     * `src/ticker.ts`: `exchangeTs = exSec * 1000`), so every Kite stamp is an exact multiple of
+     * 1000ms and cross-leg dispersion can only ever be 0, 1000, 2000, … ms. Four legs the exchange
+     * published 160ms apart therefore measure as either 0ms (same second) or a full 1000ms (either
+     * side of a second boundary) — purely by where the boundary fell. Against a 250ms limit the
+     * boundary case is refused, so a perfectly coherent snapshot was rejected on quantisation noise.
+     * This module's own `BROKER_TIMESTAMP_NOTES` in executionCoherence.ts has always said so:
+     * "Any exchange-dispersion threshold below ~1000 ms is therefore unsatisfiable-by-noise for Kite
+     * data and would reject coherent books purely on quantisation."
+     *
+     * Observed consequence before this change: a paper_legging run showed 100% refusals, every one
+     * `cross_leg_time_skew`, on a healthy feed with 200+ underlyings — and the two deploy templates
+     * that shipped 250 carried a comment asserting the receive-time gate "actually governs", which
+     * the code contradicts (`evaluateBookCoherence` applies the exchange bound whenever it is > 0 and
+     * all four legs carry a stamp, which for Kite depth packets is always).
+     *
+     * WHY RAISING IT LOSES NO PROTECTION. Sub-second coherence is enforced by
+     * `maxCrossLegReceiveDispersionMs` (500ms) against OUR OWN arrival clock, which is millisecond-
+     * resolution and always present. That is the precise gate. This one is a COARSE sanity check that
+     * still catches genuinely separated books — stamps spanning 15s/18s/15s/19s measure 4000ms and are
+     * still refused. Setting it BELOW the broker's precision does not buy tighter coherence; it only
+     * makes admission depend on second boundaries.
+     *
+     * `0` still disables it entirely, leaving receive-time as the sole constraint. A value below the
+     * active broker's documented precision is warned about at boot (see `warnCoherencePrecision`).
+     */
+    maxCrossLegExchangeDispersionMs: clampInt("BOX_MAX_CROSS_LEG_EXCHANGE_DISPERSION_MS", 1_000, 0, 60_000),
     // Four-leg RECEIVE-TIME coherence — the ALWAYS-available cross-sectional bound
     // (Dhan has no book exchange stamp; Kite's is 1s-granular). 500ms comfortably
     // admits a genuine simultaneous snapshot delivered over one socket yet rejects

@@ -111,8 +111,19 @@ const REASON_META: Record<
   cross_leg_time_skew: {
     category: "market",
     remedy:
-      "No action if rare. The four legs' exchange timestamps were too far apart to be one coherent " +
-      "snapshot, so the box was not priced across stale quotes.",
+      // DELIBERATELY POINTS AT THE DETAIL rather than naming a cause. Two very different problems
+      // share this reason, and the first version of this sentence named only one of them ("the four
+      // legs' exchange timestamps were too far apart") while also saying "no action if rare" — which
+      // is useless advice on a deployment refusing 100% of entries, and misleading when the binding
+      // bound was receive-time. The detail line states which bound failed and by how much, so send
+      // the operator there instead of guessing for them.
+      "Read the detail: it names which bound failed. `exchange-timestamp dispersion 1000ms exceeds " +
+      "250ms` is CONFIGURATION, not the market — Zerodha stamps books to the whole second, so any " +
+      "BOX_MAX_CROSS_LEG_EXCHANGE_DISPERSION_MS below 1000 refuses coherent books whenever the four " +
+      "legs straddle a second boundary; set it to 1000. A larger multiple (2000ms+) means one leg's " +
+      "book genuinely has not updated for seconds — usually an illiquid strike — and refusing is " +
+      "correct. `receive-time dispersion` is a separate problem: the four books really did arrive " +
+      "that far apart, which is worth investigating on the feed.",
   },
   abort_after_fill: {
     category: "market",
