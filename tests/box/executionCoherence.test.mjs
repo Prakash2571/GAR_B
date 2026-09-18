@@ -23,6 +23,7 @@ import {
   evaluateReductionCoherence,
   livePolicyFromConfig,
   paperPolicyFromConfig,
+  coherencePrecisionWarning,
   BROKER_TIMESTAMP_NOTES,
 } from "../../dist/box/executionCoherence.js";
 import { CentralBoxExecutionGateway } from "../../dist/box/executionGateway.js";
@@ -469,4 +470,97 @@ test("LIVE gateway ADMITS a coherent book (four legs received within ~120ms)", a
   assert.equal(res.ok, true, res.ok ? "" : res.detail);
   assert.equal(h.submitted.length, 4, "all four legs were transmitted");
   assert.deepEqual(h.violations, []);
+});
+
+
+/* ══════════════ THE STAMP-PRECISION GUARD — the 100%-refusal regression ══════════════ */
+
+/**
+ * A deployment refused 100% of entries with `cross_leg_time_skew` on a healthy 200-underlying feed.
+ * Nothing was wrong with the market: `BOX_MAX_CROSS_LEG_EXCHANGE_DISPERSION_MS` was 250 while Kite
+ * stamps order books in epoch SECONDS, so cross-leg dispersion could only ever be 0 or a multiple of
+ * 1000 ms — and every set of four legs that straddled a second boundary measured exactly 1000 ms and
+ * was refused.
+ *
+ * The module had documented this since it was written (`BROKER_TIMESTAMP_NOTES`: "Any
+ * exchange-dispersion threshold below ~1000 ms is therefore unsatisfiable-by-noise for Kite data")
+ * and NOTHING READ IT. Two shipped templates set 250 anyway, one asserting in a comment that
+ * receive-time would govern instead — which the decision function contradicts.
+ *
+ * These tests hold both halves: the quantisation behaviour itself, and the guard that now names it.
+ */
+
+test("PRECISION: 1000ms of Kite quantisation is refused at 250 and admitted at 1000", () => {
+  const now = 1_000_000;
+  // Four books the exchange published milliseconds apart, but straddling a second boundary — so Kite
+  // reports two of them a whole second earlier. Receive times are identical and perfectly coherent,
+  // and every receive-to-exchange delay stays well inside the 5s clock-sanity bound.
+  const straddle = legs(now, {
+    exchange: { k1_ce: now - 1000, k2_ce: now - 1000, k2_pe: now, k1_pe: now },
+  });
+
+  const tooTight = evaluateBookCoherence(
+    straddle,
+    livePolicyFromConfig(cfg({ maxCrossLegExchangeDispersionMs: 250, maxCrossLegReceiveDispersionMs: 500 })),
+    now,
+  );
+  assert.equal(tooTight.admit, false, "250 against 1s stamps refuses a coherent snapshot");
+  assert.equal(tooTight.reason, "exchange_dispersion");
+  assert.match(tooTight.detail, /1000ms exceeds 250ms/);
+
+  const atPrecision = evaluateBookCoherence(
+    straddle,
+    livePolicyFromConfig(cfg({ maxCrossLegExchangeDispersionMs: 1000, maxCrossLegReceiveDispersionMs: 500 })),
+    now,
+  );
+  assert.equal(atPrecision.admit, true, "at the stamp precision the same books are admitted");
+});
+
+test("PRECISION: 1000ms does NOT blunt the check — genuinely separated stamps still refuse", () => {
+  const now = 1_000_000;
+  // Legs whose books have not been republished for seconds. A real signal, not quantisation. Kept
+  // inside BOX_MAX_RECEIVE_TO_EXCHANGE_DELAY_MS (5000) so this refuses on DISPERSION rather than on
+  // the clock-sanity check, which is what makes the assertion meaningful.
+  const lagging = legs(now, {
+    exchange: { k1_ce: now, k2_ce: now - 3000, k2_pe: now, k1_pe: now - 4000 },
+  });
+  const decision = evaluateBookCoherence(
+    lagging,
+    livePolicyFromConfig(cfg({ maxCrossLegExchangeDispersionMs: 1000, maxCrossLegReceiveDispersionMs: 60_000 })),
+    now,
+  );
+  assert.equal(decision.admit, false, "4000ms of real separation must still be refused at a 1000ms bound");
+  assert.equal(decision.reason, "exchange_dispersion");
+  assert.match(decision.detail, /4000ms exceeds 1000ms/);
+});
+
+test("GUARD: a sub-precision bound is named for the broker that has a stamp", () => {
+  const warning = coherencePrecisionWarning({ broker: "zerodha", maxExchangeDispersionMs: 250 });
+  assert.ok(warning, "250 is below Kite's 1000ms precision and must be reported");
+  // The operator needs the number, the cause and the remedy — not merely "check your config".
+  assert.match(warning, /250/);
+  assert.match(warning, /1000ms/);
+  assert.match(warning, /UNSATISFIABLE-BY-QUANTISATION/);
+  assert.match(warning, /BOX_MAX_CROSS_LEG_RECEIVE_DISPERSION_MS/);
+});
+
+test("GUARD: stays silent when there is nothing to say", () => {
+  // At or above the precision there is no quantisation problem.
+  assert.equal(coherencePrecisionWarning({ broker: "zerodha", maxExchangeDispersionMs: 1000 }), null);
+  assert.equal(coherencePrecisionWarning({ broker: "zerodha", maxExchangeDispersionMs: 2000 }), null);
+  // 0 is an explicit, documented "disabled" — an operator who chose it is not confused.
+  assert.equal(coherencePrecisionWarning({ broker: "zerodha", maxExchangeDispersionMs: 0 }), null);
+  // Dhan publishes NO book timestamp, so the bound is never applied and warning about it would send
+  // an operator to change a setting that cannot affect anything.
+  assert.equal(BROKER_TIMESTAMP_NOTES.dhan.exchange_ts_available, false);
+  assert.equal(coherencePrecisionWarning({ broker: "dhan", maxExchangeDispersionMs: 250 }), null);
+  // An unknown broker has no documented precision to compare against.
+  assert.equal(coherencePrecisionWarning({ broker: "someone_else", maxExchangeDispersionMs: 1 }), null);
+});
+
+test("GUARD: the documented precision matches what the Kite parser can actually produce", () => {
+  // src/ticker.ts does `exchangeTs = exSec * 1000`, so every stamp is a whole second. If that ever
+  // changes, this constant must change with it or the guard will police the wrong threshold.
+  assert.equal(BROKER_TIMESTAMP_NOTES.zerodha.exchange_ts_precision_ms, 1000);
+  assert.equal(BROKER_TIMESTAMP_NOTES.zerodha.exchange_ts_available, true);
 });

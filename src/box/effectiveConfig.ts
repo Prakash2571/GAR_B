@@ -175,7 +175,7 @@ const KNOBS: readonly KnobSpec[] = [
   { key: "feedMaxAgeMs", envVar: "BOX_FEED_MAX_AGE_MS", kind: "number", default: 5_000 },
   { key: "underlyingMaxAgeMs", envVar: "BOX_UNDERLYING_MAX_AGE_MS", kind: "number", default: 10_000 },
   { key: "maxCrossLegReceiveDispersionMs", envVar: "BOX_MAX_CROSS_LEG_RECEIVE_DISPERSION_MS", kind: "int", default: 500, min: 0, max: 60_000 },
-  { key: "maxCrossLegExchangeDispersionMs", envVar: "BOX_MAX_CROSS_LEG_EXCHANGE_DISPERSION_MS", kind: "int", default: 250, min: 0, max: 60_000 },
+  { key: "maxCrossLegExchangeDispersionMs", envVar: "BOX_MAX_CROSS_LEG_EXCHANGE_DISPERSION_MS", kind: "int", default: 1_000, min: 0, max: 60_000 },
   { key: "maxReceiveToExchangeDelayMs", envVar: "BOX_MAX_RECEIVE_TO_EXCHANGE_DELAY_MS", kind: "int", default: 5_000, min: 0, max: 120_000 },
   { key: "coherenceZeroDispersionDisablesInLive", envVar: "BOX_COHERENCE_ZERO_DISPERSION_DISABLES_IN_LIVE", kind: "bool", default: false },
 

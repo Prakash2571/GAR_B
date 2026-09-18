@@ -320,7 +320,10 @@ test("REQUIRED 18: the strategy-maths configuration surface is untouched by this
     assert.equal(cfg.unwindMaxChaseTicks, 5);
     assert.equal(cfg.queueModel, "haircut");
     assert.equal(cfg.queueLiquidityHaircutPct, 30);
-    assert.equal(cfg.maxCrossLegExchangeDispersionMs, 250);
+    // 1000ms, matching Kite's whole-second stamp precision. A default BELOW that precision is
+    // unsatisfiable-by-quantisation (see config.ts) — it was 250, which refused coherent books
+    // whenever the four legs straddled a second boundary.
+    assert.equal(cfg.maxCrossLegExchangeDispersionMs, 1000);
     assert.equal(cfg.simulatedLatencyMs, 250);
     assert.equal(cfg.simulatedDecisionMs, 40);
   });

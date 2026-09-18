@@ -74,6 +74,7 @@ import { BoxTradingSessionManager } from "./tradingSessionStore.js";
 import { AccountFundsTracker, unavailableFunds, type AccountFundsSnapshot } from "./accountFunds.js";
 import { EntryAlertLedger } from "./entryAlerts.js";
 import { BoxExecutionSimulator } from "./executionSimulator.js";
+import { coherencePrecisionWarning } from "./executionCoherence.js";
 import { createExecutionClock, type ExecutionClock } from "./executionClock.js";
 import { ExecutionEnvironmentMonitor } from "./executionEnvironment.js";
 import { ExecutionCalibrationStore, type CalibrationStage } from "./executionCalibration.js";
@@ -1961,6 +1962,22 @@ export class BoxEngine {
      */
     this.ensureAccountFundsTimer();
 
+    /*
+     * NAME AN UNSATISFIABLE COHERENCE BOUND, LOUDLY, AT BOOT.
+     *
+     * A cross-leg exchange-dispersion limit below the broker's stamp precision refuses coherent
+     * books on quantisation alone, and the symptom — 100% of entries refused as `cross_leg_time_skew`
+     * on a healthy feed — looks exactly like adverse market conditions. Nothing previously connected
+     * the setting to the cause, so the operator had no way to tell the two apart.
+     *
+     * Logged after the readiness line so it is the LAST thing on screen at boot rather than being
+     * scrolled away by it.
+     */
+    const coherenceWarning = coherencePrecisionWarning({
+      broker: this.deps.activeBroker(),
+      maxExchangeDispersionMs: this.cfg.maxCrossLegExchangeDispersionMs,
+    });
+
     console.log(
       `[Box] engine ready — ${this.positions.size} open box position(s), ` +
         `entry gate ₹${requiredNetProfit(this.cfg)} EXPECTED NET after every cost ` +
@@ -1970,6 +1987,7 @@ export class BoxEngine {
         `freshness ${this.cfg.quoteMaxAgeMs}ms, ATM±${this.strikeLevel} of max ±${this.cfg.strikesEachSide}, ` +
         `market ${this.marketOpen ? "OPEN" : "CLOSED"}.`,
     );
+    if (coherenceWarning !== null) console.warn(coherenceWarning);
     } catch (error) {
       // A failed live boot must be retryable after Mongo/session recovery.
       this.started = false;
