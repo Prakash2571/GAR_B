@@ -602,6 +602,11 @@ export interface BoxConfig {
   /** Deployment kill switch. `executionMode=live` is invalid unless this is true. */
   liveTradingEnabled: boolean;
   /** Low-frequency broker reconciliation cadence. */
+  /**
+   * Unresolved-recovery age (ms) at which operational status escalates. `0` disables the escalation
+   * only — never the underlying entry refusal, which the order manager owns.
+   */
+  liveRecoveryEscalationMs: number;
   liveReconcileIntervalMs: number;
   /** Quiet period after a feed reconnect before a new entry may be submitted. */
   liveFeedReconnectWarmupMs: number;
@@ -1514,6 +1519,16 @@ export function loadBoxConfig(): BoxConfig {
         "") || null,
 
     liveTradingEnabled,
+    /*
+     * How long unresolved recovery may persist before operational status ESCALATES.
+     *
+     * Strict rather than clamped: this governs when an operator is told that recovery has stalled, so
+     * a typo silently resolving to a long default would delay the alert without saying so. `0`
+     * disables escalation and is a legitimate explicit choice — the unresolved state itself is still
+     * reported and still blocks entry, because that enforcement lives in the order manager and does
+     * not depend on this threshold. See `recoveryEscalation.ts`.
+     */
+    liveRecoveryEscalationMs: strictLimitInt("BOX_LIVE_RECOVERY_ESCALATION_MS", 120_000, 0, 60 * 60_000),
     liveReconcileIntervalMs: clampInt("BOX_LIVE_RECONCILE_INTERVAL_MS", 60_000, 5_000, 15 * 60_000),
     liveFeedReconnectWarmupMs: clampInt("BOX_LIVE_FEED_RECONNECT_WARMUP_MS", 5_000, 0, 5 * 60_000),
     liveMaxOpenBoxes: clampInt("BOX_LIVE_MAX_OPEN_BOXES", 1, 0, 20),

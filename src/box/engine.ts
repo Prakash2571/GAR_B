@@ -57,6 +57,7 @@ import {
 import { BoxChargeEstimator, buildEntryChargeLegs, type BoxChargeLeg, type PriceChargeGroupsFn } from "./charges.js";
 import { BoxChargeReconciler } from "./chargeReconciler.js";
 import { activeUnderlyings, type UnderlyingActivity } from "./underlyingLock.js";
+import { deriveRecoveryEscalation, recoveryEscalationBlocker } from "./recoveryEscalation.js";
 import {
   MAX_EXCLUDED_UNDERLYINGS,
   UnderlyingExclusionBook,
@@ -799,6 +800,18 @@ export class BoxEngine {
    * but it must never become a reason the exposure this process already holds cannot be reduced.
    */
   private residualRecoveryLoadError: string | null = null;
+  /**
+   * When THIS process first observed any unresolved-recovery condition, wall clock. Null when clear.
+   *
+   * The non-durable half of the escalation age. Residual exposure carries its own durable
+   * `created_at`, which is preferred and survives a restart; the other unresolved states (unknown
+   * orders, unattended working orders, incomplete reconciliation) have no durable timestamp anywhere
+   * in the schema, so their age is measured from here and RESETS ON RESTART. That limitation is
+   * reported rather than hidden — see `RecoveryAgeSource` in `recoveryEscalation.ts`.
+   *
+   * One number, cleared the moment nothing is unresolved, so nothing accumulates.
+   */
+  private recoveryUnresolvedSinceWall: number | null = null;
   /** Retry timer for an unreadable residual picture. Cleared the moment a read succeeds. */
   private residualRecoveryRetryTimer: NodeJS.Timeout | null = null;
   private static readonly RESIDUAL_RECOVERY_RETRY_MS = 15_000;
@@ -5682,6 +5695,28 @@ export class BoxEngine {
   }
 
   /**
+   * The oldest `created_at` across all outstanding residual legs, or null when there are none.
+   *
+   * This is the DURABLE unresolved-since instant: `created_at` is written when the residual is
+   * recorded and deliberately preserved when a shrunken residual is written back, so it is neither
+   * reset by a partial flatten nor by a restart that reloads the same residual. That is what lets the
+   * recovery-escalation age survive a restart instead of quietly starting from zero.
+   *
+   * Wall clock, matching the stamp's own domain — comparing it against a monotonic reading would be
+   * meaningless.
+   */
+  private oldestResidualCreatedAtWall(): number | null {
+    let oldest: number | null = null;
+    for (const legs of this.residualByAttempt.values()) {
+      for (const leg of legs) {
+        if (!Number.isFinite(leg.created_at)) continue;
+        if (oldest === null || leg.created_at < oldest) oldest = leg.created_at;
+      }
+    }
+    return oldest;
+  }
+
+  /**
    * Every instrument token that OUTSTANDING RESIDUAL EXPOSURE needs a live book for.
    *
    * WHY THIS EXISTS. Residual legs are real (or really simulated) exposure that no ordinary open
@@ -7837,6 +7872,40 @@ export class BoxEngine {
           `Reduction of known exposure continues, and the read is retried automatically.`,
       });
     }
+    /*
+     * RECOVERY ESCALATION. A MORE PRECISE REASON for a refusal that is already happening.
+     *
+     * Every condition below already blocks new entry inside
+     * `BoxOrderManager.entryBlockReasonAfterControls`, so this adds NO new enforcement — two gates for
+     * one condition can disagree, and an operator then cannot tell which is in force. What it adds is
+     * the distinction between "recovery is in progress" and "recovery has been stuck for longer than
+     * the operator said was acceptable", plus the bounded numbers behind it.
+     *
+     * Derived, never stored, so it clears itself the moment the underlying state resolves. Entry-scoped
+     * for the usual reason: the readiness scope filter cannot route it to the reduction verdict, and
+     * nothing here flattens, cancels or reverses anything because a timer expired.
+     */
+    const escalation = deriveRecoveryEscalation({
+      nowWall: this.executionClock.wall(),
+      escalateAfterMs: this.cfg.liveRecoveryEscalationMs,
+      oldestResidualCreatedAtWall: this.oldestResidualCreatedAtWall(),
+      firstObservedUnresolvedAtWall: this.recoveryUnresolvedSinceWall,
+      residualLegCount: this.residualLegCount(),
+      unknownOrderCount: live?.unknownOrders ?? 0,
+      unattendedWorkingOrderCount: live?.unattendedWorkingOrders ?? 0,
+      reconciliationComplete: live?.health.reconciliation_complete ?? true,
+      recoveryActive: live?.recoveryActive ?? false,
+      crashRecoveryQuarantined: live?.crashRecoveryEntryQuarantined ?? false,
+      residualStateUnknown: this.residualRecoveryLoadError !== null,
+      residualAttemptIds: [...this.residualByAttempt.keys()],
+    });
+    // Start or clear the process-local mark in the SAME pass that evaluated the conditions, so the
+    // two can never disagree about whether anything is unresolved.
+    this.recoveryUnresolvedSinceWall = escalation.unresolved
+      ? (this.recoveryUnresolvedSinceWall ?? this.executionClock.wall())
+      : null;
+    const escalationBlocker = recoveryEscalationBlocker(escalation);
+    if (escalationBlocker !== null) engineBlockers.push(escalationBlocker);
     /*
      * EXPOSURE THIS PROCESS MUST NOT EXECUTE. Scoped `reduction` — the most serious scope — because
      * that is precisely what it means: a real position or residual is on, and this process is the
