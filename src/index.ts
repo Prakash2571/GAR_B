@@ -60,6 +60,10 @@ import { LocalChargeCalculator } from "./box/localCharges.js";
 import { registerBoxModule, type BoxModule } from "./box/index.js";
 // SECTION 7: the shape of the readiness evidence this module injects into the ONE decision.
 import type { ReadinessBlocker } from "./box/operationalReadiness.js";
+import {
+  readZerodhaStaticIpPolicy,
+  zerodhaStaticIpReadinessBlocker,
+} from "./box/zerodhaStaticIp.js";
 import { countUnresolvedBoxOrderIntentsForBroker } from "./box/repository.js";
 import {
   deriveFnoBoard,
@@ -878,6 +882,20 @@ boxModule.engine.setExternalReadinessBlockers(() => {
       detail: "DHAN_LIVE_TRADING_ENABLED is not armed, so Dhan will take no new entry.",
     });
   }
+  /*
+   * The Zerodha static-IP operator confirmation, as OBSERVABILITY.
+   *
+   * Enforcement is `entryBlockReasonAfterControls` in the order manager, which is the only thing that
+   * can stop a POST — readiness is consumed by `getStatus()` and the runtime-status projection and by
+   * nothing in the entry decision path. This exists so the condition has a precise, greppable reason
+   * on the status surface instead of an entry that is simply, silently never taken.
+   */
+  const zerodhaStaticIpBlocker = zerodhaStaticIpReadinessBlocker({
+    live: boxExecutionMode === "live",
+    broker: active,
+    policy: readZerodhaStaticIpPolicy(process.env),
+  });
+  if (zerodhaStaticIpBlocker !== null) blockers.push(zerodhaStaticIpBlocker);
   if (!isPgReady()) {
     blockers.push({
       code: "postgres_unavailable",

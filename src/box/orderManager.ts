@@ -36,6 +36,7 @@ import {
   type BoxSchedulingSlot,
   clampEntrySubmitConcurrency,
 } from "./executionSchedulingPolicy.js";
+import { ZERODHA_STATIC_IP_UNCONFIRMED } from "./zerodhaStaticIp.js";
 import type {
   BoxOrderIntentAudit,
   BoxOrderIntentPatch,
@@ -420,10 +421,24 @@ export interface OrderManagerLimits {
   maxGrossOpenLegQuantity: number;
   reconcileIntervalMs: number;
   feedReconnectWarmupMs: number;
+  /**
+   * Has an operator confirmed Zerodha's static-IP registration for a LIVE deployment?
+   *
+   * Pre-resolved against the execution mode at construction so this object stays a plain value and
+   * the order manager needs no knowledge of the mode: a paper profile places no broker order, so it
+   * is folded to `true` here rather than special-cased at the point of use.
+   *
+   * Consumed by `entryBlockReasonAfterControls` ONLY. It must never be read from a submit, cancel or
+   * modify path that a reduction can reach — an operator forgetting a confirmation flag must not stop
+   * GAR_B from ATTEMPTING to reduce exposure it already owns.
+   */
+  zerodhaEntryStaticIpConfirmed: boolean;
 }
 
 export function orderManagerLimitsFromConfig(cfg: BoxConfig): OrderManagerLimits {
   return {
+    zerodhaEntryStaticIpConfirmed:
+      cfg.executionMode === "live" ? cfg.zerodhaStaticIp.confirmed : true,
     maxOpenBoxes: cfg.liveMaxOpenBoxes,
     maxConcurrentExecutions: cfg.liveMaxConcurrentExecutions,
     entrySubmitConcurrency: cfg.liveEntrySubmitConcurrency,
@@ -1108,6 +1123,38 @@ export class BoxOrderManager {
     }
     if (this.residualLegs > this.deps.limits.maxResidualLegs) {
       return `${this.residualLegs} residual leg(s) exceed the configured limit; entry waits until they clear.`;
+    }
+    /*
+     * THE ZERODHA STATIC-IP OPERATOR CONFIRMATION — ENFORCEMENT, not reporting.
+     *
+     * Zerodha requires the public egress IP that sends API order requests to be registered in the
+     * Kite developer console. GAR_B cannot verify that whitelist (no authoritative endpoint exists),
+     * so this gate records an OPERATOR CONFIRMATION and refuses new live entry without one.
+     *
+     * It lives HERE, and the location is the substance of the change. `entryBlockReasonAfterControls`
+     * is reached only through `canEnter`, which `submit()` consults exclusively under
+     * `purpose === "ENTRY"` — the disjoint branch from `purpose !== "ENTRY"`. So this cannot be
+     * reached by an EXIT, a PROTECTIVE_CANCEL, an EMERGENCY_RESIDUAL or reconciliation, by
+     * construction rather than by convention.
+     *
+     * That placement is deliberate in contrast to Dhan's `ensureTradingReady()`, which is called from
+     * `submitOrder`, `cancelOrder` AND `modifyOrder`. For Dhan that is right — its broker genuinely
+     * refuses all three from a non-whitelisted address. It is the wrong home for a LOCAL policy flag:
+     * an operator forgetting a confirmation must never stop GAR_B from attempting to reduce exposure
+     * it already owns. If the host really is on an unregistered address, Zerodha rejecting the exit
+     * is a broker/infrastructure failure to surface and escalate — not a reason to decline to try.
+     *
+     * A readiness blocker with the same code is published for observability, but readiness is
+     * consumed only by `getStatus()` and the runtime-status projection, so it enforces nothing. This
+     * line is the enforcement; the two are tested independently on purpose.
+     */
+    if (!this.deps.limits.zerodhaEntryStaticIpConfirmed && this.deps.broker?.() === "zerodha") {
+      return (
+        `${ZERODHA_STATIC_IP_UNCONFIRMED}: no operator has confirmed that the public egress IP sending ` +
+        `Zerodha order requests is registered in the Kite developer console, so no NEW entry is taken. ` +
+        `Set ZERODHA_STATIC_IP_CONFIRMED=true once it is registered. Exits, protective cancels, ` +
+        `emergency residual flattening and reconciliation are NOT gated by this.`
+      );
     }
     if (request) {
       const quantityBlocked = this.quantityLimitBlockReason(request);

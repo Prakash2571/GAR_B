@@ -19,6 +19,7 @@ import {
   ENTRY_SUBMIT_CONCURRENCY_MIN,
 } from "./executionSchedulingPolicy.js";
 import { normaliseAllowlist } from "./underlyingExclusions.js";
+import { readZerodhaStaticIpPolicy, type ZerodhaStaticIpPolicy } from "./zerodhaStaticIp.js";
 import type { BoxQueueModel, BoxScannerConfigSnapshot, ExecutionMode } from "./types.js";
 
 function num(name: string, fallback: number): number {
@@ -623,6 +624,11 @@ export interface BoxConfig {
    * no identity constraint. Never consulted for exits, reductions or reconciliation.
    */
   liveAllowedUnderlyings: readonly string[];
+  /**
+   * The operator's declared position on Zerodha's static-IP requirement. Gates NEW live Zerodha
+   * ENTRY only; never consulted for a reduction. See `zerodhaStaticIp.ts`.
+   */
+  zerodhaStaticIp: ZerodhaStaticIpPolicy;
   /** Distinct bounded deadlines for transport and broker lifecycle phases. */
   liveHttpTimeoutMs: number;
   liveAckTimeoutMs: number;
@@ -1529,6 +1535,12 @@ export function loadBoxConfig(): BoxConfig {
      * what a symbol is.
      */
     liveAllowedUnderlyings: normaliseAllowlist(csv("BOX_LIVE_ALLOWED_UNDERLYINGS")),
+    /*
+     * The Zerodha static-IP OPERATOR CONFIRMATION. Read through the pure policy module so that one
+     * place owns the fail-closed parse and the honest wording. `confirmed` is an operator assertion
+     * that the egress IP is registered in the Kite developer console — never a broker-verified fact.
+     */
+    zerodhaStaticIp: readZerodhaStaticIpPolicy(process.env),
     liveHttpTimeoutMs: clampInt("BOX_LIVE_HTTP_TIMEOUT_MS", 5_000, 250, 30_000),
     liveAckTimeoutMs: clampInt("BOX_LIVE_ACK_TIMEOUT_MS", 3_000, 250, 30_000),
     liveWorkingTimeoutMs: clampInt("BOX_LIVE_WORKING_TIMEOUT_MS", 30_000, 1_000, 10 * 60_000),
