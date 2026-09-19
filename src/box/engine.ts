@@ -58,6 +58,7 @@ import { BoxChargeEstimator, buildEntryChargeLegs, type BoxChargeLeg, type Price
 import { BoxChargeReconciler } from "./chargeReconciler.js";
 import { activeUnderlyings, type UnderlyingActivity } from "./underlyingLock.js";
 import { deriveRecoveryEscalation, recoveryEscalationBlocker } from "./recoveryEscalation.js";
+import { deriveResidualNotional, residualNotionalSummary } from "./residualNotional.js";
 import {
   MAX_EXCLUDED_UNDERLYINGS,
   UnderlyingExclusionBook,
@@ -7904,7 +7905,33 @@ export class BoxEngine {
     this.recoveryUnresolvedSinceWall = escalation.unresolved
       ? (this.recoveryUnresolvedSinceWall ?? this.executionClock.wall())
       : null;
-    const escalationBlocker = recoveryEscalationBlocker(escalation);
+    /*
+     * §12 RESIDUAL ECONOMIC OBSERVABILITY, attached where it is most decision-relevant.
+     *
+     * Computed only when an escalation is actually being reported, so a healthy deployment pays nothing
+     * for it. NOTIONAL, never a loss or risk estimate: an option position's loss can exceed it or fall
+     * well below it, and nothing here computes which. UNKNOWN rather than zero whenever a price is
+     * missing, stale or unusable — see `residualNotional.ts`.
+     *
+     * `quoteMaxAgeMs` is the repository's existing "is this quote usable for a decision" policy rather
+     * than a threshold invented here; the strict supervised profile sets it to 3000ms.
+     */
+    const escalationBlocker = recoveryEscalationBlocker(
+      escalation,
+      escalation.escalated
+        ? residualNotionalSummary(
+            deriveResidualNotional({
+              legs: [...this.residualByAttempt.values()].flat(),
+              price: (token) => {
+                const quote = this.quotes.get(token);
+                return quote === undefined ? undefined : { last: quote.last, at: quote.at };
+              },
+              nowWall: this.executionClock.wall(),
+              maxPriceAgeMs: this.cfg.quoteMaxAgeMs,
+            }),
+          )
+        : null,
+    );
     if (escalationBlocker !== null) engineBlockers.push(escalationBlocker);
     /*
      * EXPOSURE THIS PROCESS MUST NOT EXECUTE. Scoped `reduction` — the most serious scope — because

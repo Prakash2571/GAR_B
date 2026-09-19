@@ -191,6 +191,16 @@ export interface RecoveryEscalationBlocker {
  */
 export function recoveryEscalationBlocker(
   escalation: RecoveryEscalation,
+  /**
+   * Optional one-sentence economic size of the unresolved residual exposure (§12).
+   *
+   * Appended rather than made a status field of its own because
+   * `operational-readiness.schema.json` is closed at the root AND at `exposure_management`, so a new
+   * field is a contract version bump across two repositories. This is the point where an operator most
+   * needs the number — recovery has been stuck long enough to warrant a decision, and "3 residual
+   * legs" does not say whether that decision is urgent.
+   */
+  residualSummary?: string | null,
 ): RecoveryEscalationBlocker | null {
   if (!escalation.escalated) return null;
   const seconds = Math.floor((escalation.oldestRecoveryAgeMs ?? 0) / 1000);
@@ -210,8 +220,9 @@ export function recoveryEscalationBlocker(
       `${escalation.unresolvedRecoveryCount} unresolved condition(s): ` +
       `${escalation.unresolvedResidualLegCount} residual leg(s), ${escalation.unknownOrderCount} ` +
       `unknown order(s), reconciliation ${escalation.reconciliationRequired ? "INCOMPLETE" : "complete"}.` +
-      `${sample} This is an ALERT, not an instruction: nothing is flattened or reversed because a ` +
-      `timer expired. New entry is already refused for the underlying state; exits, protective ` +
-      `cancels, emergency residual flattening, reconciliation and broker-state refresh all continue.`,
+      `${sample}${residualSummary ? ` ${residualSummary}` : ""} This is an ALERT, not an instruction: ` +
+      `nothing is flattened or reversed because a timer expired. New entry is already refused for the ` +
+      `underlying state; exits, protective cancels, emergency residual flattening, reconciliation and ` +
+      `broker-state refresh all continue.`,
   };
 }
