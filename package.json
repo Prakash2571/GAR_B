@@ -24,8 +24,9 @@
     "test:shutdown": "node --test \"tests/shutdown/*.test.mjs\"",
     "test:readiness": "node --test \"tests/readiness/*.test.mjs\"",
     "test:contract": "node --test \"tests/contract/*.test.mjs\"",
+    "test:operator-config": "node --experimental-strip-types --test \"tests/operatorConfig/*.test.mjs\"",
     "test:integration": "npm run test:pg && npm run test:projector",
-    "test": "npm run build && npm run test:unit && npm run test:invariants && npm run test:tokens && npm run test:access && npm run test:switch && npm run test:shutdown && npm run test:readiness && npm run test:contract && npm run test:integration"
+    "test": "npm run build && npm run test:unit && npm run test:invariants && npm run test:tokens && npm run test:access && npm run test:switch && npm run test:shutdown && npm run test:readiness && npm run test:contract && npm run test:operator-config && npm run test:integration"
   },
   "keywords": [],
   "author": "",

@@ -31,6 +31,7 @@ suite requires, so an accidental future dependency is obvious:
 |-------|-------------|----------|----------|-------|
 | unit (`tests/box/`) | **no** | **no** | **no** | Pure/offline. Any test needing a real database belongs in another suite; a static guard fails the suite otherwise. |
 | invariants (`tests/invariants/`) | no | no | no | Pure safety invariants. |
+| operator-config (`tests/operatorConfig/`) | no | no | no | Pure/offline, and the ONLY suite that runs against `src/**.ts` directly — **no `npm run build` required**. See below. |
 | tokens (`tests/tokens/`) | no | no | loopback only | Drives a LOCAL mock HTTP server (127.0.0.1); no real broker. |
 | access (`tests/access/`) | no | no | loopback only | Site passcode gate; loopback express app only. |
 | switch (`tests/switch/`) | no | no | loopback only | Broker switch; broker egress served from fixtures (hermetic). |
@@ -276,3 +277,50 @@ ordering that cannot be executed offline. Cases:
 - (source) the outbox flush is declared as BOUNDED;
 - (source) NO declared step names a flatten/liquidate/close-position action.
 ```
+
+
+## The operator-config suite (`tests/operatorConfig/`) — the one suite that skips the build
+
+`npm run test:operator-config` is
+`node --experimental-strip-types --test "tests/operatorConfig/*.test.mjs"`, and it is the only suite
+that imports `src/**.ts` rather than `dist/**.js`.
+
+**Why it is different.** Every other suite asserts against the BUILT output, which is the right
+default: it proves the thing that ships. The operator-configuration modules
+(`src/box/operatorConfig/`) get a second, narrower treatment because their defining property is that
+they are PURE — no `pg`, no `express`, no `mongodb`, no `node:fs`, no reach into the engine, nothing
+but types and arithmetic. Running them straight from source, with no build and no devDependencies, is
+EVIDENCE of that purity rather than a way around the toolchain. If someone later adds a database call
+to `policy.ts`, this suite stops working, which is precisely the alarm we want. Two tests in
+`registry.test.mjs` assert the property directly as well:
+
+- `operatorConfig modules import nothing outside their own directory`
+- `operatorConfig modules use erasable TypeScript only`
+
+The second matters because `--experimental-strip-types` strips types but TRANSFORMS nothing, so these
+modules must stay within erasable syntax (no `enum`, no `namespace`, no constructor parameter
+properties). That constraint is what keeps `npm run build` and this harness compiling the same source.
+
+**The resolve hook.** The repo compiles under NodeNext, so a `.ts` file importing a sibling writes
+`./precedence.js`. `tests/helpers/tsResolve.mjs` rewrites a RELATIVE `.js` specifier to `.ts` when the
+`.ts` exists, and passes everything else to the default resolver — so it can never silently redirect a
+package import. `tests/operatorConfig/_harness.mjs` registers it and re-exports the modules.
+
+### What the suite covers (92 tests)
+
+| File | Covers |
+|------|--------|
+| `precedence.test.mjs` | The containment rule. Missing rows fall through and NEVER resolve to 0; `0 = unlimited` is normalised to `+Infinity` before any comparison so `Math.min(5, 0)` cannot turn a finite ceiling into an unlimited one; a ceiling may be lowered at runtime and never raised; a floor may be raised and never lowered; boolean containment follows the SAFE direction, so an env-enabled protection cannot be disabled and an env-disabled risky feature cannot be enabled; an UNSET env var expresses no bound, so the code default does not become an unraisable ceiling; `isSafer` is direction-aware rather than magnitude-aware. |
+| `validate.test.mjs` | Unknown keys refused (including env-var-style names — the API speaks domain keys only); `NaN`/±`Infinity` refused; numeric strings refused rather than coerced; fractions refused for integers; present-but-`null` refused rather than treated as "leave alone"; every numeric setting's declared bounds enforced at both inclusive ends; enum membership; and ALL-OR-NOTHING — one bad field refuses the whole patch and `values` is absent, so nothing can be half-applied. |
+| `policy.test.mjs` | The mutation policies. Flatness is all five conditions (open boxes, residual legs, working orders, in-flight executions, clean reconciliation), each with its own named blocker; tightening while armed is allowed and widening is REFUSED with the route to it named; `FLAT_AND_DISARMED` settings are refused while armed even when tightening (the dual-authority settings); `NEXT_SESSION` settings are storable while armed but report `next_arm`, never touching the armed snapshot; a deployment bound is refused rather than clamped; widening requires full admin; the fault-injecting paper profile can never be selected in live. |
+| `registry.test.mjs` | The security boundary and the migration guarantee. No registered setting maps to a `secret` or `identity` variable — checked against the REAL `classifyEnvVar` in `src/env/secrets.ts`, plus a test proving the guard throws when one is; no credential name appears in executable code anywhere in the subsystem; no deployment live gate (`BOX_EXECUTION_MODE`, `BOX_LIVE_TRADING_ENABLED`, `ZERODHA_`/`DHAN_LIVE_TRADING_ENABLED`, …) is runtime-configurable and no setting writes a capability field; **every code default is read out of `loadBoxConfig()`'s own source and compared**, which is what makes "first deployment behaves exactly as before" true rather than hoped for; `0 = unlimited` is declared only where a bigger number really is looser; anything `dangerous` is also admin-gated. |
+| `snapshot.test.mjs` | Immutability and atomicity. The snapshot and every resolved entry are frozen; a mutation produces version + 1 and leaves the previous snapshot untouched; rebuilding wholesale means a reset row cannot leave a stale value behind; a stale OR ABSENT expected version is refused (absent is stale, not "force"); a deployment clamp is reported on the resolved entry rather than silently applied; accessors throw on an unregistered key instead of returning `undefined`, so a typo in execution code crashes at first use rather than becoming a permissive limit. |
+| `exitInvariant.test.mjs` | **The exit / risk-reduction invariant, asserted against the real backend source.** `exposureReductionBlockReason` references no runtime-configurable setting, no `deps.limits`, and depends only on `disposed` + a KNOWN-bad broker session (`=== "unhealthy"`, never `!== "healthy"`); the per-Box capital cap has exactly ONE call site and it is dominated by a `purpose === "ENTRY"` guard; `acquireForExit`/`refsForExit` apply none of the entry admission gates; `EXPIRY_SAFETY` overrides profitability and is not gated by `minExitNetPnl`, whose `clearsFloor` only ever feeds the two VOLUNTARY profit rules; `minExitNetPnl` is absent from the order manager, coordinator and gateway entirely; no execution module imports the config policy/validation modules. |
+
+**A note on the source assertions in `exitInvariant.test.mjs`.** Several of the functions it inspects
+take an inline object type (`refsForExit(position: {`, `evaluateExitDecision(args: {`), so
+brace-counting from the first `{` after the signature captures the PARAMETER TYPE rather than the
+body — and for an assert-this-is-absent test that is a silent false pass, which is worse than a
+failure. `functionBody()` therefore skips the parameter list by matching parentheses first, and every
+absence assertion is paired with an `assertRealBody()` tripwire naming a token the real body is known
+to contain. Keep the tripwires when adding a case.

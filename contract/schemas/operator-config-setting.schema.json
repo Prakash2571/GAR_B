@@ -1,0 +1,155 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "operator-config-setting.schema.json",
+  "title": "One operator-configurable setting, with its provenance and current mutability",
+  "description": "Source: src/box/operatorConfig/ (registry.ts for the metadata, precedence.ts for configured/effective/source, policy.ts for mutable/blockers). THE DOMAIN KEY IS THE API, NOT THE ENVIRONMENT VARIABLE: `key` is a stable camelCase name such as `maxBoxCapitalRupees`, and `env_var` is provenance only, shown in an Advanced detail. THREE VALUES ARE DISTINCT AND ALL THREE ARE SENT: `configured_value` is what the operator asked for, `effective_value` is what the engine enforces, and `default_value` is the code default. They diverge when an explicitly-set deployment ceiling clamps an operator value, which is exactly the case `clamped_by_deployment` and `source: runtime_clamped_by_env` exist to make visible — a UI that showed only one number would report a limit that is not in force. `session_snapshot_value` is non-null ONLY for a NEXT_SESSION setting while a session is armed, and carries the value frozen at arm time, so the UI can never present a newly configured ceiling as though the armed session were already using it. NO SECRET IS EVER CARRIED HERE: only environment variables classified as plain `config` in src/env/secrets.ts may be registered, and a backend test asserts it. CLOSED so an added field is caught.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "key",
+    "label",
+    "description",
+    "category",
+    "type",
+    "unit",
+    "configured_value",
+    "effective_value",
+    "default_value",
+    "source",
+    "deployment_bound",
+    "clamped_by_deployment",
+    "mutable",
+    "mutation_policy",
+    "takes_effect",
+    "requires_flat",
+    "requires_disarmed",
+    "dangerous",
+    "requires_full_admin",
+    "session_snapshot_value",
+    "blockers",
+    "env_var",
+    "safe_direction"
+  ],
+  "properties": {
+    "key": {
+      "type": "string",
+      "description": "Stable camelCase domain key. The wire and persisted identity."
+    },
+    "label": {
+      "type": "string",
+      "description": "Human label, shown first. Never an environment variable name."
+    },
+    "description": { "type": "string" },
+    "category": {
+      "enum": ["strategy", "risk", "market_data", "paper", "universe", "charges"]
+    },
+    "type": { "enum": ["boolean", "integer", "number", "enum"] },
+    "unit": {
+      "enum": [
+        "rupees",
+        "milliseconds",
+        "seconds",
+        "minutes",
+        "count",
+        "ratio",
+        "percent",
+        "none"
+      ]
+    },
+    "configured_value": {
+      "type": ["boolean", "number", "string"],
+      "description": "What the operator has configured: the persisted runtime value if present, else the environment value, else the code default."
+    },
+    "effective_value": {
+      "type": ["boolean", "number", "string"],
+      "description": "What the engine actually enforces, after deployment containment. May be stricter than configured_value."
+    },
+    "default_value": { "type": ["boolean", "number", "string"] },
+    "source": {
+      "enum": ["default", "env", "runtime", "runtime_clamped_by_env"],
+      "description": "Which layer supplied effective_value. `runtime_clamped_by_env` means an operator value is NOT in force because a deployment bound overrides it."
+    },
+    "deployment_bound": {
+      "type": ["boolean", "number", "string", "null"],
+      "description": "The absolute bound this deployment set, when the setting is a ceiling/floor and its environment variable was explicitly set. Null means the deployment expressed no opinion."
+    },
+    "clamped_by_deployment": {
+      "type": "boolean",
+      "description": "True when configured_value differs from effective_value because of deployment_bound."
+    },
+    "min": { "type": ["number", "null"] },
+    "max": { "type": ["number", "null"] },
+    "enum_values": {
+      "type": ["array", "null"],
+      "items": { "type": "string" }
+    },
+    "zero_means": {
+      "type": ["string", "null"],
+      "enum": ["value", "unlimited", "disabled", null],
+      "description": "What 0 means for this setting. `unlimited` matters: for those settings 0 is the LEAST restrictive value, not the most."
+    },
+    "safe_direction": {
+      "enum": [
+        "lower_is_safer",
+        "higher_is_safer",
+        "enabled_is_safer",
+        "disabled_is_safer",
+        "neutral"
+      ],
+      "description": "Which direction of change REDUCES risk. Published because it is NOT derivable from the number: raising minExpectedNetProfit is safer while raising maxOpenBoxes is riskier, and both are 'a bigger number'. The frontend uses this to decide which edits need a dangerous-change confirmation, so that judgement comes from backend metadata rather than a second implementation of the rule that could disagree. Note for a ceiling with zero_means: unlimited, 0 is the LEAST safe value, so direction must be read together with zero_means."
+    },
+    "mutable": {
+      "type": "boolean",
+      "description": "Whether this setting can be changed RIGHT NOW, in the system's current state. False with an empty blockers array is not possible — a refusal always names its reasons."
+    },
+    "mutation_policy": {
+      "enum": [
+        "HOT_SAFE",
+        "TIGHTEN_ONLY_WHILE_ARMED",
+        "FLAT_AND_DISARMED",
+        "NEXT_SESSION",
+        "RESTART_REQUIRED"
+      ]
+    },
+    "takes_effect": {
+      "enum": ["immediately", "next_candidate", "next_arm", "next_restart"]
+    },
+    "requires_flat": { "type": "boolean" },
+    "requires_disarmed": { "type": "boolean" },
+    "dangerous": {
+      "type": "boolean",
+      "description": "Risk-increasing in at least one direction. The UI must require an explicit confirmation naming old value, new value, effect and when it takes effect. UI confirmation is not security; the backend enforces regardless."
+    },
+    "requires_full_admin": { "type": "boolean" },
+    "session_snapshot_value": {
+      "type": ["boolean", "number", "string", "null"],
+      "description": "For a NEXT_SESSION setting while a session is armed: the value FROZEN at arm time, which the armed session is actually bound by. Null when no session is armed or the setting is not session-snapshotted."
+    },
+    "blockers": {
+      "type": "array",
+      "description": "Why this setting cannot currently be changed. Empty when mutable is true.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["code", "message"],
+        "properties": {
+          "code": { "type": "string" },
+          "message": { "type": "string" }
+        }
+      }
+    },
+    "env_var": {
+      "type": "string",
+      "description": "The legacy/bootstrap environment variable, for provenance and an Advanced detail only. Always a variable classified as plain `config`; never a credential."
+    },
+    "caveat": {
+      "type": ["string", "null"],
+      "description": "An operator-facing warning, such as Zerodha's whole-second book timestamps making any cross-leg exchange-dispersion limit below ~1000 ms unsatisfiable by quantisation."
+    },
+    "updated_at": { "type": ["string", "null"], "format": "date-time" },
+    "updated_by": {
+      "type": ["string", "null"],
+      "description": "The operator ROLE that last changed this setting. Never a token, passcode or session identifier."
+    }
+  }
+}

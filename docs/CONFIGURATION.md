@@ -8,6 +8,12 @@ fallbacks (from `src/config.ts`, `src/box/config.ts`, `src/pg/pool.ts`,
 Legend: **Req?** = required. "yes" means the process cannot function without it;
 "prod" means required in production only; "no" means it has a safe default.
 
+> **The authority boundary.** This document is the environment-variable reference. The separation of
+> secrets, deployment capability, operator policy and session authority — and the precedence rule that
+> stops a runtime setting widening a deployment ceiling — is described in
+> [`OPERATOR_CONFIG.md`](./OPERATOR_CONFIG.md), with the per-variable classification in
+> [`OPERATOR_CONFIG_AUDIT.md`](./OPERATOR_CONFIG_AUDIT.md).
+
 ## Configuration precedence and the effective-config surface
 
 Precedence, lowest to highest:
