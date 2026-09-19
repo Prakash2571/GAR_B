@@ -46,6 +46,15 @@ import type { EconomicAdmissionReport, EconomicRefusalReason } from "./boxCapita
 import type { ReadinessBlocker } from "./operationalReadiness.js";
 
 /**
+ * The one reason token for "live, and no funding evidence is read at all".
+ *
+ * Exported because it now names BOTH surfaces: the readiness blocker below (observability) and the
+ * order manager's ENTRY refusal (enforcement). Sharing the constant is what stops the two drifting
+ * into describing the same condition by different names.
+ */
+export const FUNDING_CHECKS_DISABLED = "funding_checks_disabled";
+
+/**
  * The five mutually exclusive funding states.
  *
  * `checks_disabled` and `verified` are the two the review called out as conflated. They are now
@@ -329,7 +338,7 @@ export function fundingReadinessBlockers(readiness: FundingReadiness): Readiness
   if (readiness.status === "checks_disabled") {
     return [
       {
-        code: "funding_checks_disabled",
+        code: FUNDING_CHECKS_DISABLED,
         scope: "entry",
         detail:
           "This deployment is LIVE and every funding evidence gate is disabled, so an entry would be " +

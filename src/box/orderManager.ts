@@ -36,6 +36,7 @@ import {
   type BoxSchedulingSlot,
   clampEntrySubmitConcurrency,
 } from "./executionSchedulingPolicy.js";
+import { FUNDING_CHECKS_DISABLED } from "./fundingReadiness.js";
 import { ZERODHA_STATIC_IP_UNCONFIRMED } from "./zerodhaStaticIp.js";
 import type {
   BoxOrderIntentAudit,
@@ -433,12 +434,42 @@ export interface OrderManagerLimits {
    * GAR_B from ATTEMPTING to reduce exposure it already owns.
    */
   zerodhaEntryStaticIpConfirmed: boolean;
+  /**
+   * Is this deployment LIVE while performing no funding evidence checks at all?
+   *
+   * The exact condition `buildFundingReadiness` calls `checks_disabled`: live, and not one of
+   * BOX_LIVE_REQUIRE_FUNDS_COVER / _MARGIN_EVIDENCE / _STAGE_FUNDING on. In that state
+   * `evaluateEntryEconomics` returns before reading anything, so an entry would be admitted with no
+   * funds or margin evidence whatsoever.
+   *
+   * POLARITY IS DELIBERATE: the field names the DANGEROUS state, so the safe reading is the falsy
+   * one. `tsc` requires every TypeScript construction site to set it, and the one real builder below
+   * always does; an untyped test fixture that omits it therefore reads as "the condition was not
+   * established" rather than as "block everything". The inverse polarity would have forced the
+   * dangerous default onto every hand-built fixture in the suite while adding no protection to any
+   * real deployment.
+   *
+   * Consumed by `entryBlockReasonAfterControls` ONLY — never from a submit, cancel or modify path a
+   * reduction can reach.
+   */
+  liveFundingChecksDisabled: boolean;
 }
 
 export function orderManagerLimitsFromConfig(cfg: BoxConfig): OrderManagerLimits {
   return {
     zerodhaEntryStaticIpConfirmed:
       cfg.executionMode === "live" ? cfg.zerodhaStaticIp.confirmed : true,
+    /*
+     * Mirrors `buildFundingReadiness`'s `checks_disabled` branch exactly, so enforcement and the
+     * status surface cannot disagree about when funding evidence is absent. The raw OR is equivalent
+     * to the effective one: stage funding implies the other two, so `anyGateOn` is the same either
+     * way.
+     */
+    liveFundingChecksDisabled:
+      cfg.executionMode === "live" &&
+      !cfg.liveRequireFundsCover &&
+      !cfg.liveRequireMarginEvidence &&
+      !cfg.liveRequireStageFunding,
     maxOpenBoxes: cfg.liveMaxOpenBoxes,
     maxConcurrentExecutions: cfg.liveMaxConcurrentExecutions,
     entrySubmitConcurrency: cfg.liveEntrySubmitConcurrency,
@@ -1148,6 +1179,33 @@ export class BoxOrderManager {
      * consumed only by `getStatus()` and the runtime-status projection, so it enforces nothing. This
      * line is the enforcement; the two are tested independently on purpose.
      */
+    /*
+     * LIVE WITH NO FUNDING EVIDENCE AT ALL — ENFORCEMENT, alongside the readiness blocker.
+     *
+     * `fundingReadinessBlockers` already publishes `funding_checks_disabled` for this condition, but
+     * readiness is consumed only by `getStatus()` and the runtime-status projection, so it reports
+     * and cannot stop an order. The three env flags were relied on to prevent the entry indirectly —
+     * they are what switch economic admission on — but "the check is off so the check cannot refuse"
+     * is the absence of a gate, not a gate. All three default to false, so this is what a live
+     * deployment gets by forgetting three lines.
+     *
+     * Deliberately NOT broker-scoped, unlike the static-IP gate below it. The condition is a property
+     * of the deployment rather than of a broker, and `buildFundingReadiness` computes it the same
+     * way, so scoping enforcement to Zerodha would leave a live Dhan deployment unprotected while the
+     * status surface still reported the problem — the exact enforcement/observability split this
+     * follow-up exists to close.
+     *
+     * Entry-only by construction: this function is reached only through `canEnter`, which `submit()`
+     * consults exclusively under `purpose === "ENTRY"`.
+     */
+    if (this.deps.limits.liveFundingChecksDisabled) {
+      return (
+        `${FUNDING_CHECKS_DISABLED}: this deployment is live and every funding evidence gate is ` +
+        `disabled, so an entry would be admitted without any funds or margin evidence being read. Set ` +
+        `BOX_LIVE_REQUIRE_STAGE_FUNDING=true (which implies the funds-cover and margin checks). Exits, ` +
+        `protective cancels, emergency residual flattening and reconciliation are NOT gated by this.`
+      );
+    }
     if (!this.deps.limits.zerodhaEntryStaticIpConfirmed && this.deps.broker?.() === "zerodha") {
       return (
         `${ZERODHA_STATIC_IP_UNCONFIRMED}: no operator has confirmed that the public egress IP sending ` +
