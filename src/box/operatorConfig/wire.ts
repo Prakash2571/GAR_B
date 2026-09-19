@@ -195,6 +195,11 @@ export function projectOperatorConfig(args: ProjectArgs): Record<string, unknown
       max: spec.max ?? null,
       enum_values: spec.enumValues === undefined ? null : [...spec.enumValues],
       zero_means: spec.zeroMeans ?? null,
+      // Published so the UI can decide which edits are risk-INCREASING without reimplementing the
+      // rule. "Bigger" is not "riskier": raising minExpectedNetProfit is safer, raising maxOpenBoxes
+      // is not. A second implementation of that judgement in the browser could disagree with the
+      // backend that enforces it, so the backend states it.
+      safe_direction: spec.safeDirection,
       mutable,
       mutation_policy: spec.policy,
       takes_effect: spec.takesEffect,

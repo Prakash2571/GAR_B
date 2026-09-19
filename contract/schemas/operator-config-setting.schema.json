@@ -27,7 +27,8 @@
     "requires_full_admin",
     "session_snapshot_value",
     "blockers",
-    "env_var"
+    "env_var",
+    "safe_direction"
   ],
   "properties": {
     "key": {
@@ -86,6 +87,16 @@
       "type": ["string", "null"],
       "enum": ["value", "unlimited", "disabled", null],
       "description": "What 0 means for this setting. `unlimited` matters: for those settings 0 is the LEAST restrictive value, not the most."
+    },
+    "safe_direction": {
+      "enum": [
+        "lower_is_safer",
+        "higher_is_safer",
+        "enabled_is_safer",
+        "disabled_is_safer",
+        "neutral"
+      ],
+      "description": "Which direction of change REDUCES risk. Published because it is NOT derivable from the number: raising minExpectedNetProfit is safer while raising maxOpenBoxes is riskier, and both are 'a bigger number'. The frontend uses this to decide which edits need a dangerous-change confirmation, so that judgement comes from backend metadata rather than a second implementation of the rule that could disagree. Note for a ceiling with zero_means: unlimited, 0 is the LEAST safe value, so direction must be read together with zero_means."
     },
     "mutable": {
       "type": "boolean",
