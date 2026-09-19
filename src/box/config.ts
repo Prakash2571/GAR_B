@@ -599,6 +599,11 @@ export interface BoxConfig {
   /** Maximum quantity in one live leg and across all absolute open leg quantities. */
   liveMaxOpenLegQuantity: number;
   liveMaxGrossOpenLegQuantity: number;
+  /**
+   * The profile asserts its two quantity ceilings describe EXACTLY ONE LOT of the intended
+   * underlying. Opt-in, and only meaningful in live. See the boot check in `loadBoxConfig`.
+   */
+  liveExactOneLot: boolean;
   /** Distinct bounded deadlines for transport and broker lifecycle phases. */
   liveHttpTimeoutMs: number;
   liveAckTimeoutMs: number;
@@ -1270,6 +1275,57 @@ export function loadBoxConfig(): BoxConfig {
     }
   }
 
+  /*
+   * A PROFILE THAT CLAIMS "EXACTLY ONE LOT" MUST BE ARITHMETICALLY CAPABLE OF MEANING IT.
+   *
+   * THE DRIFT THIS CATCHES, WHICH ALREADY HAPPENED. The order quantity actually sent is always
+   * `candidate.lot_size`, read from the live instrument master — never a number from any env file.
+   * The two live quantity ceilings are a CONTAINMENT CHECK on that quantity. They therefore have to
+   * agree with it, and when they stop agreeing the failure is silent in one direction and total in
+   * the other: a per-leg cap below one lot refuses every entry (indistinguishable from "nothing
+   * ever qualifies"), and a gross cap above four lots permits more exposure than the profile claims.
+   *
+   * `FINAL-one-box-live.env.template` shipped 75 / 300 together with a note saying "75 is only right
+   * while NIFTY's is 75". NIFTY's lot then moved to 65. The per-leg figure was updated; the gross
+   * figure was not. The result was a gross ceiling of 300 against a real four-leg lot of 260 — an
+   * envelope 15% wider than the "exactly one lot" the profile advertises, with nothing anywhere
+   * reporting the discrepancy. That is precisely the class of error a supervised first run cannot
+   * afford, because the whole point of the exercise is that the size is known.
+   *
+   * WHAT IS CHECKABLE AT BOOT, AND WHAT IS NOT. The lot size is not knowable here: it belongs to an
+   * instrument master that has not been loaded yet, and inventing a number for it in this file would
+   * recreate exactly the hardcoding this check exists to prevent. What IS knowable is whether the
+   * two ceilings are consistent WITH EACH OTHER: four legs of one lot is four times one leg of one
+   * lot, whatever the lot happens to be. So this refuses `gross !== 4 × perLeg` — which catches the
+   * 300-vs-260 drift above without asserting what the lot size is.
+   *
+   * The remaining half — comparing the ceilings against the SELECTED underlying's actual `lot_size`
+   * — is a runtime readiness question, because only then is the instrument known. It is deliberately
+   * not attempted here.
+   *
+   * OPT-IN, AND LIVE-ONLY. Only a profile that sets `BOX_LIVE_EXACT_ONE_LOT=true` is asserting the
+   * exact-one-lot relationship, so only that profile is held to it. A deployment intentionally
+   * sizing a gross ceiling to something other than 4x — a multi-lot or multi-box posture — is
+   * untouched and needs no change. Paper is untouched entirely.
+   */
+  if (mode === "live" && strictBool("BOX_LIVE_EXACT_ONE_LOT", false)) {
+    const perLeg = strictLimitInt("BOX_LIVE_MAX_OPEN_LEG_QUANTITY", 100, 1, 1_000_000);
+    const gross = strictLimitInt("BOX_LIVE_MAX_GROSS_OPEN_LEG_QUANTITY", 400, 1, 4_000_000);
+    if (gross !== perLeg * 4) {
+      throw new Error(
+        `[Box] BOX_LIVE_EXACT_ONE_LOT=true declares that the live quantity ceilings describe exactly ` +
+          `one lot across the four legs of one Box, but BOX_LIVE_MAX_GROSS_OPEN_LEG_QUANTITY=${gross} ` +
+          `is not 4 x BOX_LIVE_MAX_OPEN_LEG_QUANTITY=${perLeg} (=${perLeg * 4}). A Box is four legs, so ` +
+          `these two must move together: the usual cause is an exchange lot-size change applied to the ` +
+          `per-leg figure and not the gross one, which leaves the gross ceiling permitting more ` +
+          `exposure than the profile claims. Set the gross ceiling to ${perLeg * 4}, or if you did ` +
+          `intend a wider envelope than one lot, unset BOX_LIVE_EXACT_ONE_LOT — do not widen the ` +
+          `per-leg cap to make the arithmetic agree. The order quantity itself always comes from the ` +
+          `instrument master, never from these values.`,
+      );
+    }
+  }
+
   return {
     executionMode: mode,
     simulatedDecisionMs: num("BOX_SIMULATED_DECISION_MS", 40),
@@ -1446,6 +1502,7 @@ export function loadBoxConfig(): BoxConfig {
     liveConsecutiveFailureLimit: clampInt("BOX_LIVE_CONSECUTIVE_FAILURE_LIMIT", 3, 1, 100),
     liveMaxOpenLegQuantity: strictLimitInt("BOX_LIVE_MAX_OPEN_LEG_QUANTITY", 100, 1, 1_000_000),
     liveMaxGrossOpenLegQuantity: strictLimitInt("BOX_LIVE_MAX_GROSS_OPEN_LEG_QUANTITY", 400, 1, 4_000_000),
+    liveExactOneLot: strictBool("BOX_LIVE_EXACT_ONE_LOT", false),
     liveHttpTimeoutMs: clampInt("BOX_LIVE_HTTP_TIMEOUT_MS", 5_000, 250, 30_000),
     liveAckTimeoutMs: clampInt("BOX_LIVE_ACK_TIMEOUT_MS", 3_000, 250, 30_000),
     liveWorkingTimeoutMs: clampInt("BOX_LIVE_WORKING_TIMEOUT_MS", 30_000, 1_000, 10 * 60_000),
