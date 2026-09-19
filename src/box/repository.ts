@@ -3043,7 +3043,22 @@ export async function loadBoxSettings(): Promise<Map<string, number>> {
   const out = new Map<string, number>();
   if (!isBoxDbEnabled()) return out;
   try {
-    const { rows } = await query<{ key: string; value: unknown }>(`SELECT key, value FROM box_settings`);
+    // `WHERE value IS NOT NULL` — and this is a correctness filter, not an optimisation.
+    //
+    // Migration 013 made `value` nullable and added `value_json`, so a setting whose type is a
+    // boolean, enum or string is stored with `value = NULL`. `num(null)` is `Number(null)` which is
+    // `0`, NOT `NaN`, so the `Number.isFinite` guard below ADMITS it and this map would report every
+    // JSON-valued setting as the number zero. For a ceiling, zero means UNLIMITED — the exact
+    // "a missing value must never read as 0" hazard the operator-config work exists to prevent,
+    // arriving through a different door.
+    //
+    // Today no caller is harmed (only `min_expected_net_profit` and `safety_buffer` are read out of
+    // this map, and both are numeric), so this is a latent trap rather than a live defect. It is
+    // filtered in SQL anyway, because "this row has no numeric value" is a fact about the row and the
+    // next caller to iterate the whole map should not have to know about it.
+    const { rows } = await query<{ key: string; value: unknown }>(
+      `SELECT key, value FROM box_settings WHERE value IS NOT NULL`,
+    );
     for (const row of rows) {
       const value = num(row.value);
       if (Number.isFinite(value)) out.set(row.key, value);
@@ -3066,9 +3081,15 @@ export async function saveBoxSettings(entries: Map<string, number>): Promise<voi
   if (entries.size === 0) return;
   await withTx(async (client) => {
     for (const [key, value] of entries) {
+      // `value_json = NULL` on both paths, because migration 013 added a CHECK requiring EXACTLY ONE
+      // of `value`/`value_json` to be set. Without it, this upsert writing a numeric value over a key
+      // that already holds a JSON value would leave both columns non-NULL and violate the constraint,
+      // failing the whole transaction. Unreachable today — the only keys this writes are the two
+      // numeric tuning thresholds — but it is the kind of landmine that fires exactly when the
+      // operator-config wiring starts writing JSON-valued settings, and it costs one clause to defuse.
       await client.query(
-        `INSERT INTO box_settings (key, value, updated_at) VALUES ($1, $2, now())
-         ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = now()`,
+        `INSERT INTO box_settings (key, value, value_json, updated_at) VALUES ($1, $2, NULL, now())
+         ON CONFLICT (key) DO UPDATE SET value = $2, value_json = NULL, updated_at = now()`,
         [key, value],
       );
     }
