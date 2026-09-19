@@ -18,6 +18,7 @@ import {
   ENTRY_SUBMIT_CONCURRENCY_MAX,
   ENTRY_SUBMIT_CONCURRENCY_MIN,
 } from "./executionSchedulingPolicy.js";
+import { normaliseAllowlist } from "./underlyingExclusions.js";
 import type { BoxQueueModel, BoxScannerConfigSnapshot, ExecutionMode } from "./types.js";
 
 function num(name: string, fallback: number): number {
@@ -72,6 +73,19 @@ function bool(name: string, fallback: boolean): boolean {
   if (v === "1" || v === "true" || v === "yes") return true;
   if (v === "0" || v === "false" || v === "no") return false;
   return fallback;
+}
+
+/**
+ * Split a comma-separated env value into raw, untrimmed parts.
+ *
+ * Deliberately does NOT normalise: the caller applies whatever domain rules belong to the list it is
+ * building, so that one normaliser owns each domain rather than this helper guessing. Returns an
+ * empty array for unset or blank, which every caller must therefore give an explicit meaning.
+ */
+function csv(name: string): string[] {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return [];
+  return raw.split(",");
 }
 
 /** Parse a comma-separated list of IST hours (0-23), de-duplicated and sorted. */
@@ -604,6 +618,11 @@ export interface BoxConfig {
    * underlying. Opt-in, and only meaningful in live. See the boot check in `loadBoxConfig`.
    */
   liveExactOneLot: boolean;
+  /**
+   * Underlyings a NEW live box may be entered on, normalised, de-duplicated and sorted. Empty means
+   * no identity constraint. Never consulted for exits, reductions or reconciliation.
+   */
+  liveAllowedUnderlyings: readonly string[];
   /** Distinct bounded deadlines for transport and broker lifecycle phases. */
   liveHttpTimeoutMs: number;
   liveAckTimeoutMs: number;
@@ -1503,6 +1522,13 @@ export function loadBoxConfig(): BoxConfig {
     liveMaxOpenLegQuantity: strictLimitInt("BOX_LIVE_MAX_OPEN_LEG_QUANTITY", 100, 1, 1_000_000),
     liveMaxGrossOpenLegQuantity: strictLimitInt("BOX_LIVE_MAX_GROSS_OPEN_LEG_QUANTITY", 400, 1, 4_000_000),
     liveExactOneLot: strictBool("BOX_LIVE_EXACT_ONE_LOT", false),
+    /*
+     * The live ENTRY allowlist. Empty means "no identity constraint" — see `allowlistEntryRefusal`
+     * for why the absent case is not read as "nothing may be traded". Normalisation happens here,
+     * once, with the same rules the operator blocklist uses, so the two layers cannot disagree about
+     * what a symbol is.
+     */
+    liveAllowedUnderlyings: normaliseAllowlist(csv("BOX_LIVE_ALLOWED_UNDERLYINGS")),
     liveHttpTimeoutMs: clampInt("BOX_LIVE_HTTP_TIMEOUT_MS", 5_000, 250, 30_000),
     liveAckTimeoutMs: clampInt("BOX_LIVE_ACK_TIMEOUT_MS", 3_000, 250, 30_000),
     liveWorkingTimeoutMs: clampInt("BOX_LIVE_WORKING_TIMEOUT_MS", 30_000, 1_000, 10 * 60_000),

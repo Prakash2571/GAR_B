@@ -243,9 +243,77 @@ export class UnderlyingExclusionBook {
 /** Why an entry was refused by the blocklist layer. */
 export interface ExclusionRefusal {
   /** A stable snake_case code, suitable for a metric label or a readiness blocker. */
-  readonly code: "underlying_excluded" | "underlying_exclusions_unreadable";
+  readonly code: "underlying_excluded" | "underlying_exclusions_unreadable" | "underlying_not_allowlisted";
   /** One bounded sentence for an operator. */
   readonly detail: string;
+}
+
+/**
+ * NORMALISE A CONFIGURED ALLOWLIST ONCE, AT LOAD, USING THE SAME RULES AS THE BLOCKLIST.
+ *
+ * Two lists deciding whether a name may be traded must agree about what a name IS, or `" nifty "`
+ * passes one layer and fails another. So this runs the identical `normaliseUnderlyingSymbol` the
+ * blocklist uses, and silently drops anything that is not a usable symbol rather than keeping a
+ * value no comparison could ever match.
+ *
+ * De-duplicated and sorted so the reported "effective allowed symbols" is stable regardless of how
+ * the operator happened to order or repeat them.
+ */
+export function normaliseAllowlist(raw: readonly string[]): string[] {
+  const out = new Set<string>();
+  for (const candidate of raw) {
+    const symbol = normaliseUnderlyingSymbol(candidate);
+    if (symbol !== null) out.add(symbol);
+  }
+  return [...out].sort();
+}
+
+/**
+ * THE ALLOWLIST VERDICT: may a new box be entered on this underlying AT ALL?
+ *
+ * WHY THIS EXISTS ALONGSIDE THE BLOCKLIST. `BOX_MAX_UNDERLYINGS=1` bounds HOW MANY names are
+ * considered, not WHICH: the one name that survives is chosen by the board's own priority order, so
+ * a universe change, an index reshuffle or a newly-listed name can silently move which instrument a
+ * supervised trial actually trades. The blocklist is the wrong tool for the inverse problem — it
+ * requires naming every instrument you do NOT want, which is unbounded and fails open on anything
+ * added after you wrote it. An allowlist fails CLOSED on exactly that case.
+ *
+ * AN EMPTY LIST MEANS UNCONSTRAINED, AND THAT IS DELIBERATE. Unset is how every existing deployment
+ * is configured, and reading it as "nothing may be traded" would silently convert an upgrade into a
+ * total trading halt. So the absent case is documented as "no identity constraint" and reported as
+ * such, rather than being quietly given a meaning nobody configured. A profile that wants the
+ * constraint states it — which the supervised one-box profile does.
+ *
+ * ENTRY ONLY. This is composed into the same verdict function the blocklist uses, which is consulted
+ * exclusively on entry paths. It can no more block an exit, a protective cancel, an emergency
+ * residual flatten or a reconciliation than the blocklist can, and a name dropped from the
+ * allowlist mid-session keeps every one of those routes for exposure already owned.
+ *
+ * Total and synchronous, so it is safe in the scanner's tick path and inside the coordinator's
+ * no-await prologue.
+ */
+export function allowlistEntryRefusal(
+  allowed: readonly string[],
+  underlying: string,
+): ExclusionRefusal | null {
+  if (allowed.length === 0) return null;
+  const symbol = normaliseUnderlyingSymbol(underlying);
+  /*
+   * An unusable symbol cannot be PROVEN to be on the list, and this is the fail-closed direction:
+   * the allowlist exists so that only named instruments are traded, so "I cannot tell what this is"
+   * must refuse rather than pass. The blocklist makes the opposite call for the same input, and
+   * correctly — there, an unrecognised name simply is not on the blocklist.
+   */
+  if (symbol === null || !allowed.includes(symbol)) {
+    return {
+      code: "underlying_not_allowlisted",
+      detail:
+        `${symbol ?? String(underlying)} is not on the live entry allowlist (${allowed.join(", ")}), ` +
+        `so no new box will be entered on it. Any box already open on it is still monitored and will ` +
+        `still exit, reduce and protectively cancel.`,
+    };
+  }
+  return null;
 }
 
 /**

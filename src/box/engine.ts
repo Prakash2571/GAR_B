@@ -60,6 +60,7 @@ import { activeUnderlyings, type UnderlyingActivity } from "./underlyingLock.js"
 import {
   MAX_EXCLUDED_UNDERLYINGS,
   UnderlyingExclusionBook,
+  allowlistEntryRefusal,
   exclusionEntryRefusal,
   validateExclusionInput,
   type UnderlyingExclusion,
@@ -2160,6 +2161,26 @@ export class BoxEngine {
    * no-await prologue.
    */
   private underlyingExclusionRefusal(underlying: string): { code: string; detail: string } | null {
+    /*
+     * TWO LAYERS, ONE VERDICT, AND THE ALLOWLIST IS CHECKED FIRST.
+     *
+     * Composing the allowlist here rather than adding a parallel mechanism is the whole point: this
+     * function is already injected into all four entry enforcement points — the cheap scanner filter
+     * and the three authoritative lower layers — so the allowlist inherits every one of them, plus
+     * the property that none of them is reachable from a reduction. A second, separately-wired check
+     * would have had to re-earn all of that, and could be bypassed anywhere it was forgotten.
+     *
+     * The allowlist is evaluated BEFORE the blocklist because it is the cheaper and more fundamental
+     * question: "is this instrument one we intend to trade at all" precedes "has an operator
+     * suspended it". It also means an allowlisted-out name never depends on the blocklist being
+     * readable, so a database outage cannot widen the set of tradable instruments.
+     *
+     * Both are ENTRY-only, which is enforced by where this function is consulted, not by anything it
+     * does itself. A name removed from the allowlist mid-session keeps every exit, reduction,
+     * protective cancel and reconciliation route for exposure already owned.
+     */
+    const notAllowed = allowlistEntryRefusal(this.cfg.liveAllowedUnderlyings, underlying);
+    if (notAllowed !== null) return notAllowed;
     return exclusionEntryRefusal(this.exclusions, underlying);
   }
 
