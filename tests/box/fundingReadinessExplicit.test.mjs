@@ -172,15 +172,71 @@ test("a configured recovery reserve is reported and drops the limitation", () =>
   assert.ok(!r.limitations.some((l) => /RECOVERY_RESERVE_RUPEES is 0/.test(l)));
 });
 
-/* ═════════════════ 4. blockers: entry-only, and never for a disabled gate ═════════════════ */
+/* ═════════════════ 4. blockers: entry-only, including for a disabled gate ═════════════════ */
 
-test("DISABLED gates produce NO blocker — reporting a risk is not the same as halting trading", () => {
-  assert.deepEqual(
-    fundingReadinessBlockers(base()),
-    [],
-    "turning the default-off configuration into a trading stop would change a deployment's " +
-      "controls rather than report on them",
+/**
+ * THIS CASE USED TO ASSERT THE OPPOSITE, AND THE REVERSAL IS DELIBERATE.
+ *
+ * It previously required that all-gates-off produce NO blocker, reasoning that "turning the
+ * default-off configuration into a trading stop would change a deployment's controls rather than
+ * report on them". Half of that argument still holds and is preserved below — this must not become a
+ * trading stop. The other half does not survive contact with what the state actually means.
+ *
+ * `checks_disabled` is reachable ONLY when `live === true` and not one of the three gates is on. In
+ * that state `evaluateEntryEconomics` returns null before reading anything, so a real-money entry is
+ * admitted with no funds or margin evidence whatsoever. All three flags default to false, so this is
+ * not a deployment expressing a preference — it is what a live deployment gets by forgetting three
+ * lines, and the only signal was a limitation string on a surface nothing forces anyone to read.
+ *
+ * And "trading stop" overstates the remedy: the blocker is `scope: "entry"`, so it halts only NEW
+ * exposure. Exits, protective cancels, emergency residual flattening and reconciliation are all
+ * structurally unreachable from it. A deployment in this state keeps every ability to manage what it
+ * already holds — which is also why this is a readiness blocker rather than a boot refusal.
+ */
+test("all gates OFF while LIVE produces ONE entry-scoped blocker — no evidence read is not an assumption", () => {
+  const blockers = fundingReadinessBlockers(base());
+  assert.equal(blockers.length, 1, "exactly one blocker: the condition is single, not per-gate");
+  assert.equal(blockers[0].code, "funding_checks_disabled");
+  assert.equal(blockers[0].scope, "entry", "it must be entry-scoped or it could reach reduction");
+  assert.match(blockers[0].detail, /BOX_LIVE_REQUIRE_STAGE_FUNDING/, "the detail must name the fix");
+  assert.match(
+    blockers[0].detail,
+    /exited, reduced, protectively\s+cancelled and reconciled/,
+    "and must say plainly that exposure management is unaffected",
   );
+});
+
+test("...and PAPER is untouched: a non-live deployment is `not_applicable`, never blocked", () => {
+  const paper = base({ live: false });
+  assert.equal(paper.status, "not_applicable");
+  assert.deepEqual(
+    fundingReadinessBlockers(paper),
+    [],
+    "a paper rehearsal performs no funding admission by design and must never be blocked for it",
+  );
+});
+
+/**
+ * REDUCTION IMMUNITY, ASSERTED OVER EVERY BLOCKER THIS MODULE CAN EMIT.
+ *
+ * The invariant is that no funding condition may prevent reducing exposure already owned. Rather
+ * than assert it for the one new code, this enumerates every state that produces a blocker at all
+ * and requires `scope: "entry"` for all of them — so a future funding blocker added with the wrong
+ * scope fails here instead of silently acquiring the power to block an exit.
+ */
+test("NO funding blocker, in any state, is ever scoped to reduction", () => {
+  const states = [
+    ["checks_disabled", base()],
+    ["refused (one reason)", base({ requireStageFunding: true, report: report({ allowed: false, reasons: ["funding_stage_unknown"] }) })],
+    ["refused (no reason)", base({ requireStageFunding: true, report: report({ allowed: false, reasons: [] }) })],
+  ];
+  for (const [label, readiness] of states) {
+    const blockers = fundingReadinessBlockers(readiness);
+    assert.ok(blockers.length > 0, `${label} must produce at least one blocker`);
+    for (const b of blockers) {
+      assert.equal(b.scope, "entry", `${label}: blocker ${b.code} must be entry-scoped, never reduction or both`);
+    }
+  }
 });
 
 test("`verified` and `not_evaluated` produce no blocker", () => {

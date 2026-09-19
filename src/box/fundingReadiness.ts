@@ -24,7 +24,13 @@
  * the behaviour existing deployments are running today, and silently converting it into a
  * trading-stop would be a change to their trading controls rather than a report about them. So:
  *
- *   • gates OFF                          → no blocker; the state is REPORTED as `checks_disabled`.
+ *   • gates OFF while LIVE               → `funding_checks_disabled`, scope `entry`. Reporting this
+ *                                          state was previously thought sufficient; it is not. All
+ *                                          three flags default to false, so it is what a live
+ *                                          deployment gets by forgetting three lines, and in it an
+ *                                          entry is admitted without any evidence being read at all.
+ *                                          Entry-scoped, so reduction and reconciliation continue.
+ *   • gates OFF while PAPER              → no blocker; the state is `not_applicable`.
  *   • gate ON and evidence unusable      → an ENTRY-SCOPED blocker, because evidence that is
  *                                          REQUIRED and absent must refuse entry.
  *
@@ -295,6 +301,46 @@ const REASON_DETAIL: Readonly<Record<EconomicRefusalReason, string>> = {
  * see how old the verdict is.
  */
 export function fundingReadinessBlockers(readiness: FundingReadiness): ReadinessBlocker[] {
+  /*
+   * A LIVE DEPLOYMENT WITH EVERY FUNDING GATE OFF MUST NOT BE ADMITTED TO ENTRY.
+   *
+   * `checks_disabled` means, precisely, `live === true` and not one of the three gates on (see
+   * `buildFundingReadiness`, where it is the only branch reachable with those two facts). In that
+   * state `evaluateEntryEconomics` returns `null` before reading anything, so a live entry is
+   * admitted WITHOUT ANY funds or margin evidence at all — and this module previously emitted no
+   * blocker for it, on the stated grounds that the state was already "REPORTED as checks_disabled".
+   *
+   * Reporting it was not enough. All three flags default to FALSE, so this is not an exotic
+   * configuration — it is what a live deployment gets by forgetting three lines, and the only signal
+   * was a limitation string on a diagnostics surface that nothing forces anyone to read. The
+   * limitation text itself says an entry "can be admitted without any funds or margin evidence being
+   * read", which is a description of the exact condition under which new real-money exposure should
+   * not be taken.
+   *
+   * SCOPE IS `entry`, and that is the whole point. This cannot touch EXIT, PROTECTIVE_CANCEL,
+   * EMERGENCY_RESIDUAL or reconciliation: the readiness scope filter cannot select an entry-scoped
+   * blocker for the reduction verdict, and the order manager's two admission predicates are
+   * disjoint. A deployment that boots in this state therefore still reconciles and still reduces
+   * exposure it already owns — which is why this is a readiness blocker and NOT a boot refusal. A
+   * process that will not start cannot unwind a position the broker is still holding.
+   *
+   * PAPER IS UNTOUCHED: a non-live deployment is `not_applicable`, never `checks_disabled`.
+   */
+  if (readiness.status === "checks_disabled") {
+    return [
+      {
+        code: "funding_checks_disabled",
+        scope: "entry",
+        detail:
+          "This deployment is LIVE and every funding evidence gate is disabled, so an entry would be " +
+          "admitted without any funds or margin evidence being read. Set " +
+          "BOX_LIVE_REQUIRE_STAGE_FUNDING=true (which implies both the funds-cover and margin checks), " +
+          "or at minimum BOX_LIVE_REQUIRE_FUNDS_COVER=true and BOX_LIVE_REQUIRE_MARGIN_EVIDENCE=true. " +
+          "New entry is refused; exposure already held can still be exited, reduced, protectively " +
+          "cancelled and reconciled.",
+      },
+    ];
+  }
   if (readiness.status !== "refused") return [];
   const blockers: ReadinessBlocker[] = [];
   for (const reason of readiness.reasons) {
