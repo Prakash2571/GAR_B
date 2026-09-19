@@ -29,6 +29,8 @@ register(pathToFileURL(repoPath("tests", "helpers", "tsResolve.mjs")).href);
 const secrets = await import(pathToFileURL(repoPath("src", "env", "secrets.ts")).href);
 
 const FILE = "013_operator_runtime_config.sql";
+/** The follow-up that repairs 013's cluster-wide constraint-existence guard. */
+const REPAIR = "014_box_settings_constraint_scope.sql";
 const sql = readFileSync(repoPath("migrations", FILE), "utf8");
 
 /** SQL with `--` comments stripped, so the file's own prose cannot satisfy or trip an assertion. */
@@ -39,14 +41,74 @@ const code = sql
 
 /* ═════════════════ 1. Ordering and the immutability guard ═════════════════ */
 
-test("the migration is the next number in sequence and nothing duplicates it", () => {
+test("migration numbers are unique and zero-padded, and 013 precedes its repair", () => {
   const files = readdirSync(repoPath("migrations")).filter((f) => f.endsWith(".sql")).sort();
-  assert.equal(files.at(-1), FILE, `013 must sort last; got ${files.at(-1)}`);
+  assert.ok(files.includes(FILE), `${FILE} is missing`);
+  assert.ok(files.includes(REPAIR), `${REPAIR} is missing`);
+  // 014 repairs an existence guard in 013, so it must apply AFTER it.
+  assert.ok(files.indexOf(REPAIR) > files.indexOf(FILE), "the repair does not sort after 013");
 
   const numbers = files.map((f) => f.slice(0, 3));
   assert.equal(new Set(numbers).size, numbers.length, "two migrations share a number");
   // Lexical sort is load-bearing in the runner, so the zero padding must be intact.
   for (const n of numbers) assert.match(n, /^\d{3}$/);
+});
+
+test("EVERY migration scopes a pg_constraint lookup to its own table", () => {
+  /*
+   * THE CLASS OF BUG THIS CATCHES, generalised beyond the one instance.
+   *
+   * `ALTER TABLE ... ADD CONSTRAINT` has no `IF NOT EXISTS` form, so a migration that needs to be
+   * re-runnable guards it with a catalog lookup. `pg_constraint` is CLUSTER-WIDE and `conname` is only
+   * unique per table, so an unqualified `WHERE conname = '...'` asks "is anything anywhere called
+   * this?" when it meant "does MY table have it?". Another schema in the same database then satisfies
+   * the guard and the constraint is silently skipped — the migration reports success and the table has
+   * no constraint.
+   *
+   * Migration 013 shipped with exactly that, and it was caught only because the pg harness gives every
+   * test file its own schema. Any deployment applying these migrations into more than one schema would
+   * hit it silently. So the requirement is pinned for every migration, not just the one that got it
+   * wrong: a `pg_constraint` lookup must narrow by `conrelid` (or by `connamespace`/`relnamespace`).
+   */
+  /*
+   * ONE EXEMPTION, and it is a frozen file rather than an accepted exception.
+   *
+   * 013 contains the original unscoped guard. It CANNOT be corrected: the runner records a sha256 per
+   * applied file and refuses one whose contents changed after it was applied, so editing it would break
+   * boot for any database that already ran it. 014 repairs the outcome instead, and the two tests
+   * either side of this one prove 014 exists, sorts after 013, and adds the constraint correctly
+   * scoped. Listing 013 by name keeps the rule live for every other migration — including every future
+   * one — while recording exactly why this file is allowed to keep the defect.
+   */
+  const FROZEN_WITH_KNOWN_DEFECT = new Set([FILE]);
+
+  let scanned = 0;
+  for (const file of readdirSync(repoPath("migrations")).filter((f) => f.endsWith(".sql"))) {
+    const body = readFileSync(repoPath("migrations", file), "utf8")
+      .split("\n")
+      .filter((line) => !/^\s*--/.test(line))
+      .join("\n");
+    if (!/pg_constraint/.test(body)) continue;
+    scanned++;
+    if (FROZEN_WITH_KNOWN_DEFECT.has(file)) continue;
+    assert.match(
+      body,
+      /conrelid|connamespace|relnamespace/,
+      `${file} looks up pg_constraint without scoping it to a table — another schema's constraint of the same name would silently satisfy the guard`,
+    );
+  }
+  // The exemption must not be the only thing this test ever sees, or it guards nothing.
+  assert.ok(scanned > FROZEN_WITH_KNOWN_DEFECT.size, "no non-exempt migration was actually scanned");
+});
+
+test("the repair migration adds the constraint scoped to its own schema", () => {
+  const body = readFileSync(repoPath("migrations", REPAIR), "utf8");
+  assert.match(body, /conrelid = 'box_settings'::regclass/);
+  assert.match(body, /ADD CONSTRAINT box_settings_exactly_one_value/);
+  // It must not try to rewrite 013's history.
+  assert.equal(/DROP CONSTRAINT/i.test(body), false, "the repair drops a constraint instead of adding the missing one");
+  // And it must not manage its own transaction, like every other migration.
+  assert.equal(/^\s*(BEGIN|COMMIT)\s*;/im.test(body), false);
 });
 
 test("migration 003 still declares box_settings as it originally did", () => {
