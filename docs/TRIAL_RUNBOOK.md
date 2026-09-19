@@ -18,7 +18,7 @@ must remember under pressure.
 | Control | Enforced in code? | Mechanism |
 |---|---|---|
 | Broker / account scope | **Yes** | Active broker owns the token namespace; a switch invalidates every book and drops sessions. Evidence identity (`broker`, masked account, session generation) is checked **before and after** every async broker read. |
-| Allowed instrument scope | **Partly** | Candidate admission validates exchange identity, lot size, tick size and expiry per leg. **Not** an allow-list of specific underlyings — see gap 1a. |
+| Allowed instrument scope | **Yes** | Candidate admission validates exchange identity, lot size, tick size and expiry per leg, **and** `BOX_LIVE_ALLOWED_UNDERLYINGS` is a live ENTRY allow-list of specific underlyings. Evaluated in `engine.ts` (`allowlistEntryRefusal`, `underlyingExclusions.ts`) **before** the operator blocklist, and it fails **closed**: a name that is not on a non-empty list cannot be entered. An **empty** list means "no identity constraint", so scoping the trial requires actually setting it. ENTRY-only by design — removing a name mid-session keeps every exit, reduction and reconciliation route for exposure already owned. |
 | Maximum lot size | **Yes** | One lot per leg (`quantity: candidate.lot_size`); `live_max_open_leg_quantity` / `live_max_gross_open_leg_quantity` cap open quantity. |
 | **Maximum entry attempts (counting failed/recovered)** | **Yes — new** | `BOX_SESSION_MAX_ENTRY_ATTEMPTS`. Consumed at **admission, before any broker POST**, so an attempt that submits and is then unwound still spends it. Durable, so a restart does not reset it. |
 | Maximum completed trades | **Yes** | `BOX_SESSION_MAX_COMPLETED_TRADES`. Consumed at **establishment**. |
@@ -26,7 +26,7 @@ must remember under pressure.
 | Maximum unresolved exposure | **Partly** | Residual legs are tracked durably and block re-entry via readiness blockers. **No single configurable rupee ceiling on unresolved exposure** — see gap 1b. |
 | Maximum order submissions | **Partly** | Bounded indirectly by the attempt budget (4 legs/attempt) and by the rate-limit ledger. **No independent submission counter** — see gap 1c. |
 | Recovery duration | **Partly** | Bounded retry/backoff on the reconciliation sweep; ack/working/partial/cancel timeouts bound each order. **No global "give up and escalate after N minutes"** — see gap 1d. |
-| Capital / loss budget | **Partly — do not rely on it** | Daily risk seed and charge watermarks exist and are durable. **No test proves a rupee loss ceiling halts entry** (FAULT_MATRIX 6.5). Treat the loss budget as **observability, not a brake**. |
+| Capital / loss budget | **Yes — entry only** | `BOX_LIVE_DAILY_LOSS_LIMIT` (default **₹5,000**) halts NEW ENTRY. Enforcement is **indirect**: `evaluateLimits()` is its only consumer and it trips the **sticky** circuit breaker, which `entryBlockReason` then refuses on at all five entry checkpoints. The figure is reconstructed at boot from **durable** state (`box_trades` + `box_execution_attempts`), so it **survives a restart**; an **incomplete** reconstruction refuses entry rather than trusting an understated loss. It **never** blocks an exit, protective cancel or reconciliation. Proven end to end by `tests/box/dailyLossLimitEntryBrake.test.mjs` (previously untested — this row used to say "observability, not a brake"). **Two caveats:** `BOX_LIVE_DAILY_LOSS_LIMIT=0` means the gate is **DISABLED**, not "no loss allowed"; and the limit is a frozen copy in the manager's limits, so tightening it while armed needs a limits-republish path to take effect. |
 | Kill switch | **Yes** | `emergencyFlatten` reduces exposure and is never queued behind another control; entry blockers cannot disable risk reduction (`tests/invariants/exitImmunityProtectiveCancel.test.mjs`). |
 | Preconditions before entry | **Yes** | The single authoritative readiness decision; the server revalidates **every** entry request independently of any UI. |
 | Restart does not reset budgets | **Yes** | Cycle **and** attempt budgets are durable in PostgreSQL; an unreadable session refuses entry rather than assuming a clean slate. |
@@ -35,7 +35,7 @@ must remember under pressure.
 
 | # | Gap | Consequence for the trial |
 |---|---|---|
-| 1a | No underlying allow-list | Scope the trial by configuring **one** underlying in the universe, and verify it in the read-only checklist (§4 step 6). |
+| 1a | ~~No underlying allow-list~~ — **CLOSED.** `BOX_LIVE_ALLOWED_UNDERLYINGS` now exists and is enforced as an ENTRY gate. | Still scope the trial by setting it explicitly to the **one** underlying you intend to trade, and verify the deployed value in the read-only checklist (§4 step 6). An **empty** list is not a scoped trial — it means no identity constraint at all. |
 | 1b | No rupee ceiling on unresolved exposure | The **manual** stop condition in §6 is the control. Watch `residual_legs`. |
 | 1c | No independent submission counter | With 4 legs/attempt, `MAX_ENTRY_ATTEMPTS × 4` is the practical submission ceiling. Recovery/unwind orders are **additional and not counted**. |
 | 1d | No global recovery deadline | The manual escalation procedure in §6 is the control. |

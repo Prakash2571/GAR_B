@@ -335,6 +335,17 @@ export class BrokerAmbiguousSubmitError extends Error {
   }
 }
 
+/**
+ * THE CONTRACT. `BrokerOrderRejectedError` means "the broker refused the request, so NOTHING
+ * executed and NO exposure exists". Downstream that is treated as a certificate: the execution
+ * gateway's `provenNoExposure` accepts it as proof, and partial-entry recovery then unwinds the
+ * SIBLING hedges because the rejected leg is believed absent.
+ *
+ * It is therefore only ever safe to construct with a snapshot that actually proves the zero —
+ * see {@link verifyZeroBrokerExposure}. Use {@link brokerRejectionOutcome} rather than calling
+ * this constructor directly on a placement path, so a contradicted rejection cannot be dressed
+ * up as a certificate.
+ */
 export class BrokerOrderRejectedError extends Error {
   constructor(
     readonly order: BrokerOrder,
@@ -345,6 +356,200 @@ export class BrokerOrderRejectedError extends Error {
     super(order.reject_reason ?? "Broker rejected order.", { cause: causeValue });
     this.name = "BrokerOrderRejectedError";
   }
+}
+
+/** The nameable reason a rejection snapshot FAILS to prove that nothing executed. */
+export type ZeroExposureDisproof =
+  | "state_not_terminal_rejected"
+  | "positive_cumulative_fill"
+  | "fill_records_present"
+  | "quantity_evidence_missing";
+
+export interface ZeroExposureVerdict {
+  /** True ONLY when this snapshot establishes, on its own evidence, that no exposure was created. */
+  readonly proven: boolean;
+  readonly disproof: ZeroExposureDisproof | null;
+  readonly detail: string | null;
+}
+
+/**
+ * DOES THIS SNAPSHOT PROVE THAT THE BROKER CREATED NO EXPOSURE?
+ *
+ * ─────────────────────────────────────────────────────────────────────────────────────────────
+ * THE DEFECT THIS CLOSES (rejection/fill race)
+ * ─────────────────────────────────────────────────────────────────────────────────────────────
+ * A placement POST can return a DEFINITIVE rejection after an order update has already reported a
+ * positive cumulative fill for the same client order id. Both live adapters merge the rejection
+ * onto their current snapshot, and `mergeBrokerOrderSnapshot` correctly refuses to pick a side:
+ * it yields RECONCILIATION_REQUIRED and PRESERVES the fill. The adapters then threw that merged
+ * snapshot inside a `BrokerOrderRejectedError` anyway — the one error type the gateway accepts as
+ * proof that the leg does not exist. Partial-entry recovery consequently treated the disputed leg
+ * as absent and unwound the CONFIRMED BUY hedges that may still have been protecting its real
+ * short fill, turning a recovery into a fresh naked position.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────────────────────
+ * THE INVARIANT
+ * ─────────────────────────────────────────────────────────────────────────────────────────────
+ * "The broker rejected the request" proves zero exposure ONLY when the authoritative merged
+ * snapshot establishes a TERMINAL `REJECTED` state with a VERIFIED `filled_quantity === 0`.
+ * Each of the following leaves the outcome unproven, and unproven must mean uncertain:
+ *
+ *   • a NONTERMINAL or CONTRADICTORY state (`RECONCILIATION_REQUIRED`, `UNKNOWN`, or any working
+ *     label) — including the broker-order-id conflict that `mergeBrokerOrderSnapshot` also routes
+ *     to RECONCILIATION_REQUIRED, which is why an id conflict needs no separate clause here;
+ *   • a POSITIVE cumulative fill;
+ *   • FILL RECORDS present, whatever the cumulative field says;
+ *   • MISSING quantity evidence — a terminal label with no cumulative quantity is not an
+ *     execution record (`evaluateExecutionEvidence` marks that `quantity: "missing"` /
+ *     `accounting: "unproven"`), and absence is not zero.
+ *
+ * A genuinely confirmed zero is unaffected: `evaluateExecutionEvidence` reports an explicit zero
+ * as `{quantity: "confirmed", price: "not_applicable", accounting: "complete"}`, and a locally
+ * constructed rejection carries no evidence marker at all — nothing to disclaim.
+ *
+ * PURE and total: no clock, no config, no I/O.
+ */
+export function verifyZeroBrokerExposure(order: BrokerOrder): ZeroExposureVerdict {
+  const proven: ZeroExposureVerdict = { proven: true, disproof: null, detail: null };
+  const refuse = (disproof: ZeroExposureDisproof, detail: string): ZeroExposureVerdict =>
+    ({ proven: false, disproof, detail });
+
+  // THE EXPOSURE QUESTIONS COME FIRST, THEN THE LABEL.
+  //
+  // Ordered deliberately so `disproof` names the most informative cause. By the time a contradicted
+  // rejection reaches here, `mergeBrokerOrderSnapshot` has usually ALREADY rewritten the state to
+  // RECONCILIATION_REQUIRED, so testing the state first would report every such case as
+  // `state_not_terminal_rejected` and bury the fact that actually matters to an operator — that a
+  // cumulative fill exists. A snapshot with no fill still falls through to the state test below.
+
+  // 1. CUMULATIVE QUANTITY. Must be a finite, verified zero. A nonsensical reading is missing
+  //    evidence, not a zero.
+  if (!Number.isFinite(order.filled_quantity)) {
+    return refuse(
+      "quantity_evidence_missing",
+      `${order.client_order_id} reports a non-numeric cumulative filled quantity ` +
+        `(${String(order.filled_quantity)}), so the zero is unverified`,
+    );
+  }
+  if (order.filled_quantity > 0) {
+    return refuse(
+      "positive_cumulative_fill",
+      `${order.client_order_id} was reported REJECTED while holding a confirmed cumulative fill of ` +
+        `${order.filled_quantity}`,
+    );
+  }
+  if (order.filled_quantity < 0) {
+    return refuse(
+      "quantity_evidence_missing",
+      `${order.client_order_id} reports a negative cumulative filled quantity ` +
+        `(${order.filled_quantity}), so the zero is unverified`,
+    );
+  }
+
+  // 2. FILL RECORDS. A fill row is an execution record in its own right; it must not be outvoted
+  //    by an aggregate field that happens to read zero.
+  const filledFromRecords = order.fills.reduce(
+    (total, fill) => (Number.isFinite(fill.quantity) && fill.quantity > 0 ? total + fill.quantity : total),
+    0,
+  );
+  if (filledFromRecords > 0) {
+    return refuse(
+      "fill_records_present",
+      `${order.client_order_id} carries fill records totalling ${filledFromRecords} despite a ` +
+        "zero cumulative quantity",
+    );
+  }
+
+  // 3. STATE. `REJECTED` is the only state that asserts the request never executed. A merge that
+  //    could not reconcile the evidence reports RECONCILIATION_REQUIRED, and that is precisely the
+  //    signal this guard exists to respect rather than overrule. A broker-order-id conflict lands
+  //    here too, because the merge routes that to RECONCILIATION_REQUIRED as well.
+  if (order.state !== "REJECTED") {
+    return refuse(
+      "state_not_terminal_rejected",
+      `${order.client_order_id} is in state ${order.state}, which does not assert that the request ` +
+        "was refused without execution",
+    );
+  }
+
+  // 4. EVIDENCE QUALITY. Absence of a quantity is not a zero.
+  const evidence = order.execution_evidence;
+  if (evidence !== undefined && (evidence.quantity === "missing" || evidence.accounting === "unproven")) {
+    return refuse(
+      "quantity_evidence_missing",
+      `${order.client_order_id} was labelled REJECTED but its quantity evidence is ` +
+        `${evidence.quantity}/${evidence.accounting}, so no cumulative quantity was ever confirmed`,
+    );
+  }
+
+  return proven;
+}
+
+/**
+ * A REJECTION THAT CONTRADICTS THE EVIDENCE — the broker refused the request, but the snapshot for
+ * that client order id does not support "nothing executed".
+ *
+ * WHY IT EXTENDS {@link BrokerAmbiguousSubmitError}. This repo already has one fully plumbed
+ * uncertainty channel, and every layer already keys off that type: `OrderManager` persists the
+ * carried snapshot, counts `unknownOrders` rather than `rejects`, withholds hedge coverage, and —
+ * critically — keeps the ORIGINAL typed error even when the durable write of the uncertainty
+ * FAILS. The execution gateway marks the attempt `uncertain`, harvests `.order` so the
+ * RECONCILIATION_REQUIRED snapshot is visible to `entryLegOutcomes`, and `planPartialEntryRecovery`
+ * then returns `quarantine_unknown` instead of unwinding. Subclassing inherits all of that
+ * correctness rather than re-deriving it, while the distinct name and `disproof` keep the operator
+ * diagnosis precise. Inventing a parallel channel is how one of these layers gets missed.
+ *
+ * It is deliberately NOT a `BrokerOrderRejectedError`: nothing may read it as proof of absence.
+ */
+export class BrokerRejectionContradictedError extends BrokerAmbiguousSubmitError {
+  /** Why the rejection failed to prove zero exposure. */
+  readonly disproof: ZeroExposureDisproof;
+  /** The merged snapshot, non-optional here: reconciliation and the operator both need it. */
+  readonly rejectedOrder: BrokerOrder;
+  /** Cumulative quantity observed for this identity despite the rejection. */
+  readonly observedFilledQuantity: number;
+  /** Broker identity, preserved so reconciliation can ask the broker about the right order. */
+  readonly brokerOrderId: string | null;
+  readonly brokerRejectFamily: BrokerRejectFamily | null;
+  /** The broker's own refusal text, unmixed with the conflict sentence. */
+  readonly brokerRejectReason: string | null;
+
+  constructor(order: BrokerOrder, verdict: ZeroExposureVerdict, causeValue?: unknown) {
+    super(
+      order.client_order_id,
+      `broker rejected ${order.client_order_id} but the outcome is NOT proven to be zero exposure ` +
+        `(${verdict.disproof}): ${verdict.detail ?? "no detail"}. State ${order.state}, cumulative ` +
+        `filled ${order.filled_quantity}, broker order id ${order.broker_order_id ?? "none"}. ` +
+        "Reconciliation is required and NO retry was attempted.",
+      causeValue,
+      order,
+    );
+    this.name = "BrokerRejectionContradictedError";
+    this.disproof = verdict.disproof ?? "state_not_terminal_rejected";
+    this.rejectedOrder = order;
+    this.observedFilledQuantity = Number.isFinite(order.filled_quantity) ? order.filled_quantity : 0;
+    this.brokerOrderId = order.broker_order_id;
+    this.brokerRejectFamily = order.reject_family;
+    this.brokerRejectReason = order.reject_reason;
+  }
+}
+
+/**
+ * THE ONLY WAY A PLACEMENT PATH SHOULD REPORT A BROKER REJECTION.
+ *
+ * Returns a `BrokerOrderRejectedError` when — and only when — the snapshot proves zero exposure;
+ * otherwise a `BrokerRejectionContradictedError`, which carries the same snapshot through the
+ * uncertainty channel. Callers `throw` the result, so the decision cannot be forgotten at a call
+ * site that merely wanted to report "the broker said no".
+ */
+export function brokerRejectionOutcome(
+  order: BrokerOrder,
+  causeValue?: unknown,
+): BrokerOrderRejectedError | BrokerRejectionContradictedError {
+  const verdict = verifyZeroBrokerExposure(order);
+  return verdict.proven
+    ? new BrokerOrderRejectedError(order, causeValue)
+    : new BrokerRejectionContradictedError(order, verdict, causeValue);
 }
 
 export class BrokerDisabledError extends Error {

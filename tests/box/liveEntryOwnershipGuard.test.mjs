@@ -217,11 +217,25 @@ test("a refusal is classified as neither a broker rejection nor ambiguous", asyn
   assert.equal(result.ok, false);
   assert.equal(after.rejects, before.rejects, "a local refusal is not a broker rejection");
   assert.equal(after.unknownOrders, before.unknownOrders, "a local refusal is not ambiguous");
+  /*
+   * UPDATED EXPECTATION (was `NO_FILL`).
+   *
+   * Both labels agree that nothing filled; they disagree about whether anything was SENT.
+   * `NO_FILL` is a SUBMITTED failure to `executionFunnel` (`submittedFailureByReason.no_fill`),
+   * whereas `REFUSED_BEFORE_SUBMIT` routes to `recordZeroPostRefusal`. Every leg here was refused by
+   * a local authority before its POST — which the assertion below proves — so counting the attempt
+   * as submitted inflated the submitted-attempt denominator and described a risk-control refusal as
+   * a liquidity outcome.
+   *
+   * This test's stated point ("neither a broker rejection nor ambiguous") is unchanged and is
+   * asserted by the two checks above; the label is now the third, correct alternative.
+   */
   assert.equal(
     result.legging.outcome_class,
-    "NO_FILL",
-    "nothing filled, so there is no exposure and nothing to unwind",
+    "REFUSED_BEFORE_SUBMIT",
+    "nothing was submitted at all, so this is a zero-POST refusal rather than a no-fill",
   );
+  assert.deepEqual(stack.adapter.posts, [], "and the zero-POST claim is literally true");
   assert.deepEqual(result.legging.residual_exposure, []);
 });
 
