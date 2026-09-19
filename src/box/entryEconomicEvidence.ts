@@ -86,7 +86,12 @@ export interface EntryEconomicEvidence {
  */
 export function entryEconomicSendBoundaryGap(input: {
   readonly evidence: EntryEconomicEvidence | null;
-  readonly request?: BrokerOrderRequest;
+  /*
+   * `| undefined` is explicit, not redundant: this project sets `exactOptionalPropertyTypes`, under
+   * which `request?: BrokerOrderRequest` would refuse an argument whose own type is
+   * `BrokerOrderRequest | undefined` — which is exactly what the gateway's optional parameter is.
+   */
+  readonly request?: BrokerOrderRequest | undefined;
   readonly currentIdentity: EvidenceIdentity | null;
   readonly monoNow: number;
 }): string | null {
