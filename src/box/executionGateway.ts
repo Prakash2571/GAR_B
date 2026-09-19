@@ -26,14 +26,16 @@ import {
 import { buildFundingReadiness, type FundingReadiness } from "./fundingReadiness.js";
 import {
   ageEvidence,
-  identityMismatch,
-  monoElapsed,
   orderPlanFingerprint,
   readEvidence,
   type EvidenceClock,
   type EvidenceIdentity,
   type EvidenceInstant,
 } from "./evidenceTiming.js";
+import {
+  entryEconomicSendBoundaryGap,
+  type EntryEconomicEvidence,
+} from "./entryEconomicEvidence.js";
 import { monotonicNow } from "../brokers/deadline.js";
 import { entrySubmissionOrder } from "./entrySubmissionOrder.js";
 import {
@@ -207,21 +209,17 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
   private lastCapitalReport: BoxCapitalReport | null = null;
   /** The most recent economic-admission decision (five distinct quantities), for status. */
   private lastEconomicReport: EconomicAdmissionReport | null = null;
-  /**
-   * The evidence that admitted the CURRENT entry attempt, retained so the final send boundary can
-   * re-check expiry, identity and the order plan WITHOUT re-fetching from the broker. Null when no
-   * economic control is enabled or admission was refused.
+  /*
+   * THERE IS DELIBERATELY NO `economicEvidence` FIELD HERE.
+   *
+   * Entry economic evidence is owned by the attempt that produced it and reaches the send boundary
+   * through that attempt's own closure — see `entryEconomicEvidence.ts` for the contamination this
+   * removes. A field here, of any shape, would reintroduce it: a single slot directly, and a
+   * `Map<attemptId, …>` by requiring a lookup that can miss, return the wrong entry, or leak.
+   *
+   * Do not add `latestEconomicEvidence`, `currentEconomicEvidence` or an equivalent. `lastEconomicReport`
+   * below is a different thing: a status projection, explicitly never a correctness input.
    */
-  private economicEvidence: {
-    readonly fundsObservedAtMono: number | null;
-    readonly marginObservedAtMono: number | null;
-    readonly fundsMaxAgeMs: number;
-    readonly marginMaxAgeMs: number;
-    readonly planFingerprint: string;
-    readonly identity: EvidenceIdentity | null;
-    readonly fundsRequired: boolean;
-    readonly marginRequired: boolean;
-  } | null = null;
 
   constructor(private readonly deps: {
     cfg: BoxConfig;
@@ -567,7 +565,19 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     // the requirement. Enabled only when the operator asks for it (funds-cover or margin-evidence);
     // when enabled, MISSING or STALE evidence REFUSES rather than assumes. Runs on the SAME four
     // immutable requests, still before any leg is sent, so a refusal is a free pre-submit refusal.
-    const economic = await this.evaluateEntryEconomics(requests, args.candidate.direction ?? "LONG_BOX");
+    const economics = await this.evaluateEntryEconomics(
+      requests,
+      args.candidate.direction ?? "LONG_BOX",
+      attemptId,
+    );
+    const economic = economics?.report ?? null;
+    /*
+     * THIS ATTEMPT'S evidence, captured as an immutable local. It is closed over by the
+     * `sendBoundaryEconomics` closure below and is unreachable from anywhere else, so no concurrent
+     * attempt can read, overwrite or erase it. Nothing needs to clean it up: it becomes garbage with
+     * the attempt's own stack frame.
+     */
+    const attemptEconomicEvidence: EntryEconomicEvidence | null = economics?.evidence ?? null;
     if (economic && !economic.allowed) {
       const rejected = liveEntryFailure(
         args.candidate,
@@ -674,8 +684,12 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
           // the one the margin figure was computed for must all refuse the POST while there is
           // still no exposure. The manager decides WHEN to honour it, using the same rule as the
           // coherence check (no exposure ⇒ refuse; exposure taken ⇒ complete and record).
+          //
+          // The evidence is the one THIS attempt acquired, captured immutably in this closure rather
+          // than read from a gateway field at POST time. That is what makes cross-attempt
+          // contamination impossible rather than merely unlikely — see `entryEconomicEvidence.ts`.
           sendBoundaryEconomics: (candidateRequest?: BrokerOrderRequest) =>
-            this.economicSendBoundary(candidateRequest ?? request),
+            this.economicSendBoundary(attemptEconomicEvidence, candidateRequest ?? request),
         });
       }),
     );
@@ -1737,7 +1751,12 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
   private async evaluateEntryEconomics(
     requests: readonly BrokerOrderRequest[],
     direction: BoxDirection,
-  ): Promise<EconomicAdmissionReport | null> {
+    /**
+     * The attempt this evaluation belongs to. Stamped onto the returned evidence so a refusal can
+     * name it and a test can prove an attempt used its OWN evidence rather than a sibling's.
+     */
+    attemptId: string,
+  ): Promise<{ report: EconomicAdmissionReport; evidence: EntryEconomicEvidence | null } | null> {
     if (this.mode !== "live") return null;
     const requireFundsCover = this.deps.cfg.liveRequireFundsCover === true;
     const requireMarginEvidence = this.deps.cfg.liveRequireMarginEvidence === true;
@@ -1876,8 +1895,12 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
       readElapsedMs: { funds: fundsObs.elapsed_ms, margin: marginObs.elapsed_ms },
     });
     this.lastEconomicReport = report;
-    // Retained so the SEND BOUNDARY can re-check expiry and the plan without re-fetching.
-    this.economicEvidence = report.allowed
+    /*
+     * The evidence is RETURNED to the caller, which hands it to this attempt's send-boundary closure.
+     * It is not stored on the gateway — see `entryEconomicEvidence.ts`. `lastEconomicReport` above is
+     * still assigned because it is the status projection and explicitly not a correctness input.
+     */
+    const evidence: EntryEconomicEvidence | null = report.allowed
       ? {
           fundsObservedAtMono: fundsObs.at?.mono ?? null,
           marginObservedAtMono: marginObs.at?.mono ?? null,
@@ -1892,9 +1915,10 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
           // that was just closed at admission.
           fundsRequired: requireFundsCover || requireStageFunding,
           marginRequired: requireMarginEvidence || requireStageFunding,
+          attemptId,
         }
       : null;
-    return report;
+    return { report, evidence };
   }
 
   /** The clock pair evidence is stamped against: wall for audit, monotonic for durations. */
@@ -1926,39 +1950,26 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
    * exposure taken ⇒ complete and record", which is why this must never be used to abandon a leg
    * that could already be filling.
    */
-  private economicSendBoundary(request?: BrokerOrderRequest): string | null {
-    const evidence = this.economicEvidence;
-    if (!evidence) return null; // no economic control enabled, or admission produced no evidence
-    const mono = this.deps.monotonicNow?.() ?? monotonicNow();
-
-    if (evidence.fundsRequired && evidence.fundsObservedAtMono !== null) {
-      const age = monoElapsed(evidence.fundsObservedAtMono, mono);
-      if (age === null || age > evidence.fundsMaxAgeMs) {
-        return `available-funds evidence EXPIRED before transmit (age ${age ?? "?"}ms > ${evidence.fundsMaxAgeMs}ms)`;
-      }
-    }
-    if (evidence.marginRequired && evidence.marginObservedAtMono !== null) {
-      const age = monoElapsed(evidence.marginObservedAtMono, mono);
-      if (age === null || age > evidence.marginMaxAgeMs) {
-        return `planned-margin evidence EXPIRED before transmit (age ${age ?? "?"}ms > ${evidence.marginMaxAgeMs}ms)`;
-      }
-    }
-    const mismatch = identityMismatch(evidence.identity, this.evidenceIdentity());
-    if (mismatch) return `economic evidence no longer applies: ${mismatch}`;
-
-    // PLAN BINDING. The manager hands us the request it is about to POST; if its contract, side,
-    // quantity or limit price is not the one the margin figure was computed for, the evidence is
-    // not about this order.
-    if (request) {
-      const leg = orderPlanFingerprint([request]);
-      if (!evidence.planFingerprint.split("|").includes(leg)) {
-        return (
-          "order plan CHANGED after evidence acquisition (quantity or limit price differs from the " +
-          `plan the margin figure was fetched for): ${leg}`
-        );
-      }
-    }
-    return null;
+  private economicSendBoundary(
+    evidence: EntryEconomicEvidence | null,
+    request?: BrokerOrderRequest,
+  ): string | null {
+    /*
+     * `null` here means exactly one thing now: THIS attempt was admitted without any economic control
+     * enabled, so there is nothing to re-check. It can no longer mean "another attempt's refusal
+     * erased the evidence", because the value arrives from the calling attempt's own closure rather
+     * than from a slot anything else can write.
+     *
+     * A refused admission never reaches this point at all: `simulateLeggingEntry` returns
+     * `REFUSED_BEFORE_SUBMIT` before the guard is constructed, so an attempt that failed economic
+     * admission has no send boundary to run.
+     */
+    return entryEconomicSendBoundaryGap({
+      evidence,
+      request,
+      currentIdentity: this.evidenceIdentity(),
+      monoNow: this.deps.monotonicNow?.() ?? monotonicNow(),
+    });
   }
 
   /** Estimated charges (₹) for a request set, from the local fee calculator when available. */
