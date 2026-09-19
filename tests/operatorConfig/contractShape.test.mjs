@@ -312,3 +312,62 @@ test("a missing required setting field is rejected", () => {
   });
   assert.ok(errorsFor({ ...payload, settings }).length > 0, "the schema accepted a setting with no effective_value");
 });
+
+
+/* ═════════════════ 8. The mutability probe must not manufacture a refusal ═════════════════ */
+
+test("a paper profile is still reported mutable in LIVE, despite one forbidden value", () => {
+  // The probe asks "does this system STATE permit a change?" by evaluating a hypothetical different
+  // value. If it happened to pick the one value forbidden in live, the setting would be reported as
+  // permanently locked when in fact only that value is — a refusal manufactured by the probe itself.
+  const payload = project({
+    state: baseState({ executionMode: "live" }),
+    deployment: { executionMode: "live", liveTradingEnabled: true, liveCapable: true },
+  });
+  const s = payload.settings.find((x) => x.key === "paperExecutionProfile");
+  assert.equal(s.mutable, true, "the probe manufactured a forbidden_in_live refusal");
+  assert.equal(
+    s.blockers.some((b) => b.code === "forbidden_in_live"),
+    false,
+    "a forbidden-value blocker leaked into the editability affordance",
+  );
+  // The forbidden value is still advertised, because the backend refuses it on submit and the UI
+  // should show why rather than silently omitting an option.
+  assert.ok(s.enum_values.includes("stress"));
+});
+
+test("the probe never reports a setting mutable when the STATE genuinely forbids it", () => {
+  // The complement: the fix must not have made the probe permissive.
+  const payload = project({
+    state: baseState({ executionMode: "live", entryArmed: true, openBoxes: 1 }),
+    deployment: { executionMode: "live", liveTradingEnabled: true, liveCapable: true },
+  });
+  const s = payload.settings.find((x) => x.key === "paperExecutionProfile");
+  assert.equal(s.mutation_policy, "FLAT_AND_DISARMED");
+  assert.equal(s.mutable, false);
+  assert.ok(s.blockers.some((b) => b.code === "session_armed" || b.code === "open_box"));
+});
+
+/* ═════════════════ 9. safe_direction reaches the wire ═════════════════ */
+
+test("every setting publishes safe_direction, so the UI need not infer risk direction", () => {
+  const VALID = ["lower_is_safer", "higher_is_safer", "enabled_is_safer", "disabled_is_safer", "neutral"];
+  for (const s of project().settings) {
+    assert.ok(VALID.includes(s.safe_direction), `${s.key} published "${s.safe_direction}"`);
+  }
+});
+
+test("the coherence bounds publish the sentinel the UI needs to be conservative about", () => {
+  const settings = project().settings;
+  for (const key of [
+    "maxCrossLegReceiveDispersionMs",
+    "maxCrossLegExchangeDispersionMs",
+    "maxReceiveToExchangeDelayMs",
+  ]) {
+    const s = settings.find((x) => x.key === key);
+    assert.equal(s.zero_means, "disabled", `${key} lost its sentinel marker`);
+    assert.equal(s.safe_direction, "lower_is_safer");
+    // Without both fields the frontend cannot tell that 0 disables the gate.
+    assert.notEqual(s.min, null);
+  }
+});

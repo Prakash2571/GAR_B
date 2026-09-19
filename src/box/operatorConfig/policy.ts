@@ -34,7 +34,7 @@
  * deferral is the documented behaviour and is reported as `takesEffect: "next_arm"`, not hidden.
  */
 
-import { isSafer } from "./precedence.js";
+import { isSafer, toComparable } from "./precedence.js";
 import type {
   Blocker,
   MutationPolicy,
@@ -171,18 +171,17 @@ export function evaluateMutation(args: {
   // REFUSED, not clamped. Silently storing 150,000 while enforcing 120,000 would leave the UI
   // truthfully reporting a configured value that has no effect, which is how an operator comes to
   // believe a limit is in force when it is not.
+  //
+  // This used to consider ONLY numeric `ceiling` settings, so two whole classes fell through and were
+  // silently clamped by the resolver instead of being refused here: a `floor` lowered past a
+  // deployment minimum (`expirySafetyMinutes`), and a boolean protection turned off after the
+  // deployment had explicitly asserted the safe state (`oneActiveBoxPerUnderlying`).
   if (args.deploymentBound !== undefined && args.deploymentBound !== null && widening) {
     const bound = args.deploymentBound;
-    const overshoots =
-      typeof bound === "number" && typeof requested === "number"
-        ? spec.containment === "ceiling"
-          ? isSafer(spec, bound, requested) === false && requested !== bound && exceedsCeiling(bound, requested, spec)
-          : false
-        : false;
-    if (overshoots) {
+    if (overshootsDeploymentBound(spec, bound, requested)) {
       blockers.push({
         code: "deployment_bound",
-        message: `${spec.label} is capped at ${String(bound)} by this deployment's ${spec.envVar}. A runtime setting can lower it but never raise it.`,
+        message: deploymentBoundMessage(spec, bound),
       });
     }
   }
@@ -224,15 +223,54 @@ export function evaluateMutation(args: {
 }
 
 /**
- * Does `requested` exceed a `ceiling` bound, accounting for `0 = unlimited`?
+ * Does `requested` fall outside the absolute bound this deployment set?
  *
- * Separated out because the `0` case inverts the comparison: a requested `0` on an
- * unlimited-capable ceiling is the LEAST restrictive value possible, so it overshoots any finite
- * bound even though `0 < bound` numerically.
+ * Covers all four shapes a bound can take, because each one has a way of being widened:
+ *
+ *   ceiling, numeric  — requested is MORE permissive than the bound. `0` on an unlimited-capable or
+ *                       disabled-capable setting is the LEAST restrictive value available, so it
+ *                       overshoots any finite bound even though `0 < bound` arithmetically.
+ *   floor, numeric    — requested is LESS than a deployment minimum.
+ *   boolean           — the deployment asserted the SAFE state and the request is the unsafe one.
+ *   enum              — no ordering exists, so any move away from a stated bound is refused rather
+ *                       than guessed at.
+ *
+ * Shares `toComparable` with the resolver deliberately: two different notions of "0 means unlimited"
+ * is precisely how the refusal here and the clamp there would come to disagree.
  */
-function exceedsCeiling(bound: number, requested: number, spec: SettingSpec): boolean {
-  const unlimited = spec.zeroMeans === "unlimited";
-  const boundCmp = unlimited && bound === 0 ? Number.POSITIVE_INFINITY : bound;
-  const reqCmp = unlimited && requested === 0 ? Number.POSITIVE_INFINITY : requested;
-  return reqCmp > boundCmp;
+function overshootsDeploymentBound(
+  spec: SettingSpec,
+  bound: SettingValue,
+  requested: SettingValue,
+): boolean {
+  if (spec.containment === "replace") return false;
+  if (bound === requested) return false;
+
+  if (typeof bound === "boolean" && typeof requested === "boolean") {
+    if (spec.safeDirection === "enabled_is_safer") return bound === true && requested === false;
+    if (spec.safeDirection === "disabled_is_safer") return bound === false && requested === true;
+    return false;
+  }
+
+  if (typeof bound !== "number" || typeof requested !== "number") return true;
+
+  // An ambiguous sentinel on either side cannot be proven to sit within the bound, so it is refused
+  // rather than guessed at. See `zeroDirectionIsAmbiguous` in ./precedence.ts.
+  if (spec.zeroMeans === "disabled" && (bound === 0 || requested === 0)) return true;
+
+  const boundCmp = toComparable(bound, spec.zeroMeans);
+  const reqCmp = toComparable(requested, spec.zeroMeans);
+  return spec.containment === "ceiling" ? reqCmp > boundCmp : reqCmp < boundCmp;
+}
+
+/** Phrase the refusal in the direction the bound actually constrains. */
+function deploymentBoundMessage(spec: SettingSpec, bound: SettingValue): string {
+  const where = `by this deployment's ${spec.envVar}`;
+  if (typeof bound === "boolean") {
+    return `${spec.label} is pinned to ${bound ? "on" : "off"} ${where}. A runtime setting cannot override it.`;
+  }
+  if (spec.containment === "floor") {
+    return `${spec.label} has a minimum of ${String(bound)} ${where}. A runtime setting can raise it but never lower it.`;
+  }
+  return `${spec.label} is capped at ${String(bound)} ${where}. A runtime setting can lower it but never raise it.`;
 }

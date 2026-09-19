@@ -151,12 +151,56 @@ test("a fully valid patch returns exactly the coerced values", () => {
 
 /* ═════════════════ 6. Read-only settings ═════════════════ */
 
-test("a RESTART_REQUIRED setting cannot be written even with a valid value", () => {
-  const readOnly = SPECS.filter((s) => s.policy === "RESTART_REQUIRED");
-  for (const s of readOnly) {
-    const value = s.type === "boolean" ? true : s.type === "enum" ? s.enumValues[0] : s.min;
-    const r = validatePatch({ [s.key]: value }, SPECS);
-    assert.equal(r.ok, false, `${s.key} was writable despite RESTART_REQUIRED`);
-    assert.deepEqual(codes(r), ["not_mutable"]);
-  }
+test("the registry currently declares no RESTART_REQUIRED setting", () => {
+  // Recorded as a FACT, so the synthetic test below is understood to be the real coverage rather than
+  // looking like belt-and-braces. Everything deployment-owned is simply not registered at all, which
+  // is a stronger guarantee than registering it as read-only.
+  assert.deepEqual(SPECS.filter((s) => s.policy === "RESTART_REQUIRED"), []);
+});
+
+test("a RESTART_REQUIRED setting cannot be written even with a perfectly valid value", () => {
+  // DRIVEN WITH A SYNTHETIC SPEC ON PURPOSE. Iterating the registry for RESTART_REQUIRED entries — as
+  // this test first did — loops zero times and passes vacuously, which is worse than no test: it
+  // reports coverage of a rule nothing exercises. The validator must reject the policy whether or not
+  // any setting currently uses it, because the next one added will rely on exactly that.
+  const readOnlySpec = {
+    key: "someDeploymentValue",
+    envVar: "BOX_SOME_DEPLOYMENT_VALUE",
+    boxConfigField: "someDeploymentValue",
+    category: "risk",
+    label: "Some deployment value",
+    description: "A deployment-owned value that is displayed but never writable at runtime.",
+    type: "integer",
+    unit: "count",
+    min: 0,
+    max: 10,
+    containment: "replace",
+    safeDirection: "neutral",
+    policy: "RESTART_REQUIRED",
+    takesEffect: "next_restart",
+    dangerous: false,
+    requiresFullAdmin: false,
+  };
+
+  const specs = [...SPECS, readOnlySpec];
+  const r = validatePatch({ someDeploymentValue: 5 }, specs);
+  assert.equal(r.ok, false, "a RESTART_REQUIRED setting was writable");
+  assert.deepEqual(codes(r), ["not_mutable"]);
+  assert.equal(r.values, undefined);
+
+  // And it is refused for being read-only, NOT for the value — 5 is inside 0..10.
+  assert.match(r.problems[0].message, /deployment configuration/i);
+});
+
+test("a read-only setting in a patch refuses the whole patch, including its valid siblings", () => {
+  const readOnlySpec = {
+    ...SPECS.find((s) => s.key === "maxOpenBoxes"),
+    key: "frozenThing",
+    envVar: "BOX_FROZEN_THING",
+    boxConfigField: "frozenThing",
+    policy: "RESTART_REQUIRED",
+  };
+  const r = validatePatch({ safetyBuffer: 200, frozenThing: 1 }, [...SPECS, readOnlySpec]);
+  assert.equal(r.ok, false);
+  assert.equal(r.values, undefined, "a valid sibling survived alongside a refused read-only key");
 });

@@ -150,14 +150,23 @@ function mutability(
   return probe.allowed ? { mutable: true, blockers: [] } : { mutable: false, blockers: probe.blockers };
 }
 
-/** A different-but-valid value, used only to drive the state gates in {@link mutability}. */
+/**
+ * A different-but-valid value, used ONLY to drive the state gates in {@link mutability}.
+ *
+ * It must never pick a value that would trip a NON-state refusal, because the probe is asking "does
+ * this system state permit a change?" and a spurious `forbidden_in_live` would render an otherwise
+ * editable setting as permanently locked. `paperExecutionProfile` is the live case: probing with
+ * `"stress"` while the deployment is live would report the profile as unchangeable, when in fact only
+ * that one value is.
+ */
 function flip(spec: SettingSpec, value: SettingValue): SettingValue {
   if (typeof value === "boolean") return !value;
   if (typeof value === "number") {
     const max = spec.max ?? value + 1;
     return value === max ? Math.max(spec.min ?? 0, value - 1) : value + 1;
   }
-  const choices = spec.enumValues ?? [];
+  const forbidden = spec.forbiddenValuesInLive ?? [];
+  const choices = (spec.enumValues ?? []).filter((c) => !forbidden.includes(c));
   return choices.find((c) => c !== value) ?? value;
 }
 

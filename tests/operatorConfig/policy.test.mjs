@@ -257,3 +257,162 @@ test("a no-op is allowed and is not reported as a tightening", () => {
   assert.equal(d.allowed, true);
   assert.equal(d.tightening, false);
 });
+
+
+/* ═════════════════ 9. DEPLOYMENT BOUNDS: every shape, not just numeric ceilings ═════════════════ */
+
+/*
+ * The regression these cover: the deployment-bound check used to consider ONLY numeric `ceiling`
+ * settings, so two whole classes fell through and were SILENTLY CLAMPED by the resolver instead of
+ * being refused here — which is exactly the "never silently defer or partially apply" rule this
+ * surface is built on. The operator got a success for a change that had no effect.
+ */
+
+test("a FLOOR lowered past a deployment minimum is refused, not silently clamped", () => {
+  const s = spec("expirySafetyMinutes");
+  assert.equal(s.containment, "floor");
+  const d = evaluateMutation({
+    spec: s,
+    current: 60,
+    requested: 10,
+    state: baseState(),
+    deploymentBound: 60,
+  });
+  assert.equal(d.allowed, false);
+  assert.ok(blockerCodes(d).includes("deployment_bound"));
+  const message = d.blockers.find((b) => b.code === "deployment_bound").message;
+  // Phrased in the direction the bound actually constrains.
+  assert.match(message, /minimum/i);
+  assert.match(message, /raise it but never lower it/);
+  assert.match(message, /BOX_EXPIRY_SAFETY_MINUTES/);
+});
+
+test("a FLOOR raised above the deployment minimum is allowed", () => {
+  const d = evaluateMutation({
+    spec: spec("expirySafetyMinutes"),
+    current: 60,
+    requested: 90,
+    state: baseState(),
+    deploymentBound: 60,
+  });
+  assert.equal(d.allowed, true);
+});
+
+test("a BOOLEAN protection the deployment pinned ON cannot be turned off", () => {
+  const s = spec("oneActiveBoxPerUnderlying");
+  assert.equal(s.safeDirection, "enabled_is_safer");
+  const d = evaluateMutation({
+    spec: s,
+    current: true,
+    requested: false,
+    state: baseState(),
+    deploymentBound: true,
+  });
+  assert.equal(d.allowed, false);
+  assert.ok(blockerCodes(d).includes("deployment_bound"));
+  assert.match(d.blockers.find((b) => b.code === "deployment_bound").message, /pinned to on/i);
+});
+
+test("a BOOLEAN risky feature the deployment pinned OFF cannot be enabled", () => {
+  const s = spec("enableShortBox");
+  assert.equal(s.safeDirection, "disabled_is_safer");
+  const d = evaluateMutation({
+    spec: s,
+    current: false,
+    requested: true,
+    state: baseState(),
+    deploymentBound: false,
+  });
+  assert.equal(d.allowed, false);
+  assert.ok(blockerCodes(d).includes("deployment_bound"));
+});
+
+test("enabling a protection the deployment left off is still allowed", () => {
+  const d = evaluateMutation({
+    spec: spec("oneActiveBoxPerUnderlying"),
+    current: false,
+    requested: true,
+    state: baseState(),
+    deploymentBound: false,
+  });
+  assert.equal(d.allowed, true);
+});
+
+/* ═════════════════ 10. The ambiguous coherence sentinel, at the policy layer ═════════════════ */
+
+test("disabling a coherence bound is refused while armed", () => {
+  // The serious case: this used to be classified as a TIGHTENING and waved through while armed,
+  // switching off a cross-leg coherence check on a live, armed session.
+  for (const key of [
+    "maxCrossLegReceiveDispersionMs",
+    "maxCrossLegExchangeDispersionMs",
+    "maxReceiveToExchangeDelayMs",
+  ]) {
+    const d = evaluateMutation({
+      spec: spec(key),
+      current: 500,
+      requested: 0,
+      state: baseState({ entryArmed: true }),
+    });
+    assert.equal(d.allowed, false, `${key}: disabling the gate was allowed while armed`);
+    assert.ok(blockerCodes(d).includes("widening_while_armed"));
+  }
+});
+
+test("disabling a coherence bound is refused past a deployment bound even when flat", () => {
+  const d = evaluateMutation({
+    spec: spec("maxCrossLegReceiveDispersionMs"),
+    current: 500,
+    requested: 0,
+    state: baseState(),
+    deploymentBound: 500,
+  });
+  assert.equal(d.allowed, false);
+  assert.ok(blockerCodes(d).includes("deployment_bound"));
+});
+
+test("a genuine tightening of a coherence bound is still allowed while armed", () => {
+  // The fix must not lock these settings down entirely — only the 0 cases are unprovable.
+  const d = evaluateMutation({
+    spec: spec("maxCrossLegReceiveDispersionMs"),
+    current: 500,
+    requested: 300,
+    state: baseState({ entryArmed: true }),
+  });
+  assert.equal(d.allowed, true);
+  assert.equal(d.tightening, true);
+});
+
+test("re-enabling a coherence bound from 0 requires flat and disarmed", () => {
+  // Also unprovable: in live-strict mode a stored 0 refuses every entry, so 0 -> 500 is ENABLING
+  // entry. Conservatively routed to the flat-and-disarmed path rather than guessed at.
+  const armed = evaluateMutation({
+    spec: spec("maxCrossLegReceiveDispersionMs"),
+    current: 0,
+    requested: 500,
+    state: baseState({ sessionArmed: true }),
+  });
+  assert.equal(armed.allowed, false);
+
+  const flat = evaluateMutation({
+    spec: spec("maxCrossLegReceiveDispersionMs"),
+    current: 0,
+    requested: 500,
+    state: baseState(),
+  });
+  assert.equal(flat.allowed, true);
+});
+
+test("an unlimited-capable ceiling still refuses a widening to 0 past a bound", () => {
+  // Regression guard for the shared helper: the numeric ceiling case must keep working after being
+  // generalised to cover floors and booleans.
+  const d = evaluateMutation({
+    spec: spec("maxOpenBoxes"),
+    current: 2,
+    requested: 0,
+    state: baseState(),
+    deploymentBound: 4,
+  });
+  assert.equal(d.allowed, false);
+  assert.ok(blockerCodes(d).includes("deployment_bound"));
+});

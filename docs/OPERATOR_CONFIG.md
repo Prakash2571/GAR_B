@@ -94,6 +94,17 @@ not containment; it is an accident that looks like containment. `envPresent` use
 not a value" rule as `src/env/layer.ts`, so a process manager injecting `FOO=` cannot create a
 phantom ceiling.
 
+Presence *without a parsed value* is likewise not a bound. An earlier revision read
+`envValue ?? codeDefault`, which gave `liveMaxOpenBoxes` a phantom ceiling of `1` whenever a caller
+reported presence without a value — silently capping every operator value while `clampedByDeployment`
+blamed a deployment that had said nothing of the sort.
+
+**A bound is refused, never silently clamped — in every shape it takes.** The policy layer originally
+checked only numeric `ceiling` settings, so two classes fell through and were quietly clamped by the
+resolver instead: a `floor` lowered past a deployment minimum (`expirySafetyMinutes`), and a boolean
+protection switched off after the deployment had explicitly asserted the safe state
+(`oneActiveBoxPerUnderlying`). Both now produce a named `deployment_bound` refusal.
+
 **`Math.min` is wrong here.** Several ceilings read `0` as UNLIMITED — `BOX_MAX_OPEN_BOXES`,
 `BOX_LIVE_DAILY_LOSS_LIMIT`, `BOX_LIVE_MAX_BOX_CAPITAL_RUPEES`. `Math.min(5, 0)` is `0`, which would
 convert a finite deployment limit into no limit at all. Every comparison happens in a normalised
@@ -105,7 +116,35 @@ space where `0` has become `+Infinity`, and the result is denormalised on the wa
 |---|---|---|
 | `maxOpenBoxes`, `liveDailyLossLimit`, `liveMaxBoxCapitalRupees`, `maxUnderlyings`, `maxConcurrentPerUnderlying`, `sessionMax*` | `unlimited` | the code tests `limit > 0` before enforcing, so `0` disables the gate |
 | `liveMaxOpenBoxes`, `liveMaxResidualLegs` | `value` | the order manager tests `openBoxes >= limit` / `residualLegs > limit`, so `0` is the **most** restrictive value, not the least |
-| coherence/dispersion bounds | `disabled` | `0` switches the check off but is not a comparable magnitude |
+| coherence/dispersion bounds | `disabled` | `0` switches the gate off, so it normalises like `unlimited` — **but its safety direction is mode-dependent, see below** |
+
+`unlimited` and `disabled` both normalise, because both mean "no bound is enforced". Only `value` does
+not.
+
+#### The ambiguous zero, and why it is handled separately
+
+The three cross-leg coherence bounds carry a genuine ambiguity. `loadBoxConfig` documents that in LIVE
+a `0` dispersion limit is **impossible to satisfy** — maximally safe, it refuses every entry — unless
+`BOX_COHERENCE_ZERO_DISPERSION_DISABLES_IN_LIVE` is explicitly set, while paper always reads `0` as
+disabled and therefore maximally permissive. **The same stored `0` is the strictest possible setting in
+one mode and the loosest in another, and which applies depends on a different setting.**
+
+So no change involving `0` on these settings is *provably* a tightening, and the subsystem refuses to
+guess:
+
+- `isSafer` returns false whenever `0` is on either side, which routes the change to the
+  flat-and-disarmed path instead of admitting it while armed. A genuine finite tightening
+  (500 ms → 300 ms) is unaffected.
+- A deployment that explicitly set `0` **pins it in both directions**, because a runtime value would be
+  either widening or tightening depending on a mode this resolver cannot see.
+- The policy layer refuses a `0`-involving change past a deployment bound rather than clamping it.
+
+This was a real defect before it was a design note: with `0` left out of the normalisation,
+`Math.min(500, 0)` was `0`, so a persisted runtime `0` **disabled a deployment-mandated coherence
+check** — and `isSafer` read the same `0` as the tightest available value, so the change was classified
+as a TIGHTENING and permitted **while the live session was armed.** One missing case inverted two
+independent guards. `tests/operatorConfig/precedence.test.mjs` §7 and `policy.test.mjs` §10 are the
+regression tests.
 
 ### 2.3 One deliberate exception
 
