@@ -281,6 +281,7 @@ are the shipped specification:
 | `docs/DEPLOYMENT.md` | Production setup, migrations, backup, rollback. |
 | `docs/MUMBAI_EC2_PROFILE.md` | The conservative `ap-south-1` profile. |
 | `docs/RUNBOOK.md` | Daily operations and incident response. |
+| `docs/PRE_LIVE_DEPLOYMENT_VERIFICATION.md` | **Before a first live test:** egress IP, deploy, restart, and the entry gates the Zerodha hardening release added. Run before `docs/TRIAL_RUNBOOK.md` §4 and `docs/PREFLIGHT_CHECKLIST.md`. |
 | `docs/SAFETY_INVARIANTS.md` | The invariants the execution path must never violate. |
 | `docs/FAULT_MATRIX.md` | Failure modes, expected behaviour, and the test that proves it. |
 | `docs/BROKER_TOKENS.md` | Token acquisition, encryption, rotation. |

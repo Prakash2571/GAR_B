@@ -111,15 +111,20 @@ Recorded by `brokerTimingStore` / `executionTiming` / `latencySource`.
 **Status in this task: NOT VERIFIED — I had no deployed access, no credentials and no network
 egress to the deployment.** Every step below is written to be executed by an authorised operator.
 
+> **Deploy first.** Gate B reads a *correctly deployed* process. Getting the commit, the egress IP and
+> the effective `.env` onto the host is `docs/PRE_LIVE_DEPLOYMENT_VERIFICATION.md`; run that first. Row 7
+> below is the static-IP *check*; that document §3.1 is the *procedure*, including why a matching egress
+> IP is not proof of broker-side registration.
+
 | # | Check | How | Pass condition |
 |---|---|---|---|
 | 1 | **Deployed version** | `git rev-parse HEAD` on the host; compare to the merged SHA | Matches the intended commit exactly |
-| 2 | **Migrations applied** | `SELECT name FROM <migrations table> ORDER BY name;` | Includes `009_backend_instance_epoch` and `010_session_entry_attempts` |
+| 2 | **Migrations applied** | `SELECT filename FROM schema_migrations ORDER BY filename;` — the table and column the migrator actually writes (`src/pg/migrate.ts:85`) | Includes `009_backend_instance_epoch` and `010_session_entry_attempts`. **Nothing above the highest file in `migrations/`** — see `PRE_LIVE_DEPLOYMENT_VERIFICATION.md` §5, open item 1 |
 | 3 | **Effective configuration** | `GET /api/runtime/status`, `GET /api/box/status` → `effective_config` | `session_max_entry_attempts` and `session_max_completed_trades` are the intended values, **not 0** |
 | 4 | **Readiness is orderable** | `GET /api/box/status` → `operational_readiness.instance` | `boot_ordinal` is a **positive integer**, not null. Null ⇒ entry is refused (`instance_epoch_unknown`) |
 | 5 | **Broker authentication** | `operational_readiness.identity` | `broker` correct; `account_present: true`; `account_masked` is the expected masked id |
 | 6 | **Instrument scope** | `box_status.underlyings` | **Only** the intended trial underlying |
-| 7 | **Static IP** | Compare the host's outbound IP to the broker dashboard allow-list | Registered. See BROKER_ADAPTER_AUDIT §1.1 — mandatory since 2026-04-01 |
+| 7 | **Static IP** | Compare the host's outbound IP to the broker dashboard allow-list | Registered. See BROKER_ADAPTER_AUDIT §1.1 — mandatory since 2026-04-01. **Now also a code gate for Zerodha** — see row 17 |
 | 8 | **Retail algo registration** | Account-level with the broker | Order rate stays under 10/s/segment, or the strategy is exchange-registered (audit §1.2) |
 | 9 | **Market-data freshness** | `market_data_state`, `market_data_health` | `READY`; frame/heartbeat/depth ages within bounds; `coverage.missing` understood |
 | 10 | **Order-stream readiness** | `order_stream` | `lifecycle: READY`. If Dhan: `detail` must **not** still say authorisation is assumed — a completed sweep upgrades it to `rest_verified` |
@@ -129,6 +134,16 @@ egress to the deployment.** Every step below is written to be executed by an aut
 | 14 | **Dhan funds semantics** | Read the fund-limit response with a known open position; check whether `availabelBalance + utilizedAmount` equals the pre-trade figure | Resolves audit gap 5.3. Until then the conservative understating reading applies |
 | 15 | **Session budget unspent** | `session` in box status | `remaining_entry_attempts` and `remaining_trades` are the full configured values |
 | 16 | **Kill switch reachable** | Confirm the emergency control is present and not queued behind another control | Present and independently actionable |
+| 17 | **Zerodha static-IP gate** | `operational_readiness.entry.reasons` | `zerodha_static_ip_unconfirmed` **absent**. Fails closed: unset, blank, `false` and a typo all read as not confirmed. Does **not** gate exits, by design |
+| 18 | **Funding gates not all off** | `operational_readiness.entry.reasons` | `funding_checks_disabled` **absent**. Live with every funding evidence gate disabled now refuses new entry, it no longer merely reports |
+| 19 | **Residual escalation clear** | `operational_readiness.entry.reasons` | `recovery_escalation_timeout` and `residual_state_unknown` **absent**. Escalation age is measured from durable `created_at` where available, so it survives a restart |
+| 20 | **Lot relationship holds** | The loaded instrument master vs the two quantity ceilings | `BOX_LIVE_MAX_OPEN_LEG_QUANTITY == L` and `BOX_LIVE_MAX_GROSS_OPEN_LEG_QUANTITY == 4 × L` for the **actual** current lot `L`. `BOX_LIVE_EXACT_ONE_LOT=true` refuses boot otherwise. **Read `L`, never assume it** |
+
+> **Rows 3, 4, 5, 9, 10, 11, 13, 15 and 17–19 are read from a surface that reports rather than
+> enforces.** `operationalReadiness()` is consumed only by `getStatus()` and the runtime-status
+> projection — never in the entry decision path, where `BoxOrderManager.entryBlockReasonAfterControls`
+> is the authority. Gate B is necessary evidence, not sufficient proof; see
+> `PRE_LIVE_DEPLOYMENT_VERIFICATION.md` §4.
 
 ---
 
