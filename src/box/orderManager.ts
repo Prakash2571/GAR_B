@@ -1494,7 +1494,36 @@ export class BoxOrderManager {
       // and the generic message made them indistinguishable in the logs.
       const blocked = this.entryBlockReason(request);
       if (blocked !== null) {
-        return releaseOnReject(new Error(`Entry cannot be sent: ${blocked}`));
+        /*
+         * A TYPED, PROVEN NO-POST REFUSAL — not a bare `Error`.
+         *
+         * This is a LOCAL authority refusing before anything is reserved, enqueued or persisted: no
+         * durable row exists and no HTTP request will be made. But it used to reject with a plain
+         * `Error`, and the execution gateway recognises proven-no-exposure by TYPE
+         * (`BrokerPreSubmitRefusedError` / a verified broker rejection). An unrecognised error is
+         * treated as UNPROVEN, so every limit-based entry refusal — the daily-loss breaker, a paused
+         * entry control, an unestablished risk seed, a missing account identity — was reported as
+         * `QUARANTINED_UNKNOWN` with the detail "broker terminal quantity is uncertain".
+         *
+         * That inverts the truth in the dangerous direction for an operator: it INVENTS uncertainty
+         * about a broker that was never contacted, telling them to go and reconcile a position that
+         * cannot exist, and it hides the real cause (a risk control they could simply inspect).
+         * Fail-closed must mean "refuse the order", not "claim the broker might have it".
+         *
+         * `durableIdentitySpent: false` because we are upstream of the durable CREATED write — the
+         * identity is reusable, unlike the `post_persist`/`pre_post` refusals. The stage is
+         * `"dequeue"`, matching the entry-guard refusal immediately above, which already did this.
+         * The original sentence is preserved inside the message, so existing operator-facing text
+         * and log assertions still read the same.
+         */
+        return releaseOnReject(
+          new BrokerPreSubmitRefusedError(
+            request.client_order_id,
+            "dequeue",
+            false,
+            `Entry cannot be sent: ${blocked}`,
+          ),
+        );
       }
     }
     if (request.purpose !== "ENTRY") {

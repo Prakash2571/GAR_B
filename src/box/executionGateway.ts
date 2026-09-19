@@ -833,9 +833,32 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
       const residual = residualAfterUnwind(orders, unwindOrders);
       this.verifyEntryConservation(plan, orders, unwindOrders, attemptId, "partial_entry");
 
-      const failed = liveEntryFailure(args.candidate, args.detection.at, submittedAt, orders, "legging_incomplete", plan.action === "no_exposure" ? "entry did not fill; no exposure to unwind" : "entry incomplete; confirmed fills were protectively unwound", this.deps.cfg, tradeId, residual, unwindOrders);
+      /*
+       * "NOTHING FILLED" AND "NOTHING WAS EVER SENT" ARE DIFFERENT OUTCOMES.
+       *
+       * When EVERY leg was refused by a local authority before its POST — an entry limit, the daily
+       * loss breaker, a lost feed generation, a withdrawn arm — no order reached the broker at all.
+       * That was still labelled `NO_FILL`, which `executionFunnel` counts as a SUBMITTED failure
+       * (`submittedFailureByReason.no_fill`), whereas `REFUSED_BEFORE_SUBMIT` routes to
+       * `recordZeroPostRefusal`. So a wholly refused attempt inflated the submitted-attempt
+       * denominator and was published as "we sent orders and got no fills" — which points an
+       * operator at liquidity when the real cause was a risk control they cannot see from here.
+       *
+       * The gateway's own earlier gates already stamp `REFUSED_BEFORE_SUBMIT` for exactly this
+       * situation; the manager's per-leg refusals are the same fact discovered one layer down, so
+       * they must report it the same way. The refusal reasons are carried into the detail, because
+       * "refused" without a reason sends the operator back to the logs.
+       */
+      const refusals = settled.flatMap((item) =>
+        (item.status === "rejected" && item.reason instanceof BrokerPreSubmitRefusedError
+          ? [item.reason]
+          : []));
+      const everyLegRefusedBeforePost = settled.length > 0 && refusals.length === settled.length;
+      const refusalDetail = [...new Set(refusals.map((refusal) => refusal.reason))].join("; ");
+
+      const failed = liveEntryFailure(args.candidate, args.detection.at, submittedAt, orders, "legging_incomplete", everyLegRefusedBeforePost ? `entry refused before any broker POST: ${refusalDetail}` : plan.action === "no_exposure" ? "entry did not fill; no exposure to unwind" : "entry incomplete; confirmed fills were protectively unwound", this.deps.cfg, tradeId, residual, unwindOrders);
       failed.legging.outcome_class = plan.action === "no_exposure"
-        ? "NO_FILL"
+        ? (everyLegRefusedBeforePost ? "REFUSED_BEFORE_SUBMIT" : "NO_FILL")
         : residual.length > 0
           ? "PARTIAL_ENTRY_RESIDUAL"
           : "PARTIAL_ENTRY_UNWOUND";
@@ -1132,6 +1155,17 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     let uncertain = false;
     let attempted = 0;
     const withheld: string[] = [];
+    /*
+     * THE SUBSET OF `withheld` THAT WAS NEVER TRANSMITTED AT ALL.
+     *
+     * `withheld` mixes two operationally opposite situations: a hedge DELIBERATELY held back because
+     * its paired short is still open (correct, self-healing, no action needed), and a reduction leg
+     * that COULD NOT BE SENT because its book was missing, stale or too thin (exposure stays open and
+     * automation cannot remove it). Collapsing both into one sentence about "preserving hedge cover"
+     * told the operator the reassuring story in both cases. Tracked separately so the failure detail
+     * can say which one actually happened.
+     */
+    const notSubmitted: string[] = [];
 
     /**
      * Submit one wave, recording orders and whether any outcome is unprovable.
@@ -1173,12 +1207,14 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
         } catch (error) {
           byRole.set(leg.role, { filled: 0, certain: true });
           withheld.push(`${leg.role} not submitted: ${withheldReason(errorMessage(error))}`);
+          notSubmitted.push(`${leg.role} (${withheldReason(errorMessage(error))})`);
           continue;
         }
         const verdict = this.precheckOne(request, checkedAt, feedGeneration);
         if (verdict.reason !== null) {
           byRole.set(leg.role, { filled: 0, certain: true });
           withheld.push(`${leg.role} not submitted: ${withheldReason(verdict.reason)}`);
+          notSubmitted.push(`${leg.role} (${withheldReason(verdict.reason)})`);
           continue;
         }
         checkedFeed.set(request.client_order_id, verdict.stamp);
@@ -1210,6 +1246,24 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
           // CERTAIN knowledge of zero — not an unknown — and it is exactly why the original code
           // excluded it from `uncertain`. It still releases no hedge, because the short is intact.
           byRole.set(role, { filled: 0, certain: true });
+          /*
+           * AND IT IS RECORDED AS WITHHELD, WHICH IT WAS NOT BEFORE.
+           *
+           * The `precheckOne` refusal above pushes to `withheld`; this branch — the SAME market-data
+           * authority re-applied at CHECKPOINT 3 (dequeue) and CHECKPOINT 5 (immediately pre-POST) —
+           * did not. So a reduction leg whose book died AFTER admission left `withheld` empty, and
+           * with `uncertain` false the failure detail fell through to the literal string
+           * "live exit partially filled" for a leg that was PROVABLY NEVER TRANSMITTED. An operator
+           * reading that would believe a partial reduction had occurred and that the remainder was
+           * merely unfilled, when in fact nothing was sent and the whole leg is still open.
+           *
+           * The accounting was never wrong (`clean` also requires every outstanding unit to be
+           * confirmed closed, and exposure is only ever decremented from a real `filled_quantity`),
+           * but the OPERATOR-FACING description was, and this is the one surface that tells a human
+           * whether risk was actually reduced.
+           */
+          withheld.push(`${role} not submitted: ${withheldReason(errorMessage(item.reason))}`);
+          notSubmitted.push(`${role} (${withheldReason(errorMessage(item.reason))})`);
           return;
         }
         if (item.reason instanceof OrderPersistenceAfterFillError) {
@@ -1288,15 +1342,53 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     const clean = !uncertain && withheld.length === 0 &&
       outstanding.every(({ role, quantity }) => (closedByRole.get(role) ?? 0) >= quantity);
     if (clean) return { ok: true, legs, record, booksAtFill: new Map() };
+
+    /*
+     * WHAT IS STILL OPEN, NAMED — because "partially filled" is not an instruction.
+     *
+     * Every branch below is a FAILED reduction, so by definition exposure remains. The operator's
+     * next question is always the same: what is still open, and can automation still remove it? So
+     * the remaining quantity per role is computed from the SAME authority the accounting uses
+     * (broker cumulative fills), and reported.
+     */
+    const stillOpen = outstanding
+      .map(({ role, quantity }) => ({ role, remaining: quantity - (closedByRole.get(role) ?? 0) }))
+      .filter(({ remaining }) => remaining > 0);
+    const openSummary = stillOpen.length > 0
+      ? stillOpen.map(({ role, remaining }) => `${role} ${remaining}`).join(", ")
+      : "none";
+    // Held for cover is the REST of `withheld` — the deliberate, self-healing holds.
+    const heldForCover = withheld.filter((entry) => !entry.includes("not submitted:"));
+
+    /*
+     * THE WORDING IS LOAD-BEARING IN TWO DIRECTIONS.
+     *
+     * `positionMonitor.applyLeggingExitResult` routes a position to RECOVERY by matching
+     * /uncertain|reconcil/i against this very string. The `uncertain` branch MUST keep those tokens
+     * (its whole purpose is that routing); every other branch MUST avoid them, because a withheld or
+     * partially filled leg has a KNOWN quantity and must not be sent to recovery as if it did not.
+     * That is why `withheldReason()` scrubs those two tokens out of the per-leg reasons, and why the
+     * operator instruction below is phrased without them.
+     */
+    const detail = uncertain
+      ? "exit terminal quantity uncertain; position moved to recovery"
+      : notSubmitted.length > 0
+        // NOTHING WAS SENT on these legs. Never describe this as a fill.
+        ? `live exit NOT SUBMITTED on ${notSubmitted.length} leg(s) — no order reached the broker, ` +
+          `so this exposure was NOT reduced: ${notSubmitted.join("; ")}. Still open: ${openSummary}. ` +
+          `Automated reduction will retry, but if it keeps failing the position must be reduced ` +
+          `MANUALLY AT THE BROKER TERMINAL.` +
+          (heldForCover.length > 0 ? ` Held as required cover: ${heldForCover.join("; ")}.` : "")
+        : heldForCover.length > 0
+          ? `live exit preserved required hedge cover: ${heldForCover.join("; ")}. Still open: ${openSummary}.`
+          : `live exit partially filled; the broker confirmed less than the outstanding quantity. ` +
+            `Still open: ${openSummary}.`;
+
     return {
       ok: false,
       record,
       reason: "legging_incomplete",
-      detail: uncertain
-        ? "exit terminal quantity uncertain; position moved to recovery"
-        : withheld.length > 0
-          ? `live exit preserved required hedge cover: ${withheld.join("; ")}`
-          : "live exit partially filled",
+      detail,
       legs,
       booksAtFill: new Map(),
     };

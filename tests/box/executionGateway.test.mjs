@@ -435,7 +435,23 @@ test("local pre-submit exit refusal is known-zero, not broker uncertainty", asyn
   });
 
   assert.equal(result.ok, false);
-  assert.match(result.detail, /partially filled/);
+  /*
+   * UPDATED EXPECTATION (was `/partially filled/`).
+   *
+   * This test's NAME is the invariant: a proven no-POST refusal is KNOWN-ZERO, not broker
+   * uncertainty. The old assertion nevertheless required the detail to say "partially filled" —
+   * fill language for a leg that was never transmitted — because the `BrokerPreSubmitRefusedError`
+   * branch in `runWave` did not record the leg as withheld, so the detail fell through to the
+   * generic partial-fill string. The reduction is now described as NOT SUBMITTED, which is what
+   * actually happened, and the remaining exposure is named.
+   *
+   * The two real invariants below are unchanged and still assert the original point.
+   */
+  assert.match(result.detail, /NOT SUBMITTED/, "nothing reached the broker, and the detail says so");
+  assert.doesNotMatch(result.detail, /partially filled/, "a never-transmitted leg is not a partial fill");
+  assert.match(result.detail, /k1_ce 35/, "the still-open quantity is named for the operator");
+  // KNOWN-ZERO, not uncertainty: these two tokens are what routes a position to RECOVERY.
+  assert.doesNotMatch(result.detail, /uncertain|reconcil/i, "a proven local refusal is not uncertainty");
   assert.equal(h.violations.length, 0, "proven no-POST refusal must not quarantine broker quantity");
   assertCheckedStamp(h, 0);
 });
