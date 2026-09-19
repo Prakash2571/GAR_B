@@ -22,6 +22,12 @@ function withExecutionEnv({ mode, liveEnabled }, fn) {
   const values = {
     BOX_EXECUTION_MODE: mode,
     BOX_LIVE_TRADING_ENABLED: liveEnabled,
+    // A live boot also requires a per-Box ₹ ceiling — it is the only MONETARY containment, and
+    // `loadBoxConfig` refuses `0`/unset in live for the same reason the two quantity ceilings have
+    // always refused it (see `liveCapitalCeiling.test.mjs`). Supplied here so the tests in this file
+    // keep testing what they are about — the execution-mode and live-gate parsing — rather than
+    // tripping an unrelated refusal. Restored by the `finally` below like every other key.
+    BOX_LIVE_MAX_BOX_CAPITAL_RUPEES: "100000",
   };
   const previous = new Map();
   for (const [key, value] of Object.entries(values)) {

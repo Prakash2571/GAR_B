@@ -1231,6 +1231,45 @@ export function loadBoxConfig(): BoxConfig {
     );
   }
 
+  /*
+   * THE PER-BOX ₹ CEILING MAY NOT BE SILENTLY ABSENT IN LIVE. It is the only MONETARY containment.
+   *
+   * THE ASYMMETRY THIS CLOSES. The three live size ceilings were not equally protected:
+   *
+   *   BOX_LIVE_MAX_OPEN_LEG_QUANTITY        strictLimitInt(…, min 1, …)  → 0 REFUSED at boot
+   *   BOX_LIVE_MAX_GROSS_OPEN_LEG_QUANTITY  strictLimitInt(…, min 1, …)  → 0 REFUSED at boot
+   *   BOX_LIVE_MAX_BOX_CAPITAL_RUPEES       strictLimitInt(…, min 0, …)  → 0 ACCEPTED = NO CEILING
+   *
+   * `0` is a legitimate value for that variable and means "disabled" — `capitalBlockReason` returns
+   * `null` on `limit <= 0`, i.e. no opinion. That default exists for a good reason: the cap was added
+   * after the fact, and `0` let an existing deployment upgrade without a behaviour change. But the
+   * quantity ceilings bound LOTS, and lots are not money. A deployment can satisfy both quantity caps
+   * and still commit an arbitrary rupee amount, because notional is price × quantity and the caps say
+   * nothing about price.
+   *
+   * `.env.example` ships the variable AT `0`, so the single most likely operator mistake on a
+   * real-money supervised test is leaving the one monetary ceiling at its shipped value and never
+   * being told. Every comparable containment in this file refuses rather than defaults — that is the
+   * whole argument of `strictLimitInt` — so this one is refused too.
+   *
+   * SCOPED TO LIVE ONLY, and deliberately. Paper has `BOX_PAPER_MAX_BOX_CAPITAL_RUPEES`, where `0`
+   * means the same thing and costs nothing, so a paper rehearsal is untouched. This fires only where
+   * real money is reachable, and it names the fix.
+   */
+  if (mode === "live") {
+    const liveCapitalCap = strictLimitInt("BOX_LIVE_MAX_BOX_CAPITAL_RUPEES", 0, 0, 1_000_000_000);
+    if (liveCapitalCap <= 0) {
+      throw new Error(
+        "[Box] BOX_LIVE_MAX_BOX_CAPITAL_RUPEES=0 disables the per-Box ₹ ceiling, and it cannot be " +
+          "disabled while BOX_EXECUTION_MODE=live. It is the ONLY monetary containment on a single " +
+          "Box: the two quantity ceilings bound LOTS, and a Box can satisfy both while still " +
+          "committing an arbitrary rupee amount, because notional is price × quantity. Set it to the " +
+          "largest amount one Box may commit — for a one-lot NIFTY test, 100000 is a reasonable " +
+          "starting figure. Startup is refused rather than trading with no ₹ ceiling.",
+      );
+    }
+  }
+
   return {
     executionMode: mode,
     simulatedDecisionMs: num("BOX_SIMULATED_DECISION_MS", 40),

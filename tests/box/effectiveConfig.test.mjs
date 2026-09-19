@@ -147,7 +147,14 @@ test("DEFAULT config is paper, live disabled, and reports NOT armed", () => {
 
 test("live is 'armed' on the surface ONLY when BOTH switches are set", () => {
   assert.equal(
-    resolveEffectiveConfig({ BOX_EXECUTION_MODE: "live", BOX_LIVE_TRADING_ENABLED: "true" }).liveTradingArmed,
+    resolveEffectiveConfig({
+      BOX_EXECUTION_MODE: "live",
+      BOX_LIVE_TRADING_ENABLED: "true",
+      // Required for a live resolution to load at all: the per-Box ₹ ceiling is the only monetary
+      // containment and `loadBoxConfig` refuses it disabled in live. Immaterial to what this test
+      // asserts (that `liveTradingArmed` needs BOTH switches), so it is supplied rather than tested.
+      BOX_LIVE_MAX_BOX_CAPITAL_RUPEES: "100000",
+    }).liveTradingArmed,
     true,
   );
   // Kill switch on but mode still paper → not armed (and would not place a live order).

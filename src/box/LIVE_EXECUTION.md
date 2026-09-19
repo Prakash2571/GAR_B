@@ -11,7 +11,9 @@ BOX_EXECUTION_MODE=live
 BOX_LIVE_TRADING_ENABLED=true
 ```
 
-`BOX_EXECUTION_MODE` defaults to `paper_latency`; `BOX_LIVE_TRADING_ENABLED` defaults to `false`. Unknown execution modes fail during configuration instead of falling back to paper. Live startup also requires a ready Box Mongo connection, `KITE_API_KEY`, and a current restored Kite access-token session. Paper profiles cannot reach broker mutations even if credentials are present: no live manager/adapter is constructed, and poison-adapter regressions fail on any accidental mutation.
+`BOX_EXECUTION_MODE` defaults to `paper_latency`; `BOX_LIVE_TRADING_ENABLED` defaults to `false`. Unknown execution modes fail during configuration instead of falling back to paper. Live startup also requires a ready Box Mongo connection, `KITE_API_KEY`, and a current restored Kite access-token session.
+
+Live additionally requires `BOX_LIVE_MAX_BOX_CAPITAL_RUPEES` to name a positive rupee figure. Unset and `0` both mean "no ceiling" for that variable, so `loadBoxConfig()` refuses either while the mode is `live`: it is the only *monetary* containment on a single Box, and the two quantity ceilings are not a substitute because they bound lots, and a Box can satisfy both while committing an arbitrary rupee amount — notional is price × quantity, and neither cap constrains price. Paper is untouched, where the equivalent `BOX_PAPER_MAX_BOX_CAPITAL_RUPEES=0` costs nothing. Paper profiles cannot reach broker mutations even if credentials are present: no live manager/adapter is constructed, and poison-adapter regressions fail on any accidental mutation.
 
 Every process start resets these in-memory runtime controls to `false`:
 
