@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "box-metric-ring.schema.json",
+  "title": "Rolling metric ring summary",
+  "description": "Source: src/box/metrics.ts Ring.summary(). NULL until the ring has a sample: summary() returns null while filled === 0, so a consumer must treat null as 'not measured yet' and never as zero — a p95 of null is an absence, and rendering it as 0 would invent a measurement. Every percentile is independently nullable. OPEN like the rest of this contract: `required` already catches a dropped or renamed percentile, which is the drift that breaks a consumer, whereas an ADDED percentile breaks nobody — so adding one must not need a contract bump.",
+  "type": ["object", "null"],
+  "additionalProperties": true,
+  "required": ["samples", "count", "last", "mean", "p50", "p95", "p99", "max"],
+  "properties": {
+    "samples": { "type": "number" },
+    "count": { "type": "number" },
+    "last": { "type": ["number", "null"] },
+    "mean": { "type": ["number", "null"] },
+    "p50": { "type": ["number", "null"] },
+    "p95": { "type": ["number", "null"] },
+    "p99": { "type": ["number", "null"] },
+    "max": { "type": ["number", "null"] }
+  }
+}

@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "box-metrics.schema.json",
+  "title": "Box rolling metrics snapshot",
+  "description": "Source: src/box/metrics.ts BoxMetrics.snapshot(). Declared here because the frontend's BoxExecutionHealth panel RENDERS FROM these field names, and until this schema existed `metrics` was an open object in box-status.schema.json, so a rename on the backend could not be caught by anything: the digest did not cover the interior, the frontend hand-maintains its own BoxMetricsSnapshot declaration in src/api/types.ts, and the panel would simply have gone blank in production. OPEN at every level (additionalProperties true) so the engine can keep adding rings and counters without a contract bump — the purpose here is to pin the names a consumer depends on, NOT to freeze an engine-owned payload. `latency`, `throughput` and `charges` are therefore deliberately unlisted. Anything named in a `required` array below is load-bearing for the UI: renaming or dropping it must be a deliberate, version-bumped contract change.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["execution", "legging"],
+  "properties": {
+    "execution": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "attempted",
+        "completed",
+        "successful",
+        "partial_recovered",
+        "partial_unresolved",
+        "failed",
+        "aborted",
+        "retries",
+        "success_rate",
+        "failure_rate",
+        "rejection_categories",
+        "decision_deterioration",
+        "execution_slippage",
+        "exit_slippage",
+        "latency"
+      ],
+      "properties": {
+        "attempted": { "type": "number" },
+        "completed": { "type": "number" },
+        "successful": { "type": "number" },
+        "partial_recovered": { "type": "number" },
+        "partial_unresolved": { "type": "number" },
+        "failed": { "type": "number" },
+        "aborted": { "type": "number" },
+        "retries": { "type": "number" },
+        "success_rate": { "type": "number" },
+        "failure_rate": { "type": "number" },
+        "rejection_categories": {
+          "type": "object",
+          "additionalProperties": { "type": "number" }
+        },
+        "decision_deterioration": { "$ref": "box-metric-ring.schema.json" },
+        "execution_slippage": { "$ref": "box-metric-ring.schema.json" },
+        "exit_slippage": { "$ref": "box-metric-ring.schema.json" },
+        "latency": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": ["detection_to_fill_ms"],
+          "properties": {
+            "detection_to_fill_ms": { "$ref": "box-metric-ring.schema.json" }
+          }
+        }
+      }
+    },
+    "legging": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "outcomes",
+        "fill_rate_4_of_4",
+        "failure_rate_3_of_4",
+        "failure_rate_2_of_4",
+        "failure_rate_1_of_4",
+        "legging_net_loss",
+        "first_to_last_fill_ms",
+        "most_failing_role",
+        "expected_vs_realised_net"
+      ],
+      "properties": {
+        "outcomes": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": ["total", "aborts"],
+          "properties": {
+            "total": { "type": "number" },
+            "aborts": { "type": "number" }
+          }
+        },
+        "fill_rate_4_of_4": { "type": "number" },
+        "failure_rate_3_of_4": { "type": "number" },
+        "failure_rate_2_of_4": { "type": "number" },
+        "failure_rate_1_of_4": { "type": "number" },
+        "legging_net_loss": { "$ref": "box-metric-ring.schema.json" },
+        "first_to_last_fill_ms": { "$ref": "box-metric-ring.schema.json" },
+        "most_failing_role": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["role", "count"],
+          "properties": {
+            "role": { "type": "string" },
+            "count": { "type": "number" }
+          }
+        },
+        "expected_vs_realised_net": { "$ref": "box-metric-ring.schema.json" }
+      }
+    }
+  }
+}
