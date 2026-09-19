@@ -120,6 +120,31 @@ test("the audit indexes the two questions actually asked of it", async () => {
 
 /* ═════════════════ 2. The constraints reject what they claim to ═════════════════ */
 
+test("the exactly-one-value constraint exists on THIS schema's table", async () => {
+  /*
+   * Asserted directly against the catalog, scoped by `conrelid`, BEFORE the behavioural test below.
+   *
+   * This is the regression guard for the defect migration 014 repairs. Migration 013 guarded its
+   * `ALTER TABLE ... ADD CONSTRAINT` with `SELECT 1 FROM pg_constraint WHERE conname = ...`, and
+   * `pg_constraint` is cluster-wide — so another test file's schema (this harness gives every file its
+   * own) satisfied the guard and the constraint was silently skipped here. The behavioural test then
+   * failed on `main` having passed on the branch, because the outcome depended on which file ran first.
+   *
+   * Checking the catalog by `conrelid` says "MY table has it" rather than "something somewhere is
+   * called that", and it fails with a clear cause instead of as a missing rejection.
+   */
+  const { rows } = await sql(
+    `SELECT conname FROM pg_constraint
+      WHERE conname = 'box_settings_exactly_one_value'
+        AND conrelid = 'box_settings'::regclass`,
+  );
+  assert.equal(
+    rows.length,
+    1,
+    "box_settings_exactly_one_value is missing from this schema — the migration's existence guard matched another schema's constraint",
+  );
+});
+
 test("a settings row must carry EXACTLY ONE of value / value_json", async () => {
   // Both set — a row that disagrees with itself.
   await assert.rejects(
