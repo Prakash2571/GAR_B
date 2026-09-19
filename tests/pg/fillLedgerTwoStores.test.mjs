@@ -91,6 +91,11 @@ const limits = () => ({
   dailyLossLimit: 1_000_000, rejectLimit: 100, consecutiveFailureLimit: 100,
   maxOpenLegQuantity: 1_000, maxGrossOpenLegQuantity: 10_000,
   reconcileIntervalMs: 60_000, feedReconnectWarmupMs: 0,
+  // This fixture's broker dep is zerodha, so the static-IP ENTRY policy applies to it. Supplied as
+  // confirmed because these cases are about the overfill tripwire and the fill projection agreeing —
+  // not about the operator-confirmation gate, which has its own suite. Omitting it silently refused
+  // the submit, so the breaker never tripped and the test failed for an unrelated reason.
+  zerodhaEntryStaticIpConfirmed: true,
 });
 
 /** Build a fresh manager + real consumer against a fresh PG schema. Returns a disposer too. */

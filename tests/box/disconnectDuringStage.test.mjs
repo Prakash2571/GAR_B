@@ -50,6 +50,10 @@ const LIMITS = {
   maxGrossOpenLegQuantity: 10_000,
   reconcileIntervalMs: 60_000,
   feedReconnectWarmupMs: 0,
+  // The broker dep here is zerodha, so the static-IP ENTRY policy applies. Supplied as confirmed
+  // because this fixture is about stream disconnection during a staged entry, not about the
+  // operator-confirmation gate (which has its own suite).
+  zerodhaEntryStaticIpConfirmed: true,
   maxBoxCapitalRupees: 0,
 };
 

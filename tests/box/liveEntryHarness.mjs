@@ -174,6 +174,11 @@ const limits = (overrides = {}) => ({
   maxGrossOpenLegQuantity: 10_000,
   reconcileIntervalMs: 60_000,
   feedReconnectWarmupMs: 0,
+  // This shared harness runs with a zerodha broker dep, so the static-IP ENTRY policy applies to
+  // every suite built on it. Supplied as confirmed: those suites exercise the live entry pipeline
+  // itself, and the operator-confirmation gate is covered separately in
+  // tests/invariants/zerodhaStaticIpEntryGate.test.mjs.
+  zerodhaEntryStaticIpConfirmed: true,
   maxBoxCapitalRupees: 0,
   ...overrides,
 });
