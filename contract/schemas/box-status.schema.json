@@ -460,8 +460,8 @@
       "type": "object"
     },
     "metrics": {
-      "$comment": "OPEN by design: engine-owned rolling latency/slippage/throughput rings.",
-      "type": "object"
+      "$comment": "Still OPEN at every level for engine-owned rings and counters, but the field names the frontend renders from are now pinned. See box-metrics.schema.json for why an open object was not sufficient.",
+      "$ref": "box-metrics.schema.json"
     },
     "last_error": {
       "type": [
