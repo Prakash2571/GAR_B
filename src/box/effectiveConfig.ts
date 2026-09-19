@@ -131,7 +131,7 @@ const KNOBS: readonly KnobSpec[] = [
   { key: "liveMaxOpenBoxes", envVar: "BOX_LIVE_MAX_OPEN_BOXES", kind: "int", default: 1, min: 0, max: 20 },
   { key: "liveMaxConcurrentExecutions", envVar: "BOX_LIVE_MAX_CONCURRENT_EXECUTIONS", kind: "int", default: 1, min: 1, max: 4 },
   { key: "liveEntrySubmitConcurrency", envVar: "BOX_LIVE_ENTRY_SUBMIT_CONCURRENCY", kind: "int", default: 1, min: 1, max: 4 },
-  { key: "liveMaxResidualLegs", envVar: "BOX_LIVE_MAX_RESIDUAL_LEGS", kind: "int", default: 1, min: 0, max: 4 },
+  { key: "liveMaxResidualLegs", envVar: "BOX_LIVE_MAX_RESIDUAL_LEGS", kind: "int", default: 1, min: 0, max: 4, strict: true },
   { key: "oneActiveBoxPerUnderlying", envVar: "BOX_ONE_ACTIVE_BOX_PER_UNDERLYING", kind: "bool", default: false },
   { key: "sessionMaxCompletedTrades", envVar: "BOX_SESSION_MAX_COMPLETED_TRADES", kind: "int", default: 0, min: 0, max: 10_000, strict: true },
   // The attempt ceiling was MISSING from this table while the trade ceiling beside it was present.
@@ -140,7 +140,7 @@ const KNOBS: readonly KnobSpec[] = [
   // configured for one trade can otherwise submit orders indefinitely so long as none completes.
   // Its absence also meant the effective-config drift test could not cover it.
   { key: "sessionMaxEntryAttempts", envVar: "BOX_SESSION_MAX_ENTRY_ATTEMPTS", kind: "int", default: 0, min: 0, max: 10_000, strict: true },
-  { key: "maxConcurrentPerUnderlying", envVar: "BOX_MAX_CONCURRENT_PER_UNDERLYING", kind: "int", default: 2, min: 0, max: 16 },
+  { key: "maxConcurrentPerUnderlying", envVar: "BOX_MAX_CONCURRENT_PER_UNDERLYING", kind: "int", default: 2, min: 0, max: 16, strict: true },
 
   // ---- Quantity envelope ----
   { key: "liveMaxOpenLegQuantity", envVar: "BOX_LIVE_MAX_OPEN_LEG_QUANTITY", kind: "int", default: 100, min: 1, max: 1_000_000, strict: true },
@@ -336,7 +336,18 @@ export function resolveEffectiveConfig(
     precedence: [
       "1. code default (src/box/config.ts)",
       "2. process environment (.env / PM2 env) — HIGHER wins",
-      "note: out-of-range env values are CLAMPED; unparseable env values FALL BACK to default",
+      /*
+       * This note used to read "out-of-range env values are CLAMPED; unparseable env values FALL
+       * BACK to default" without qualification, which is the opposite of what happens for every
+       * knob marked `strict` — and those are precisely the containment limits an operator reading
+       * this surface most needs to be right about. A diagnostics surface that misdescribes the
+       * loader is how a wrong belief about what is enforced gets established.
+       */
+      "note: CONTAINMENT limits (session budgets, live size/capital caps, residual tolerance, " +
+        "per-underlying concurrency, universe cap, strike level) REFUSE an explicitly-set invalid " +
+        "value — the process does not boot, so this report cannot be produced for one",
+      "note: for all other knobs an out-of-range env value is CLAMPED and an unparseable one FALLS " +
+        "BACK to the code default",
       "note: runtime operator API controls (arming) are a separate session permission plane, not shown here",
     ],
     liveTradingArmed: cfg.executionMode === "live" && cfg.liveTradingEnabled === true,

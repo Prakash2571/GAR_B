@@ -1305,7 +1305,9 @@ export function loadBoxConfig(): BoxConfig {
     // 5s: comfortably longer than a round trip, so an ambiguous terminal state stays
     // protected, but short enough that a crashed process frees contracts quickly.
     instrumentLockTtlMs: clampInt("BOX_INSTRUMENT_LOCK_TTL_MS", 5_000, 250, 60_000),
-    maxConcurrentPerUnderlying: clampInt("BOX_MAX_CONCURRENT_PER_UNDERLYING", 2, 0, 16),
+    /* Per-underlying concurrency is a containment limit, so a malformed value is refused rather
+       than resolved to the default. The `0` sentinel's existing meaning is left exactly as it was. */
+    maxConcurrentPerUnderlying: strictLimitInt("BOX_MAX_CONCURRENT_PER_UNDERLYING", 2, 0, 16),
     /**
      * THE MODE-INDEPENDENT INVENTORY CEILING: how many Boxes may be held AT ONCE, in total.
      *
@@ -1435,7 +1437,10 @@ export function loadBoxConfig(): BoxConfig {
     liveFeedReconnectWarmupMs: clampInt("BOX_LIVE_FEED_RECONNECT_WARMUP_MS", 5_000, 0, 5 * 60_000),
     liveMaxOpenBoxes: clampInt("BOX_LIVE_MAX_OPEN_BOXES", 1, 0, 20),
     liveMaxConcurrentExecutions: clampInt("BOX_LIVE_MAX_CONCURRENT_EXECUTIONS", 1, 1, 4),
-    liveMaxResidualLegs: clampInt("BOX_LIVE_MAX_RESIDUAL_LEGS", 1, 0, 4),
+    /* A containment limit on how much unresolved one-sided exposure may exist before entry stops.
+       `clampInt` silently resolved "abc" to 1 and "9" to 4; both are now refused. `0` still means
+       "tolerate none" — the comparison against it is strictly `>` and is not changed here. */
+    liveMaxResidualLegs: strictLimitInt("BOX_LIVE_MAX_RESIDUAL_LEGS", 1, 0, 4),
     liveDailyLossLimit: strictLimitInt("BOX_LIVE_DAILY_LOSS_LIMIT", 5_000, 0, 10_000_000),
     liveRejectLimit: clampInt("BOX_LIVE_REJECT_LIMIT", 3, 1, 100),
     liveConsecutiveFailureLimit: clampInt("BOX_LIVE_CONSECUTIVE_FAILURE_LIMIT", 3, 1, 100),
@@ -1585,7 +1590,16 @@ export function loadBoxConfig(): BoxConfig {
     underlyingMaxAgeMs: num("BOX_UNDERLYING_MAX_AGE_MS", 10_000),
 
     strikesEachSide: 3,
-    defaultStrikeLevel: clampStrikeLevel(num("BOX_STRIKE_LEVEL", 3)),
+    /*
+     * `clampStrikeLevel(num(...))` resolved BOTH a typo and an out-of-range value to 3 — the WIDEST
+     * candidate set, three strikes each side. An operator narrowing a first live test to ATM±1 who
+     * typed `BOX_STRIKE_LEVEL=one` got the widest scan instead of the narrowest, silently.
+     *
+     * `strictLimitInt` refuses an explicitly-set invalid value; `clampStrikeLevel` is retained
+     * around it only to narrow the type to `1 | 2 | 3` (it is a no-op now that the input is proven
+     * to be in range, and is still needed for the runtime-tuning path that does not come from env).
+     */
+    defaultStrikeLevel: clampStrikeLevel(strictLimitInt("BOX_STRIKE_LEVEL", 3, 1, 3)),
     atmHysteresis: num("BOX_ATM_HYSTERESIS", 0.15),
     windowMinIntervalMs: num("BOX_WINDOW_MIN_INTERVAL_MS", 15_000),
     enableShortBox: strictBool("BOX_ENABLE_SHORT_BOX", true),
@@ -1609,7 +1623,28 @@ export function loadBoxConfig(): BoxConfig {
     // minute, comparable to what a running scanner already costs.
     indicativeMaxUnderlyings: num("BOX_INDICATIVE_MAX_UNDERLYINGS", 150),
     maxSubscribedTokens: num("BOX_MAX_SUBSCRIBED_TOKENS", 2200),
-    maxUnderlyings: num("BOX_MAX_UNDERLYINGS", 0),
+    /*
+     * THE UNIVERSE CAP, AND WHY `num()` WAS THE WRONG PARSER FOR IT.
+     *
+     * `num()` applies no bounds whatsoever: it returns the fallback on NaN and otherwise passes the
+     * number straight through. For a cap whose fallback is `0` AND where `0` means UNLIMITED, that
+     * made every kind of typo resolve to the most permissive value available, and two more besides:
+     *
+     *     BOX_MAX_UNDERLYINGS="abc"  -> NaN -> fallback 0  -> UNLIMITED
+     *     BOX_MAX_UNDERLYINGS="-4"   -> -4                 -> a NEGATIVE cap reached the engine
+     *     BOX_MAX_UNDERLYINGS="1.7"  -> 1.7                -> a FRACTIONAL cap reached the engine
+     *
+     * An operator restricting a supervised trial to one underlying who fat-fingers the value got an
+     * unbounded universe, and nothing said so. That is the same fail-open shape `strictLimitInt`
+     * was written for, so this now uses it.
+     *
+     * `0` STILL MEANS UNLIMITED — the sentinel is deliberately unchanged here (min is 0, so an
+     * explicit `0` remains valid). This commit makes a MALFORMED value fatal; it does not
+     * reinterpret a well-formed one. The upper bound is deliberately generous: the whole F&O
+     * universe is a few hundred names, so 1000 cannot refuse a legitimate configuration and exists
+     * only to catch garbage that happens to parse as a number.
+     */
+    maxUnderlyings: strictLimitInt("BOX_MAX_UNDERLYINGS", 0, 0, 1_000),
     chargeCacheTtlMs: num("BOX_CHARGE_CACHE_TTL_MS", 30_000),
     chargeConcurrency: num("BOX_CHARGE_CONCURRENCY", 3),
     maxPublishedOpportunities: num("BOX_MAX_PUBLISHED_OPPORTUNITIES", 60),

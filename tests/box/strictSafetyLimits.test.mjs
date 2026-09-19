@@ -139,7 +139,33 @@ test("C8: the quantity caps accept a real one-lot configuration", () => {
 });
 
 test("C9: unrelated lenient parsing is UNCHANGED — this fix is scoped", () => {
-  // `BOX_MAX_UNDERLYINGS` legitimately uses 0 for "unbounded universe" and is not a live-risk
-  // containment limit; widening the strict treatment to every knob was explicitly out of scope.
-  assert.doesNotThrow(() => withEnv({ BOX_MAX_UNDERLYINGS: "not-a-number" }, () => loadBoxConfig()));
+  /*
+   * SCOPE IS STILL THE POINT, BUT THE EXAMPLE HAD TO MOVE.
+   *
+   * This case used to assert that `BOX_MAX_UNDERLYINGS="not-a-number"` does NOT throw, on the
+   * grounds that it "is not a live-risk containment limit". That reasoning has since been
+   * contradicted by the deployment profile that depends on it: `FINAL-one-box-live.env.template`
+   * lists the variable under a "⚠ SILENTLY FALL BACK **LOOSER**" heading and describes the outcome
+   * of a typo as "NO CAP AT ALL; we ask 1". A knob whose own template says a typo removes the cap
+   * entirely is a containment limit, whatever it was classified as when that patch was scoped — and
+   * `num()` gave it no bounds at all, so `-4` and `1.7` also reached the engine unaltered.
+   *
+   * It is now parsed by `strictLimitInt` (see tests/invariants/malformedRiskConfigFailsBoot.test.mjs),
+   * with the `0`-means-unlimited sentinel deliberately preserved.
+   *
+   * The scoping principle this case exists to protect is unchanged, so it is re-pointed at a knob
+   * that genuinely is ordinary tuning rather than containment: `BOX_ATM_HYSTERESIS` selects which
+   * strike counts as at-the-money. A bad value there cannot widen a risk envelope, so it still
+   * falls back quietly instead of refusing to boot.
+   */
+  assert.doesNotThrow(() => withEnv({ BOX_ATM_HYSTERESIS: "not-a-number" }, () => loadBoxConfig()));
+  const lenient = withEnv({ BOX_ATM_HYSTERESIS: "not-a-number" }, () => loadBoxConfig());
+  assert.equal(lenient.atmHysteresis, 0.15, "an unparseable tuning value falls back to its default");
+
+  // And the promotion is real: the same shape of input on the containment limit is now refused.
+  assert.throws(
+    () => withEnv({ BOX_MAX_UNDERLYINGS: "not-a-number" }, () => loadBoxConfig()),
+    /BOX_MAX_UNDERLYINGS/,
+    "the universe cap is a containment limit and no longer resolves a typo to 'no cap at all'",
+  );
 });
