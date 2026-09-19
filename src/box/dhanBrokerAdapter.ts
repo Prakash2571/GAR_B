@@ -41,8 +41,8 @@ import {
   assertBoundedLimit,
   BrokerAmbiguousSubmitError,
   BrokerDisabledError,
-  BrokerOrderRejectedError,
   BrokerPreSubmitRefusedError,
+  brokerRejectionOutcome,
   isBrokerOrderTerminal,
   type BrokerAdapter,
   type BeforeBrokerPost,
@@ -757,7 +757,13 @@ export class DhanBrokerAdapter implements BrokerAdapter {
           reject_reason: err.message,
           updated_at: Date.now(),
         });
-        throw new BrokerOrderRejectedError(cloneOrder(rejected), err);
+        // ...AND THE MERGE'S VERDICT IS THE ONE THAT TRAVELS. Identical reasoning to Kite's
+        // definitive-rejection path: an unconditional `BrokerOrderRejectedError` here would hand
+        // the gateway a no-exposure certificate for a snapshot the merge just flagged as
+        // contradictory, and recovery would unwind the hedges protecting it. This is also the
+        // rule Dhan's own post-place verification path already applied below ("a REJECTED label
+        // with a verified ZERO fill"), now shared rather than re-stated.
+        throw brokerRejectionOutcome(cloneOrder(rejected), err);
       }
 
       // AMBIGUOUS. The order may be live. Reconcile by correlation id — never
@@ -831,7 +837,9 @@ export class DhanBrokerAdapter implements BrokerAdapter {
         // OBSERVED filled quantity, so a "CANCELLED with a nonzero fill" surfaces as a real
         // partial and a "TRADED with a short fill" as PARTIALLY_FILLED rather than COMPLETE.
         if (verified.state === "REJECTED") {
-          throw new BrokerOrderRejectedError(cloneOrder(verified), placed);
+          // Through the shared guard, so a REJECTED read that somehow still carries a fill cannot
+          // become a no-exposure certificate here either.
+          throw brokerRejectionOutcome(cloneOrder(verified), placed);
         }
         return this.waitForResolution(req.client_order_id, verified);
       }
@@ -839,7 +847,10 @@ export class DhanBrokerAdapter implements BrokerAdapter {
       // exposure, so it is safe to accept as a rejection — but only once the read has CONFIRMED
       // the zero, not merely inferred it from the label.
       if (verified && verified.state === "REJECTED" && verified.filled_quantity === 0) {
-        throw new BrokerOrderRejectedError(cloneOrder(verified), placed);
+        // The pre-existing zero check is kept as the branch CONDITION (it decides whether this is
+        // the "accept the rejection" case at all) and the shared guard re-proves it on the way out,
+        // so this site and the definitive-4xx site above cannot drift apart again.
+        throw brokerRejectionOutcome(cloneOrder(verified), placed);
       }
       // EVIDENCE NOT YET VISIBLE: the read SUCCEEDED and PROJECTED a genuine working state (the
       // trade has not propagated to the order book yet). This is the "keep waiting" case, NOT the

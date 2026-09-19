@@ -7,6 +7,7 @@ import {
   BrokerPreSubmitRefusedError,
   boxClientOrderId,
   isBrokerOrderTerminal,
+  verifyZeroBrokerExposure,
 } from "./brokerAdapter.js";
 import {
   planPartialEntryRecovery,
@@ -707,9 +708,26 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
      * broker itself said the order does not exist). Every other rejection — a transport fault, a
      * database failure while recording, an error type nobody has thought of yet — leaves the outcome
      * unproven, and unproven must mean uncertain.
+     *
+     * AND THE TYPE ALONE IS NOT THE PROOF — THE SNAPSHOT IS.
+     *
+     * `BrokerOrderRejectedError`'s contract is "the broker said the order does not exist", but a
+     * placement POST can be definitively rejected AFTER an order update has already reported a
+     * positive cumulative fill for the same client order id. The adapters merge those two
+     * observations, and `mergeBrokerOrderSnapshot` deliberately refuses to pick a side: the result
+     * is RECONCILIATION_REQUIRED with the fill PRESERVED. Accepting the error type as a certificate
+     * therefore threw away the one piece of evidence that mattered — `entryLegOutcomes` reported the
+     * disputed leg as never submitted, and `planPartialEntryRecovery` unwound the CONFIRMED BUY
+     * hedges that may still have been protecting its real short.
+     *
+     * So the rejection is re-verified here against the snapshot it carries. The adapters already
+     * route contradictions into the uncertainty channel, which makes this branch unreachable from
+     * them today; it stays because this — not the adapter — is the place where "no exposure" is
+     * actually concluded, and a guard belongs at the conclusion.
      */
     const provenNoExposure = (reason: unknown): boolean =>
-      reason instanceof BrokerPreSubmitRefusedError || reason instanceof BrokerOrderRejectedError;
+      reason instanceof BrokerPreSubmitRefusedError
+      || (reason instanceof BrokerOrderRejectedError && verifyZeroBrokerExposure(reason.order).proven);
     const uncertain = settled.some((item) => item.status === "rejected" && !provenNoExposure(item.reason)) ||
       settled.some((item) => item.status === "rejected" &&
       (item.reason instanceof OrderPersistenceAfterFillError ||
@@ -731,7 +749,36 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
       orders.some((order) => order.state === "UNKNOWN" || order.state === "RECONCILIATION_REQUIRED");
     if (uncertain) {
       manager.invariantViolation(`live entry ${attemptId} has uncertain broker terminal quantity`);
-      return liveEntryFailure(args.candidate, args.detection.at, submittedAt, orders, "legging_incomplete", "broker terminal quantity is uncertain; entry quarantined", this.deps.cfg, tradeId);
+      /*
+       * LABELLED `QUARANTINED_UNKNOWN`, BECAUSE AN UNLABELLED QUARANTINE IS REPORTED AS AN UNWIND.
+       *
+       * This branch returned with `legging.outcome_class` left UNDEFINED. The funnel does not treat
+       * that as "unknown": `engine.ts` infers a class from the leg counts, and for a quarantine with
+       * one or more confirmed fills the inference is `PARTIAL_ENTRY_UNWOUND`. So an attempt that was
+       * quarantined WITHOUT unwinding anything — exposure still live at the broker, awaiting
+       * reconciliation — was published to the operator and to `submittedFailureByReason` as exposure
+       * that had been protectively reversed. That is a claim of risk reduction which never happened,
+       * and it is the opposite of what an operator must be told here.
+       *
+       * The plan-level quarantine below already stamps this class; this, the EARLIER and now the
+       * primary quarantine gate, must stamp it too or the two disagree about the same situation.
+       */
+      const disputed = orders.filter(
+        (order) => order.state === "UNKNOWN" || order.state === "RECONCILIATION_REQUIRED",
+      );
+      // Named legs and quantities, so the operator knows WHAT to reconcile at the broker rather
+      // than only that something is wrong.
+      const detail = disputed.length > 0
+        ? `broker terminal quantity is uncertain; entry quarantined and NOTHING was unwound. ` +
+          `Reconcile at the broker: ${disputed
+            .map((order) => `${order.role} ${order.side} state=${order.state} ` +
+              `cumulative_filled=${order.filled_quantity} broker_order_id=${order.broker_order_id ?? "unknown"}` +
+              `${order.reject_reason ? ` (${order.reject_reason})` : ""}`)
+            .join("; ")}`
+        : "broker terminal quantity is uncertain; entry quarantined and NOTHING was unwound";
+      const quarantined = liveEntryFailure(args.candidate, args.detection.at, submittedAt, orders, "legging_incomplete", detail, this.deps.cfg, tradeId);
+      quarantined.legging.outcome_class = "QUARANTINED_UNKNOWN";
+      return quarantined;
     }
 
     // `>=`, not `===`. A broker reporting MORE filled than requested is an anomaly, but it is an
@@ -1570,8 +1617,16 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
       }
       // A KNOWN broker refusal. It is terminal broker truth, but policy retains this durable
       // identity rather than manufacturing a fresh reduction order automatically.
+      //
+      // VERIFIED, not assumed. A refusal that contradicts an observed fill is not terminal truth
+      // about this reduction order: reporting `broker_rejected` would tell the operator the flatten
+      // simply did not go through, when in fact part of it may have. It is reported as an unknown
+      // broker state instead — the same classification an ambiguous submit gets below — so the
+      // identity is retained and reconciled rather than written off.
       if (error instanceof BrokerOrderRejectedError) {
-        return fail("broker_rejected", errorMessage(error), error.order);
+        return verifyZeroBrokerExposure(error.order).proven
+          ? fail("broker_rejected", errorMessage(error), error.order)
+          : fail("broker_state_unknown", errorMessage(error), error.order);
       }
       // An ambiguous submission may or may not exist at the broker. NEVER resubmit it under a
       // new identity; keep this one so the durable journal adopts whatever is really there.
@@ -2622,10 +2677,32 @@ function canonicalRoleOrder(orders: BrokerOrder[]): BrokerOrder[] {
   );
 }
 
+/**
+ * Harvest every snapshot that carries EVIDENCE, so the caller's uncertainty test and
+ * `entryLegOutcomes` can both see it.
+ *
+ * WHY A REJECTION'S SNAPSHOT IS NOW HARVESTED TOO — but only when it fails to prove zero exposure.
+ * The `orders.some(state === "RECONCILIATION_REQUIRED")` clause in the caller is the backstop that
+ * should have caught a contradicted rejection, and it could not fire for a snapshot that was never
+ * added to `orders`. Surfacing it makes the contradiction visible both there and to
+ * `entryLegOutcomes`, which then reports `brokerStateKnown: false` and drives
+ * `planPartialEntryRecovery` to `quarantine_unknown` instead of an unwind.
+ *
+ * A rejection that DOES prove zero exposure is deliberately still omitted. Its snapshot carries no
+ * exposure to account for, and admitting it would change `orders.length`, `fullyFilled` and the
+ * residual arithmetic for the ordinary, correct case — behaviour that is relied on today. "Absent"
+ * continues to mean "proven to carry no exposure"; what changed is that the proof is now required.
+ */
 function ordersFromSettled(results: PromiseSettledResult<BrokerOrder>[]): BrokerOrder[] {
   return results.flatMap((result) => {
     if (result.status === "fulfilled") return [result.value];
     if (result.reason instanceof BrokerAmbiguousSubmitError && result.reason.order) {
+      return [result.reason.order];
+    }
+    if (
+      result.reason instanceof BrokerOrderRejectedError
+      && !verifyZeroBrokerExposure(result.reason.order).proven
+    ) {
       return [result.reason.order];
     }
     return result.reason instanceof OrderPersistenceAfterFillError

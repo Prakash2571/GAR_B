@@ -2,9 +2,9 @@ import {
   BrokerAmbiguousSubmitError,
   BrokerCancelNotTransmittedError,
   BrokerDisabledError,
-  BrokerOrderRejectedError,
   BrokerPreSubmitRefusedError,
   assertBoundedLimit,
+  brokerRejectionOutcome,
   isBrokerOrderTerminal,
   type BrokerAdapter,
   type BeforeBrokerPost,
@@ -723,7 +723,20 @@ export class KiteBrokerAdapter implements BrokerAdapter {
         reject_reason: errorMessage(error),
         updated_at: this.clock.now(),
       });
-      throw new BrokerOrderRejectedError(clone(rejected), error);
+      // ...AND THE MERGE'S VERDICT IS THE ONE THAT TRAVELS.
+      //
+      // Routing the contradiction to RECONCILIATION_REQUIRED above was only half the job: this
+      // throw used to be an unconditional `BrokerOrderRejectedError`, which the gateway accepts as
+      // PROOF that no exposure exists. So the merge carefully preserved the fill and the very next
+      // line told everyone downstream to ignore it, and partial-entry recovery unwound the
+      // confirmed hedges protecting a leg that may really be short. `brokerRejectionOutcome`
+      // re-reads the merged snapshot and only issues the no-exposure certificate when the snapshot
+      // actually proves it; otherwise the same snapshot travels as a contradicted rejection.
+      //
+      // Note this window is NOT stream-only: the order map is also mutated while a POST is in
+      // flight by `refresh`/`getOrder`, `listOrders`, tag reconciliation, and the REST observations
+      // OrderManager feeds back through `applyOrderUpdate`.
+      throw brokerRejectionOutcome(clone(rejected), error);
     }
 
     // THE ACK-OVERWRITES-FILL WINDOW. `order` was created before the POST. A postback for this

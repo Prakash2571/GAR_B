@@ -5,6 +5,7 @@ import {
   BrokerOrderRejectedError,
   BrokerPreSubmitRefusedError,
   isBrokerOrderTerminal,
+  verifyZeroBrokerExposure,
   type BrokerAdapter,
   type BrokerOrder,
   type BrokerOrderRequest,
@@ -2961,7 +2962,20 @@ export class BoxOrderManager {
           action.reject(error);
           return;
         }
-        if (error instanceof BrokerOrderRejectedError) {
+        /*
+         * IS THIS REJECTION ACTUALLY PROOF THAT NOTHING EXECUTED?
+         *
+         * Computed ONCE, before the branches, because two branches below have to agree about it and
+         * an `instanceof` test in each is exactly how they would drift. The adapters now route a
+         * contradicted rejection through `BrokerRejectionContradictedError` (a
+         * `BrokerAmbiguousSubmitError`), so in practice such an error never reaches the clean-reject
+         * branch at all. This flag is the defence in depth for a snapshot that reaches us as a bare
+         * `BrokerOrderRejectedError` anyway — from a future call site, or a path nobody has written
+         * yet — so the guard lives at the DECISION, not only at the construction.
+         */
+        const rejectionProvesZeroExposure = error instanceof BrokerOrderRejectedError
+          && verifyZeroBrokerExposure(error.order).proven;
+        if (error instanceof BrokerOrderRejectedError && rejectionProvesZeroExposure) {
           await this.persistOrder(intent, error.order, "broker rejected order");
           this.rejects++;
           this.noteBrokerReject(error.order, errorMessage(error));
@@ -2970,8 +2984,10 @@ export class BoxOrderManager {
           // A REJECTED hedge is a definitive hedge failure: the dependent uncovered SELL legs of
           // this attempt are still parked behind the barrier and must now refuse before POSTing.
           hedgeFailureReason = errorMessage(error);
-          // The reject snapshot is authoritative and terminal — it proves ZERO covering fill,
-          // which is exactly what the ledger must record so the dependent SELL fails closed.
+          // The reject snapshot is authoritative and terminal — and, now that it has been VERIFIED
+          // against `verifyZeroBrokerExposure`, it really does prove ZERO covering fill, which is
+          // what the ledger must record so the dependent SELL fails closed. The claim used to be
+          // asserted by this comment alone while the snapshot could in fact hold a positive fill.
           terminalOrder = error.order;
           action.reject(error);
           return;
@@ -3001,7 +3017,16 @@ export class BoxOrderManager {
           action.reject(error);
           return;
         }
-        if (error instanceof BrokerAmbiguousSubmitError || isTimeoutLike(error) || !(error instanceof BrokerOrderRejectedError)) {
+        /*
+         * `!rejectionProvesZeroExposure` IS LOAD-BEARING, NOT REDUNDANT.
+         *
+         * Without it a bare `BrokerOrderRejectedError` carrying a contradictory snapshot would fail
+         * every clause here (it is not ambiguous, not timeout-like, and IS a
+         * `BrokerOrderRejectedError`) and fall through to the tail below, which transitions the
+         * intent to REJECTED and counts a clean broker reject — re-creating the defect one layer
+         * down from the adapters. An unproven rejection belongs in the uncertainty channel.
+         */
+        if (error instanceof BrokerAmbiguousSubmitError || isTimeoutLike(error) || !(error instanceof BrokerOrderRejectedError) || !rejectionProvesZeroExposure) {
           /*
            * FAILING TO RECORD THE UNCERTAINTY DOES NOT MAKE IT GO AWAY.
            *
@@ -3021,8 +3046,18 @@ export class BoxOrderManager {
            * exist must keep saying so even when we cannot write it down.
            */
           try {
-            if (error instanceof BrokerAmbiguousSubmitError && error.order) {
-              await this.persistOrder(intent, error.order, error.message);
+            // AN ALREADY-OBSERVED FILL IS NEVER SILENTLY DISCARDED. The snapshot is taken from
+            // whichever uncertain type carries one — including a contradicted rejection, whose
+            // positive cumulative quantity is the whole reason it is here. Falling back to a bare
+            // RECONCILIATION_REQUIRED transition for it would drop that quantity from the durable
+            // row and leave the reconciler with less than the adapter already knew.
+            const uncertainOrder = error instanceof BrokerAmbiguousSubmitError
+              ? error.order
+              : error instanceof BrokerOrderRejectedError
+                ? error.order
+                : undefined;
+            if (uncertainOrder) {
+              await this.persistOrder(intent, uncertainOrder, errorMessage(error));
             } else {
               await this.transition(
                 intent,
