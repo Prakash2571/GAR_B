@@ -65,6 +65,12 @@ BOX_LIVE_REQUIRE_STAGE_FUNDING=true
 BOX_LIVE_REQUIRE_FUNDS_COVER=true      # implied by stage funding, but set it explicitly
 # BOX_LIVE_RECOVERY_RESERVE_RUPEES=  # set a real rupee figure; a placeholder is NaN and now refuses at boot
 
+# ── The ₹ ceiling on ONE box: REQUIRED in live, refused at boot if absent ─────
+BOX_LIVE_MAX_BOX_CAPITAL_RUPEES=100000 # EDIT: the most a single box may commit
+#   Unset and 0 both mean "no ceiling", so neither is accepted while the mode is live. The two
+#   quantity ceilings are not a substitute: they bound LOTS, and a box can satisfy both while
+#   committing an arbitrary rupee amount, because notional is price × quantity.
+
 # ── Order streams: observe fills on the fast path ────────────────────────────
 DHAN_ORDER_STREAM_ENABLED=true         # or ZERODHA_ORDER_STREAM_ENABLED
 DHAN_STATIC_IP_EXPECTED=true           # ONLY after the EIP is genuinely whitelisted

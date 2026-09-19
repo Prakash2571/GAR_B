@@ -58,6 +58,15 @@ const LIVE = {
   BOX_LIVE_TRADING_ENABLED: "true",
   BOX_PAPER_EXECUTION_PROFILE: "standard",
   BOX_SHADOW_MODE_ENABLED: "false",
+  // A live boot also requires a per-Box ₹ ceiling. It is the only MONETARY containment — the two
+  // quantity ceilings bound LOTS, and a Box can satisfy both while committing an arbitrary rupee
+  // amount, because notional is price × quantity — so `loadBoxConfig` refuses it disabled in live,
+  // exactly as the quantity ceilings have always refused 0. See `liveCapitalCeiling.test.mjs`.
+  //
+  // Supplied here so the tests below keep testing the COORDINATOR gate rather than tripping an
+  // unrelated refusal. The one test that expects a throw is unaffected either way: the coordinator
+  // refusal is raised earlier in `loadBoxConfig` than this one.
+  BOX_LIVE_MAX_BOX_CAPITAL_RUPEES: "100000",
 };
 
 test("live + BOX_EXECUTION_COORDINATOR_ENABLED=false REFUSES to start", async () => {
