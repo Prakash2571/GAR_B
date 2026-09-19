@@ -293,6 +293,23 @@ jobs:
           NODE_OPTIONS: --import ${{ env.EGRESS_GUARD }}
         run: set -o pipefail; npm run test:contract 2>&1 | tee tests-out/contract.log
 
+      # Operator runtime-configuration suite. The ONLY suite that runs against src/**.ts directly,
+      # under `node --experimental-strip-types` with no build step — which is EVIDENCE that
+      # src/box/operatorConfig/** is free of pg, express, mongodb and every other dependency, rather
+      # than a way around the toolchain. Two of its own tests assert that purity, so if someone adds a
+      # database call to the precedence or policy layer this suite stops working and the build goes red.
+      #
+      # It needs neither PostgreSQL nor MongoDB, but it runs under the armed egress guard like every
+      # other suite and is included in both audits below. It carries the regression tests for the
+      # configuration authority boundary: that a runtime value cannot widen a deployment ceiling, that
+      # a missing row never resolves to 0 (several ceilings read 0 as UNLIMITED), that no credential is
+      # registrable, that the deployment live gates are not runtime-writable, and that no registered
+      # setting is consulted on any risk-reduction path.
+      - name: Operator-config suite (npm run test:operator-config)
+        env:
+          NODE_OPTIONS: --import ${{ env.EGRESS_GUARD }}
+        run: set -o pipefail; npm run test:operator-config 2>&1 | tee tests-out/operator-config.log
+
       # ── The egress-guard marker audit (defence in depth) ───────────────────────────────
       #
       # The runtime guard already fails a suite by THROWING on a non-loopback request. This step is
@@ -305,7 +322,7 @@ jobs:
         run: |
           set -euo pipefail
           fail=0
-          for suite in unit pg projector tokens switch access shutdown readiness contract; do
+          for suite in unit pg projector tokens switch access shutdown readiness contract operator-config; do
             log="tests-out/${suite}.log"
             if [ ! -f "$log" ]; then
               echo "FAIL: ${suite}: no captured log — suite did not run."; fail=1; continue
@@ -345,8 +362,11 @@ jobs:
           # this list: its own owner enforces zero skips within the suite; here we guard the ones
           # that would silently skip specifically because a database is absent.) The readiness suite
           # is DB-INDEPENDENT but is included too: it must never skip and must always run, so a glob
-          # that matched no files (the suite never ran) turns the build RED here as well.
-          db_suites="pg projector tokens switch access readiness contract"
+          # that matched no files (the suite never ran) turns the build RED here as well. The
+          # operator-config suite is included for the same reason: it is DB-independent by design, but
+          # it asserts the configuration authority boundary, and a glob that silently matched nothing
+          # would leave those guarantees unverified while the build stayed green.
+          db_suites="pg projector tokens switch access readiness contract operator-config"
           fail=0
           for suite in $db_suites; do
             log="tests-out/${suite}.log"
