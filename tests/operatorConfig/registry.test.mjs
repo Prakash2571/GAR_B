@@ -72,7 +72,7 @@ test("no known credential name appears in executable registry code", () => {
 });
 
 test("no credential name appears in executable code anywhere in the subsystem", () => {
-  const FILES = ["types.ts", "registry.ts", "precedence.ts", "validate.ts", "policy.ts", "snapshot.ts"];
+  const FILES = ["types.ts", "registry.ts", "precedence.ts", "validate.ts", "policy.ts", "snapshot.ts", "wire.ts"];
   for (const file of FILES) {
     const source = code(repoPath("src", "box", "operatorConfig", file));
     for (const name of secrets.registeredSecretNames()) {
@@ -276,7 +276,7 @@ test("the two legacy box_settings keys keep their existing persisted names", () 
 /* ═════════════════ 5. The modules stay erasable and dependency-free ═════════════════ */
 
 test("operatorConfig modules use erasable TypeScript only", () => {
-  const FILES = ["types.ts", "registry.ts", "precedence.ts", "validate.ts", "policy.ts", "snapshot.ts"];
+  const FILES = ["types.ts", "registry.ts", "precedence.ts", "validate.ts", "policy.ts", "snapshot.ts", "wire.ts"];
   for (const file of FILES) {
     const src = readFileSync(repoPath("src", "box", "operatorConfig", file), "utf8");
     assert.equal(/^\s*(export\s+)?enum\s/m.test(src), false, `${file} uses an enum`);
@@ -289,7 +289,7 @@ test("operatorConfig modules use erasable TypeScript only", () => {
 test("operatorConfig modules import nothing outside their own directory", () => {
   // This is what keeps configuration off the hot path and testable without a toolchain: no pg, no
   // express, no mongodb, and no reach into the engine.
-  const FILES = ["types.ts", "registry.ts", "precedence.ts", "validate.ts", "policy.ts", "snapshot.ts"];
+  const FILES = ["types.ts", "registry.ts", "precedence.ts", "validate.ts", "policy.ts", "snapshot.ts", "wire.ts"];
   for (const file of FILES) {
     const src = readFileSync(repoPath("src", "box", "operatorConfig", file), "utf8");
     for (const m of src.matchAll(/^\s*import\s[^"']*["']([^"']+)["']/gm)) {

@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "operator-config-change.schema.json",
+  "title": "One entry in the operator configuration change history",
+  "description": "Source: the append-only box_settings_audit table (migration 013), projected by src/box/repository.ts. BOTH the configured AND the effective value are recorded before and after, because a deployment ceiling can make those differ and 'I set 150,000' versus '120,000 was enforced' is exactly the distinction an incident review needs. `config_version` links the entry to the configuration snapshot it produced. NO CREDENTIAL IS EVER RECORDED: `actor_role` is an operator ROLE ('full' | 'trade'), never a token, passcode or session identifier, and only settings classified as plain `config` are registrable at all. CLOSED so an added field is caught.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "changed_at",
+    "actor_role",
+    "setting_key",
+    "previous_configured_value",
+    "new_configured_value",
+    "previous_effective_value",
+    "new_effective_value",
+    "mutation_policy",
+    "new_source",
+    "config_version"
+  ],
+  "properties": {
+    "changed_at": { "type": "string", "format": "date-time" },
+    "actor_role": {
+      "type": ["string", "null"],
+      "description": "The operator ROLE that made the change. Never a token, passcode or session identifier."
+    },
+    "setting_key": {
+      "type": "string",
+      "description": "The camelCase domain key, not the environment variable name."
+    },
+    "previous_configured_value": { "type": ["boolean", "number", "string", "null"] },
+    "new_configured_value": { "type": ["boolean", "number", "string", "null"] },
+    "previous_effective_value": {
+      "type": ["boolean", "number", "string", "null"],
+      "description": "What the engine was ENFORCING before the change — not necessarily the previously configured value, because a deployment ceiling may have been clamping it."
+    },
+    "new_effective_value": { "type": ["boolean", "number", "string", "null"] },
+    "mutation_policy": {
+      "enum": [
+        "HOT_SAFE",
+        "TIGHTEN_ONLY_WHILE_ARMED",
+        "FLAT_AND_DISARMED",
+        "NEXT_SESSION",
+        "RESTART_REQUIRED"
+      ],
+      "description": "The policy under which the change was admitted, so the trail explains WHY it was allowed in the state the system was in."
+    },
+    "new_source": {
+      "enum": ["default", "env", "runtime", "runtime_clamped_by_env"],
+      "description": "Provenance of the effective value after the change, so a deployment clamp is visible in the trail rather than inferred."
+    },
+    "session_id": {
+      "type": ["string", "null"],
+      "description": "The armed trading session at the time of the change, when there was one."
+    },
+    "reason": { "type": ["string", "null"] },
+    "config_version": {
+      "type": "number",
+      "description": "The configuration version this change produced."
+    }
+  }
+}

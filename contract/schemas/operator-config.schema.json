@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "operator-config.schema.json",
+  "title": "GET /api/box/operator-config (200) and PATCH /api/box/operator-config (200)",
+  "description": "The authoritative operator runtime configuration. Source: src/box/routes.ts, composed from the immutable snapshot in src/box/operatorConfig/snapshot.ts. A successful PATCH returns this SAME shape, so a client always ends a mutation holding the new authoritative state rather than having to re-read. `version` is the optimistic-concurrency token for the configuration AS A WHOLE: a PATCH echoes the version it believes it is editing and is refused if anything has moved, and the frontend also uses it to DISCARD a stale response that arrives after a newer one. `deployment` is READ-ONLY and env-owned — the four live-capability gates are displayed so an operator can see the deployment's ceiling, and no runtime write can alter them, which is what makes it impossible to turn a paper deployment live from a browser. `state` carries the facts the mutation policies are evaluated against, so the UI can explain a refusal before the operator attempts one. NO SECRET APPEARS ANYWHERE IN THIS PAYLOAD. CLOSED at every level so an added field is caught.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "updated_at", "operator_role", "deployment", "state", "settings", "recent_changes"],
+  "properties": {
+    "version": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Monotonic configuration version. Increments by exactly one per accepted mutation."
+    },
+    "updated_at": { "type": ["string", "null"], "format": "date-time" },
+    "operator_role": {
+      "enum": ["full", "trade", null],
+      "description": "The requesting operator's role, as the BACKEND resolved it from the session cookie. The UI must not infer permission any other way."
+    },
+    "deployment": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Env/deployment-owned capability. READ-ONLY: no field here is writable through any runtime API. Runtime controls may only REMOVE permission beneath this ceiling, never widen it.",
+      "required": [
+        "execution_mode",
+        "live_trading_enabled",
+        "zerodha_live_trading_enabled",
+        "dhan_live_trading_enabled",
+        "shadow_mode_enabled",
+        "execution_coordinator_enabled",
+        "live_capable"
+      ],
+      "properties": {
+        "execution_mode": {
+          "type": "string",
+          "description": "Which execution engine was CONSTRUCTED at startup. Immutable for the life of the process."
+        },
+        "live_trading_enabled": { "type": "boolean" },
+        "zerodha_live_trading_enabled": { "type": "boolean" },
+        "dhan_live_trading_enabled": { "type": "boolean" },
+        "shadow_mode_enabled": { "type": "boolean" },
+        "execution_coordinator_enabled": { "type": "boolean" },
+        "live_capable": {
+          "type": "boolean",
+          "description": "Whether this deployment can place a real order AT ALL, as the backend computes it from the gates above and the active broker. The single authoritative paper/live signal for the UI — never derived client-side, and never from a stream's connection state."
+        },
+        "region": { "type": ["string", "null"] },
+        "active_broker": { "type": ["string", "null"] }
+      }
+    },
+    "state": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The facts mutation policies are evaluated against. Backend-computed, so the UI can show why a change is currently refused without guessing.",
+      "required": [
+        "entry_armed",
+        "session_armed",
+        "open_boxes",
+        "residual_legs",
+        "working_orders",
+        "in_flight_executions",
+        "reconciliation_clean",
+        "flat"
+      ],
+      "properties": {
+        "entry_armed": { "type": "boolean" },
+        "session_armed": { "type": "boolean" },
+        "session_id": { "type": ["string", "null"] },
+        "open_boxes": { "type": "number", "minimum": 0 },
+        "residual_legs": { "type": "number", "minimum": 0 },
+        "working_orders": { "type": "number", "minimum": 0 },
+        "in_flight_executions": { "type": "number", "minimum": 0 },
+        "reconciliation_clean": { "type": "boolean" },
+        "flat": {
+          "type": "boolean",
+          "description": "All five conditions together: no open box, no residual leg, no working order, nothing in flight, reconciliation clean. Computed by the backend so the UI cannot disagree about what flat means."
+        }
+      }
+    },
+    "settings": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Every registered setting. Non-empty: an empty list would read as 'nothing is configurable', which would hide the entire risk surface.",
+      "items": { "$ref": "operator-config-setting.schema.json" }
+    },
+    "recent_changes": {
+      "type": "array",
+      "description": "A short, newest-first slice of the append-only audit trail.",
+      "items": { "$ref": "operator-config-change.schema.json" }
+    }
+  }
+}
