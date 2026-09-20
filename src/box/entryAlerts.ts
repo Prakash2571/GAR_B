@@ -215,6 +215,18 @@ const REASON_META: Record<
       "The durable store could not be reached, so the attempt could not be recorded safely. Check " +
       "PostgreSQL health; entry fails closed by design.",
   },
+  filled_exposure_unrecorded: {
+    // NOT `infrastructure`: the database may be perfectly healthy and the position still unrecorded
+    // (a qualification callback that threw, or a duplicate-open-box unique-index rejection). This
+    // always needs a human, and it needs one NOW.
+    category: "fault",
+    remedy:
+      "ACT NOW: all four legs FILLED at the broker but the Box was not recorded as an open position, " +
+      "so this exposure has no position row and is not being exited by the position monitor. It was " +
+      "deliberately NOT unwound and NOT released. New entry is blocked. Verify the four legs on the " +
+      "broker terminal against the detail line, then reconcile — and reduce manually at the broker if " +
+      "the residual flatten loop cannot.",
+  },
 
   /* ── technical faults ─────────────────────────────────────────────────────────────────── */
   reservation_error: {
