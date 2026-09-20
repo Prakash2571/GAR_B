@@ -192,13 +192,71 @@ so `attributedRecoveryExposure()` reports all four legs.
   nobody was managing. `crashRecoveryEntryQuarantined` did not cover it (it is refreshed only from
   `onReconciliationIssue`, and additionally requires the crash-recovery *index* to be unverified, so a
   clean restart with a healthy database never triggers it).
-- **[CODE]** New ENTRY is now blocked by the ENTRY-scoped `unowned_attributed_exposure` blocker, which
-  names the symbols, quantities and the required operator action. Reduction stays fully available,
-  because reducing is how it gets resolved.
-- **Remaining limit, [CODE]:** this is an **operator-in-the-loop** stop, not automatic recovery.
-  Nothing reconstructs a durable position or residual row from the journal. The operator must verify
-  the positions at the broker and then flatten the attributed exposure with the emergency control
-  (which acts on exactly this crash-only set) or reconcile it into a trade.
+#### A READINESS BLOCKER IS A STATEMENT, NOT A CONTROL — and this document previously said otherwise
+
+An earlier revision of this section read: *"New ENTRY is now blocked by the ENTRY-scoped
+`unowned_attributed_exposure` blocker."* **That was wrong, and the way it was wrong is the important
+part.** `operational_readiness` is a *report*. Publishing an ENTRY-scoped blocker does not stop
+anything: it renders a banner and sets a field. The new-box admission path never read it, so with
+four orphaned legs at the broker a brand-new candidate still claimed an execution slot, spent the
+session attempt, took contract reservations and **POSTed four more live orders**. Measured on the
+real wiring, at commit `2b14729`, those four POSTs were `k1_ce BUY 75`, `k2_pe BUY 75`,
+`k2_ce SELL 75`, `k1_pe SELL 75`.
+
+Treat this as the general rule when reading any readiness blocker in this repository: **a blocker
+tells you a control exists somewhere, or that it does not. It is never itself the control.** Ask
+which code path refuses, and confirm it is on the path that matters.
+
+- **[CODE] What actually enforces it now.** A gate in
+  `CoordinatedBoxExecutionGateway.coordinateEntry()`'s synchronous admission prologue
+  (`src/box/executionCoordinator.ts`, dep `orphanedExposureGate`), refusing with
+  `BoxExecutionFailureReason: "unowned_attributed_exposure"`. It sits **after** the duplicate guard
+  and **before** the session cycle budget, the operator blocklist, the underlying lock, the inventory
+  ceiling, `claim()`, `sessionConsumeAttempt()`, every reservation and every broker POST. So a
+  refused candidate consumes **no attempt**, acquires **no reservation** and sends **no bytes**.
+- **[CODE] Why the admission layer and not the order manager.** `BoxOrderManager`'s per-leg
+  `entryBlockReason` is consulted on *every* submit — including the submits that legitimately
+  continue or reduce the interrupted attempt whose fills these are. Gating there refused the recovery
+  of the very exposure being complained about, which is strictly worse than the defect. Admission is
+  the only layer that can distinguish "a NEW box" from "finish or unwind the old one", because it is
+  the only layer a new box must pass and reduction never enters at all.
+- **[CODE] Why it is unbypassable in live.** `BOX_EXECUTION_COORDINATOR_ENABLED=false` is **rejected
+  at boot** when `BOX_EXECUTION_MODE=live` (`src/box/config.ts`), so the prologue cannot be switched
+  off on a live deployment.
+- **[CODE] One derivation, two consumers.** The operator's blocker and the enforced gate are the same
+  call — `engine.unownedAttributedExposure()`, wrapping the shared
+  `unownedAttributedExposureBlocker()`. The verdict an operator reads and the rule the engine applies
+  cannot drift, and the refusal text an operator sees at admission *begins with* the blocker detail
+  they see in readiness.
+- **[CODE] It is not per-underlying or per-contract.** A second candidate on a **completely different
+  underlying** is refused too. This is the case nothing else caught: `box_inventory_limit` and the
+  Layer 1a underlying lock are both derived from the durable position book, and the defining property
+  of this exposure is that the book has **no row for it** — the position write is precisely what
+  failed.
+- **[CODE] Reduction stays fully available**, because reducing is how it gets resolved. There is no
+  counterpart gate in `acquireForExit`, `coordinateExit`, `flattenResidual` or any reconciliation
+  path, and that omission is load-bearing: gating them on this condition would make the block
+  permanent and strand real broker exposure.
+- **Evidence:** `tests/box/orphanedExposureEntryGate.test.mjs` (11 tests) drives the real coordinator,
+  the real order manager, the real live entry gateway and a fake broker transport, and asserts **zero
+  broker POSTs**. 10 of its 11 tests fail against `2b14729`.
+
+#### Remaining limit: this is an operator-in-the-loop stop, not automatic recovery
+
+- **[UNCHANGED, CODE]** Nothing reconstructs a durable position or residual row from the intent
+  journal. The engine will **not** heal this by itself, and it does not pretend to — it stops new
+  entry and names the action.
+- **[CODE] The operator must:** (1) verify the named positions **in the broker terminal**, then
+  either (2a) flatten the attributed exposure with the emergency control — which acts on exactly this
+  crash-only set, so clearing the blocker necessarily clears the gate — or (2b) reconcile it into a
+  trade, which gives the exposure an owner without closing it. Either route reopens entry; both are
+  verified in the test above.
+- **[CODE] Do NOT restart to clear it.** The condition is rebuilt from the durable journal on every
+  boot, so a restart changes nothing and costs the operator the in-memory diagnostic context.
+- **[CODE] Bound on how long this can persist: none, by design.** There is no timer that escalates or
+  auto-flattens. While it is unresolved the trial is over — new entry is refused on every underlying —
+  and the exposure sits at the broker until a human acts. For a supervised one-lot trial that is the
+  intended behaviour, because the alternative is an automated order into a book nobody is watching.
 - **[CODE]** If the broker does **not** confirm the reconstructed exposure, that is a
   journal/broker mismatch: reconcile trips the breaker and blocks entry that way instead.
 
@@ -249,10 +307,13 @@ None of the following is verifiable from this repository, and none was verified 
 | 1 | The production database's migration provenance (16 applied vs 14 shipped) | **[UNVERIFIED]** | `PRE_LIVE_DEPLOYMENT_VERIFICATION.md` §5.1 — read-only commands and stop conditions |
 | 2 | The host's actual public egress IP | **[HOST]** | Observe it from the host itself |
 | 3 | That the egress IP is registered in the Kite developer console | **[BROKER]** | Read the broker dashboard |
-| 4 | The deployed `.env` — especially `BOX_LIVE_DAILY_LOSS_LIMIT`, `BOX_LIVE_MAX_OPEN_LEG_QUANTITY`, `BOX_LIVE_MAX_GROSS_OPEN_LEG_QUANTITY`, `BOX_LIVE_ALLOWED_UNDERLYINGS`, `BOX_SESSION_MAX_ENTRY_ATTEMPTS`, `BOX_SESSION_MAX_COMPLETED_TRADES` | **[HOST]** | Read the deployed file; do not infer from defaults |
-| 5 | The current NIFTY lot size in the live instrument master | **[BROKER]** | See §4.1 |
+| 4 | The deployed `.env` — especially `BOX_LIVE_DAILY_LOSS_LIMIT`, `BOX_LIVE_MAX_OPEN_LEG_QUANTITY`, `BOX_LIVE_MAX_GROSS_OPEN_LEG_QUANTITY`, `BOX_LIVE_ALLOWED_UNDERLYINGS`, and the four one-shot bounds `BOX_SUPERVISED_ONE_LOT_TRIAL` / `BOX_MAX_OPEN_BOXES` / `BOX_LIVE_MAX_OPEN_BOXES` / `BOX_SESSION_MAX_COMPLETED_TRADES` / `BOX_SESSION_MAX_ENTRY_ATTEMPTS` | **[HOST]** | `node dist/box/effectiveConfig.js --supervised-trial --lot-size=L` on the host, with the deployed `.env` loaded. It reports the **effective** post-clamp values, so it answers a question the file's text cannot. **Do not infer from defaults** — three of the four bounds default to 0 = UNLIMITED |
+| 5 | The current lot size for the traded contract in the live instrument master | **[BROKER]** | See §4.2 and `TRIAL_RUNBOOK.md` §4.1. **Do not assume 75. Do not assume the current broker contract is 65.** Read `L`, then confirm `L <= per-leg cap` and `4L <= gross cap` |
 | 6 | That a real broker order response matches our fixtures | **[UNVERIFIED]** | Only a supervised live order can show this |
 | 7 | Deployed process/PM2 state, PostgreSQL and Mongo contents | **[HOST]** | Read them |
+| 8 | That PostgreSQL is writable **now**, not merely at boot | **[HOST]** | `operational_readiness` must show no `durable_store_unavailable` and all three `exposure_management` permissions true. **`pg_ready` cannot answer this** — it is a startup latch and stays `true` after a mid-session failure. `TRIAL_RUNBOOK.md` §6.2 |
+| 9 | That no un-owned broker exposure is present | **[HOST]** | `unowned_attributed_exposure` absent from `operational_readiness`. If present the trial cannot start on **any** underlying, and clearing it is operator-in-the-loop — nothing does it automatically. `TRIAL_RUNBOOK.md` §6.1 |
+| 10 | That the broker terminal is open, logged in and usable | **[HOST]** | There are documented states in which this system will **not** reduce exposure and will not retry (durable-store outage, un-owned exposure, a leg withheld on a stale book). The terminal is the only fallback. `TRIAL_RUNBOOK.md` §6 escalation |
 
 ### 4.1 The static-IP gate is an attestation, not proof — **[CODE]**
 
@@ -285,14 +346,38 @@ None of the following is verifiable from this repository, and none was verified 
   - if it fell well below 75, the caps would silently permit **more than one** box.
 
   Read the deployed caps (§4 item 4) and the live lot size together, and confirm the product is the
-  envelope you intend. Do not assume 75.
+  envelope you intend. **Do not assume 75, and do not assume the current broker contract is 65** — both
+  numbers appear in this repository's history and neither is authoritative.
+
+- **[CODE] This arithmetic no longer has to be done by hand.** On the host, with the deployed `.env`
+  loaded:
+
+  ```
+  node dist/box/effectiveConfig.js --supervised-trial --lot-size=L
+  ```
+
+  prints the four effective one-shot bounds and then, for the `L` you supply, the per-leg quantity, the
+  gross quantity, each cap comparison, and `floor(gross cap / 4L)` — **how many one-lot boxes the gross
+  cap alone would permit.** `L` is required: omit it and the report prints `UNVERIFIED` rather than
+  plausible arithmetic, and a zero or non-numeric value is refused rather than defaulted. The worked
+  table for the shipped caps is in `TRIAL_RUNBOOK.md` §4.1.
+
+- **[CODE] The point of that last figure.** At `L = 50` the shipped caps permit **two** boxes
+  (`floor(400/200) = 2`), so the quantity caps are **not** a one-box control at every lot size.
+  `BOX_MAX_OPEN_BOXES=1` is what bounds the trial to a single box — and it was **absent from two shipped
+  one-box profiles** until this change, where its code default of 0 meant UNLIMITED.
 
 ---
 
 ## 5. Readiness fields: which are gates and which are only reports — **[CODE]**
 
-`buildOperationalReadiness` carries an explicit `scope` per blocker (`"entry" | "reduction" | "both"`),
-and that scope — not the field's position on a panel — is what decides whether it can stop anything.
+`buildOperationalReadiness` carries an explicit `scope` per blocker (`"entry" | "reduction" | "both"`).
+That scope declares what a blocker is **allowed** to stop.
+
+**It does not make the blocker stop it.** `scope: "entry"` is a *declaration of intent*, honoured only
+if some code on the admission path reads that blocker. `unowned_attributed_exposure` carried
+`scope: "entry"` for months while the admission path never consulted it, and new boxes were admitted
+straight past it (§2.2). The scope was correct; the enforcement did not exist.
 
 - **Authoritative ENTRY gates** (the server re-validates every entry request independently of any UI):
   the circuit breaker (including the daily-loss trip), the daily-risk-seed health, the underlying
@@ -302,8 +387,18 @@ and that scope — not the field's position on a panel — is what decides wheth
 - **Reporting only:** counters and diagnostics such as realised P&L, latency and pacing statistics,
   stream-observation tallies, and the published `daily_loss_limit` / `realised_pnl_today` pair. These
   describe; they do not refuse.
-- **The trap:** a field can be *derived from* an authoritative gate and still not *be* one. Treat a
-  panel row as a gate only if it names a blocker code with an entry scope.
+- **Trap 1:** a field can be *derived from* an authoritative gate and still not *be* one.
+- **Trap 2, and this document previously fell into it.** An earlier revision advised: *"Treat a panel
+  row as a gate only if it names a blocker code with an entry scope."* **That test is not sufficient
+  and it produced a false assurance here.** An entry-scoped blocker code proves only that someone
+  *intended* a gate. The correct test names the refusing code path:
+
+  > A readiness blocker is an ENFORCED gate **only if** you can point to the line on the admission
+  > path that reads it and refuses. For a NEW live box that means one of: the
+  > `coordinateEntry()` prologue in `src/box/executionCoordinator.ts`; `sessionConsumeAttempt()` or
+  > the reservation acquisition; or `BoxOrderManager.submit()` / `execute()`. If you cannot name it,
+  > assume the condition is **reported and not enforced**, and verify with the only assertion that
+  > settles it — **that no order reached the broker**.
 
 ---
 
@@ -317,13 +412,40 @@ four-leg position (§2.4), the exit rejection that manufactured broker uncertain
 PostgreSQL-outage claim that exits were unaffected (§2.6), and the restart that admitted a new box on
 top of un-owned exposure (§2.7).
 
-**Fixing code does not authorise a live test.** The following are each independently disqualifying and
-**all four remain open**:
+Closed since, and the reason this section now warns about blockers-versus-gates throughout:
+
+- **Un-owned exposure is now ENFORCED, not merely reported** (§2.2). It was an entry-scoped readiness
+  blocker that nothing on the admission path read; a new box POSTed four more live orders on top of it.
+  It is now a gate in the coordinator's admission prologue.
+  `tests/box/orphanedExposureEntryGate.test.mjs`.
+- **Every PostgreSQL-outage message in the dashboard now derives its exit claim from the backend's
+  `exposure_management` verdict.** Five messages asserted flatly that positions "can still exit"; a
+  mid-session store failure showed **no outage banner at all** — `pg_ready` is a startup latch — while
+  promising an exit route that did not exist. GAR_F `tests/outageBannerConsistency.test.mjs`.
+- **One lot, one box, one attempt is now required and verifiable**, not advisory.
+  `BOX_SUPERVISED_ONE_LOT_TRIAL=true` refuses boot unless all four bounds are exactly 1, and
+  `node dist/box/effectiveConfig.js --supervised-trial --lot-size=L` prints the effective bounds and
+  the per-leg/gross arithmetic. This also closed a real gap: **two shipped one-box profiles omitted
+  `BOX_MAX_OPEN_BOXES` entirely**, leaving the only mode-independent inventory ceiling UNLIMITED under
+  a heading that read "one active box". `tests/box/supervisedOneLotTrial.test.mjs`.
+
+**A CODE MERGE IS NOT PERMISSION TO CONDUCT THE LIVE TEST.** Every item above was verified against
+mocked transports in CI. None of it was executed on the deployment host, against a real broker, with
+real money. The following are each **independently disqualifying** and **all five remain open**:
 
 1. The production migration discrepancy (16 applied vs 14 shipped) is **unexplained**. §4 item 1.
 2. The host's egress IP and the Zerodha whitelist are **unconfirmed**. §4 items 2–3, §4.1.
-3. The deployed configuration and the live NIFTY lot size are **unread**. §4 items 4–5, §4.2.
-4. No behaviour on this path has ever been **broker-verified**. §1.
+3. The **deployed configuration is unread** — including whether the supervised profile is actually on
+   and whether all four one-shot bounds really resolve to 1 on that host. §4 item 4. The new
+   startup refusal and the `--supervised-trial` preflight make this *checkable in one command*; they do
+   not make it *checked*.
+4. The **live contract lot size is unread**. §4 item 5, §4.2, and `TRIAL_RUNBOOK.md` §4.1. Do not
+   assume 75; do not assume the current broker contract is 65. Read `L` from the live instrument
+   master and confirm `L <= BOX_LIVE_MAX_OPEN_LEG_QUANTITY` and `4L <= BOX_LIVE_MAX_GROSS_OPEN_LEG_QUANTITY`
+   — and note that at a *smaller* `L` the gross cap alone permits more than one box, so
+   `BOX_MAX_OPEN_BOXES=1` is what bounds the trial, not the caps.
+5. No behaviour on this path has ever been **broker-verified**. §1. Every test mocks the transport.
 
-Do not arm live ENTRY. Re-issue this verdict only when each item above has been executed on the host
-and its actual output recorded here.
+**Do not arm live ENTRY.** Re-issue this verdict only when each item above has been executed on the
+host and its **actual output** recorded here — not inferred from defaults, not inferred from this
+document, and not inferred from a green CI run.

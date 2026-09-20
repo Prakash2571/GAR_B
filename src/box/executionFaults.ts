@@ -333,6 +333,9 @@ const MARKET_REASON_MAP: Record<BoxExecutionFailureReason, true> = {
   session_limit_reached: true,
   execution_mode_mismatch: true,
   lot_exceeds_quantity_cap: true,
+  // Unowned broker exposure from a crash. An ADMISSION refusal like the six above, and it names a
+  // remedy no other reason does: an operator must verify and flatten (or reconcile) real exposure.
+  unowned_attributed_exposure: true,
 };
 
 const MARKET_REASONS: readonly BoxExecutionFailureReason[] = Object.keys(

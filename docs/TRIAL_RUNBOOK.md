@@ -23,7 +23,8 @@ must remember under pressure.
 | **Maximum entry attempts (counting failed/recovered)** | **Yes — new** | `BOX_SESSION_MAX_ENTRY_ATTEMPTS`. Consumed at **admission, before any broker POST**, so an attempt that submits and is then unwound still spends it. Durable, so a restart does not reset it. |
 | Maximum completed trades | **Yes** | `BOX_SESSION_MAX_COMPLETED_TRADES`. Consumed at **establishment**. |
 | Maximum concurrent intent | **Yes** | `BOX_MAX_CONCURRENT_EXECUTIONS`, `BOX_MAX_CONCURRENT_PER_UNDERLYING`, `BOX_ONE_ACTIVE_BOX_PER_UNDERLYING`; plus the in-process **and** durable PostgreSQL reservation tiers. |
-| Maximum unresolved exposure | **Partly** | Residual legs are tracked durably and block re-entry via readiness blockers. **No single configurable rupee ceiling on unresolved exposure** — see gap 1b. |
+| Maximum unresolved exposure | **Partly** | Residual legs are tracked durably and block re-entry. **Corrected:** this row used to say "via readiness blockers". A readiness blocker is a **report, not a control** — publishing one refuses nothing. What actually refuses is the coordinator's admission prologue (`BOX_MAX_OPEN_BOXES` counts unresolved residual attempts; `BOX_ONE_ACTIVE_BOX_PER_UNDERLYING` Layer 1a counts residual legs) plus the order manager's `entryBlockReason` at the send boundary. Verify the mechanism, not the banner — see §1.1. **No single configurable rupee ceiling on unresolved exposure** — see gap 1b. |
+| **Unowned broker exposure after a crash** | **Yes — new** | Box legs confirmed at the broker that **no** open trade and **no** residual row accounts for — a fill that landed before the process could record it. Enforced in the coordinator's admission prologue (`unowned_attributed_exposure`), **before** the attempt budget, any reservation and any broker POST, on **every** underlying. Previously this condition was only *reported* by readiness and nothing consulted it, so a new box POSTed four more live orders on top of it. Operator-in-the-loop to clear: verify at the broker, then emergency-flatten or reconcile. `tests/box/orphanedExposureEntryGate.test.mjs` |
 | Maximum order submissions | **Partly** | Bounded indirectly by the attempt budget (4 legs/attempt) and by the rate-limit ledger. **No independent submission counter** — see gap 1c. |
 | Recovery duration | **Partly** | Bounded retry/backoff on the reconciliation sweep; ack/working/partial/cancel timeouts bound each order. **No global "give up and escalate after N minutes"** — see gap 1d. |
 | Capital / loss budget | **Yes — entry only** | `BOX_LIVE_DAILY_LOSS_LIMIT` (default **₹5,000**) halts NEW ENTRY. Enforcement is **indirect**: `evaluateLimits()` is its only consumer and it trips the **sticky** circuit breaker, which `entryBlockReason` then refuses on at all five entry checkpoints. The figure is reconstructed at boot from **durable** state (`box_trades` + `box_execution_attempts`), so it **survives a restart**; an **incomplete** reconstruction refuses entry rather than trusting an understated loss. It **never** blocks an exit, protective cancel or reconciliation. Proven end to end by `tests/box/dailyLossLimitEntryBrake.test.mjs` (previously untested — this row used to say "observability, not a brake"). **Two caveats:** `BOX_LIVE_DAILY_LOSS_LIMIT=0` means the gate is **DISABLED**, not "no loss allowed"; and the limit is a frozen copy in the manager's limits, so tightening it while armed needs a limits-republish path to take effect. |
@@ -32,6 +33,41 @@ must remember under pressure.
 | **Proven zero-fill EXIT rejection** | **Yes — new** | A broker rejection whose snapshot passes `verifyZeroBrokerExposure` is reported as a failed reduction with the broker's reason and the still-open quantity. It no longer invents uncertainty, trips the breaker or moves the whole position to RECOVERY; the leg's quantity stays known and its hedge stays on. Contradicted/ambiguous rejections and persistence failures still quarantine. `tests/box/exitProvenZeroFillRejection.test.mjs` |
 | Preconditions before entry | **Yes** | The single authoritative readiness decision; the server revalidates **every** entry request independently of any UI. |
 | Restart does not reset budgets | **Yes** | Cycle **and** attempt budgets are durable in PostgreSQL; an unreadable session refuses entry rather than assuming a clean slate. |
+
+### 1.1 A readiness blocker is a STATEMENT, not a control
+
+**Read this before trusting any row above, and before trusting any banner during the trial.**
+
+`operational_readiness` is a **report**. It renders banners and sets fields. Publishing a blocker —
+even an `scope: "entry"` one — **refuses nothing by itself.** Something on the actual admission path
+has to read it.
+
+This is not a hypothetical distinction. It shipped:
+
+- `unowned_attributed_exposure` was published correctly for months and **nothing consulted it**. With
+  four broker-confirmed legs that no record owned, a brand-new candidate still passed every admission
+  gate and POSTed four more live orders. Measured at commit `2b14729`:
+  `k1_ce BUY 75`, `k2_pe BUY 75`, `k2_ce SELL 75`, `k1_pe SELL 75`.
+- This runbook's own "Maximum unresolved exposure" row said re-entry was blocked "via readiness
+  blockers". It is not, and never was — it is blocked by `BOX_MAX_OPEN_BOXES` and the Layer 1a
+  underlying lock in the coordinator prologue.
+
+**The three places a NEW live box can actually be refused**, in the order they run:
+
+1. **`CoordinatedBoxExecutionGateway.coordinateEntry()`'s synchronous prologue** — the duplicate
+   guard, `unowned_attributed_exposure`, the session cycle budget, the operator blocklist, the live
+   per-leg/gross quantity caps, the Layer 1a underlying lock, `BOX_MAX_OPEN_BOXES`, the per-underlying
+   budget. Everything here refuses **before** `claim()`, **before** the attempt budget is consumed,
+   **before** any reservation and long before any POST. `BOX_EXECUTION_COORDINATOR_ENABLED=false` is
+   rejected at boot in live, so this prologue cannot be bypassed on a live deployment.
+2. **`sessionConsumeAttempt()` and the reservation acquisition** — still pre-POST, but an attempt is
+   spent here, so a refusal at this point costs the trial its budget.
+3. **`BoxOrderManager.submit()` / `execute()`** — the per-leg send boundary: `entryBlockReason`, the
+   quantity envelope, the circuit breaker, the durable CREATED→SUBMITTING compare-and-set.
+
+**So when a banner tells you entry is blocked, the correct question is "which of those three
+refused?", not "the banner says we are safe".** When in doubt, the honest test is the one the
+regression suites use: assert that **no order reached the broker**.
 
 ### Known gaps in the control set
 
@@ -51,11 +87,33 @@ must remember under pressure.
 BOX_EXECUTION_MODE=live
 BOX_LIVE_TRADING_ENABLED=true          # plus the runtime ENTRY control must be armed
 
-# ── THE TRIAL BOUNDS ─────────────────────────────────────────────────────────
-BOX_SESSION_MAX_COMPLETED_TRADES=1     # one completed box
-BOX_SESSION_MAX_ENTRY_ATTEMPTS=3       # ...and AT MOST three attempts to get it
-#   Both are required. The cycle budget alone does not bound a run of failed attempts:
-#   an attempt that submits, partially fills and is unwound spends NO cycle.
+# ── THE TRIAL BOUNDS: ONE LOT, ONE BOX, ONE ATTEMPT ──────────────────────────
+#
+# CORRECTED. This block previously read BOX_SESSION_MAX_ENTRY_ATTEMPTS=3, which is not a one-attempt
+# trial: three attempts is up to TWELVE live orders, and each attempt that partially fills and is
+# unwound takes real exposure and pays real charges. If three attempts are genuinely wanted, that is a
+# different, separately authorised test — say so explicitly rather than letting a "one-lot trial"
+# quietly permit it.
+BOX_SUPERVISED_ONE_LOT_TRIAL=true      # REFUSES BOOT unless all four below are exactly 1
+BOX_MAX_OPEN_BOXES=1                   # mode-independent inventory ceiling. Code default 0 = UNLIMITED
+BOX_LIVE_MAX_OPEN_BOXES=1              # live-only ceiling at the send boundary
+BOX_SESSION_MAX_COMPLETED_TRADES=1     # one completed box — still refuses AFTER it closes
+BOX_SESSION_MAX_ENTRY_ATTEMPTS=1       # one attempt, counted at ADMISSION, incl. one that aborts
+#
+#   ALL FOUR ARE REQUIRED, and they are not redundant — each is blind to a case the others catch:
+#     BOX_MAX_OPEN_BOXES               counts in-flight entry claims, so it is the only gate that can
+#                                      refuse two entries admitted in the same instant; the only
+#                                      mode-independent one, so the only one a PAPER rehearsal
+#                                      exercises at all.
+#     BOX_LIVE_MAX_OPEN_BOXES          live-only, read from a post-position count.
+#     BOX_SESSION_MAX_COMPLETED_TRADES counts CONSUMED cycles, so it keeps refusing once the first box
+#                                      CLOSES — when inventory is back to 0 and both ceilings admit.
+#     BOX_SESSION_MAX_ENTRY_ATTEMPTS   the ONLY bound on an attempt that ABORTED. It completes no
+#                                      cycle and leaves no inventory, so nothing else counts it.
+#
+#   Three of the four default to 0 = UNLIMITED, so omitting one is not a narrower trial — it is an
+#   unbounded one. BOX_SUPERVISED_ONE_LOT_TRIAL=true makes that a BOOT FAILURE instead of a surprise.
+#   Verify: node dist/box/effectiveConfig.js --supervised-trial --lot-size=L   (Gate B step 21, §4.1)
 
 BOX_MAX_CONCURRENT_EXECUTIONS=1
 BOX_MAX_CONCURRENT_PER_UNDERLYING=1
@@ -140,6 +198,46 @@ egress to the deployment.** Every step below is written to be executed by an aut
 | 18 | **Funding gates not all off** | `operational_readiness.entry.reasons` | `funding_checks_disabled` **absent**. Live with every funding evidence gate disabled now refuses new entry, it no longer merely reports |
 | 19 | **Residual escalation clear** | `operational_readiness.entry.reasons` | `recovery_escalation_timeout` and `residual_state_unknown` **absent**. Escalation age is measured from durable `created_at` where available, so it survives a restart |
 | 20 | **Lot relationship holds** | The loaded instrument master vs the two quantity ceilings | `BOX_LIVE_MAX_OPEN_LEG_QUANTITY == L` and `BOX_LIVE_MAX_GROSS_OPEN_LEG_QUANTITY == 4 × L` for the **actual** current lot `L`. `BOX_LIVE_EXACT_ONE_LOT=true` refuses boot otherwise. **Read `L`, never assume it** |
+| 21 | **One lot, one box, one attempt — all four bounds** | On the host, with the trial `.env` loaded: `node dist/box/effectiveConfig.js --supervised-trial --lot-size=L` | `BOX_SUPERVISED_ONE_LOT_TRIAL=true` and **all four** of `BOX_MAX_OPEN_BOXES`, `BOX_LIVE_MAX_OPEN_BOXES`, `BOX_SESSION_MAX_COMPLETED_TRADES`, `BOX_SESSION_MAX_ENTRY_ATTEMPTS` report `ok … =1`. Verdict line reads *"the four required settings are satisfied and the quantity arithmetic is shown above"*. See §4.1 for the arithmetic to check |
+| 22 | **No unowned broker exposure** | `operational_readiness.entry.reasons` and `exposure_management.blocked_reasons` | `unowned_attributed_exposure` **absent**. If present, the trial cannot start on **any** underlying and §6.1 applies — this is operator-in-the-loop, nothing clears it automatically |
+| 23 | **Durable store writable NOW, not merely at boot** | `operational_readiness` blockers **and** the three `exposure_management` permissions | `durable_store_unavailable` **absent**, and `exit_and_reduce` / `protective_cancel` / `manage_working_orders` all **true**. **Do not read `pg_ready` for this** — it is a startup latch and stays `true` after a mid-session failure (§6.2) |
+
+### 4.1 The quantity arithmetic to verify at step 21
+
+`--lot-size=L` is **read from the live instrument master** for the contract actually being traded. It
+is not optional and it is **not guessable**: the whole envelope scales with it, the test fixtures use
+`75`, and an earlier note in this repository guessed `65`. The command refuses a missing or
+non-positive value rather than substituting one, and prints `UNVERIFIED` instead of plausible
+arithmetic if you omit it.
+
+For a lot size `L`, a one-lot box is:
+
+```
+per-leg quantity = 1 lot                     = L
+gross quantity   = L × 4 legs                = 4L
+per-leg cap      BOX_LIVE_MAX_OPEN_LEG_QUANTITY        must satisfy L  <= cap
+gross cap        BOX_LIVE_MAX_GROSS_OPEN_LEG_QUANTITY  must satisfy 4L <= cap
+boxes the gross cap alone permits            = floor(gross cap / 4L)
+```
+
+Worked, at the shipped caps (`100` per leg, `400` gross):
+
+| Lot `L` | Per leg | Gross `4L` | Per-leg cap 100 | Gross cap 400 | Boxes the gross cap alone permits |
+|---|---|---|---|---|---|
+| 75 | 75 | 300 | PASS | PASS | `floor(400/300)` = **1** |
+| 65 | 65 | 260 | PASS | PASS | `floor(400/260)` = **1** |
+| 50 | 50 | 200 | PASS | PASS | `floor(400/200)` = **2** ⚠ |
+| 120 | 120 | 480 | PASS | **REFUSED** | — |
+| 150 | 150 | 600 | **REFUSED** | REFUSED | — |
+
+**Two things to take from that table.**
+
+1. **A lot size above the per-leg cap means the trial cannot run at all** — every entry is refused
+   before any order is sent. Better to learn that from this command than from a refusal at 09:20.
+2. **The last column is the one nobody computes.** At a *smaller* lot the caps permit **more than one
+   box**, so the quantity caps are **not** a one-box control. `BOX_MAX_OPEN_BOXES=1` is what bounds the
+   trial to a single box, which is exactly why it is a required setting and why its previous absence
+   from two shipped profiles mattered.
 
 > **Rows 3, 4, 5, 9, 10, 11, 13, 15 and 17–19 are read from a surface that reports rather than
 > enforces.** `operationalReadiness()` is consumed only by `getStatus()` and the runtime-status
@@ -175,6 +273,95 @@ gaps 1b and 1d.
 | Loss approaching the intended budget | It is **not** reliably enforced in code (§1) |
 | Any overfill, or a contradictory terminal observation | Escalated conditions by design |
 | Attempt budget exhausted with exposure still open | The trial is over; only reduction remains |
+| `unowned_attributed_exposure` raised | Broker legs nobody owns. New entry is refused engine-wide; **nothing reduces them automatically.** See §6.1 |
+| `durable_store_unavailable` raised, **or** the dashboard shows `PostgreSQL FAILED MID-SESSION` | Automated reduction is **refused, not queued**. See §6.2 |
+| A **partial fill** that does not converge within **2 minutes** | See §6.3 |
+| A leg **withheld** on a stale/absent book for more than **2 minutes** while exposure is open | See §6.3 |
+
+### 6.1 Unowned broker exposure after a crash (`unowned_attributed_exposure`)
+
+**What it means.** Box legs are confirmed **at the broker** that no open trade and no residual row
+accounts for — a fill that landed just before the recording write failed. The engine reconstructs
+them from the durable intent journal, so it *knows* they exist; it has no position row for them.
+
+**What the engine does and does not do.**
+
+- **Does:** refuses every NEW box, on **every** underlying, in the coordinator's admission prologue,
+  before an attempt is spent or any order is sent.
+- **Does NOT:** reduce them. There is no residual row, so the flatten loop has nothing to work, and
+  **no timer escalates.** This is an **operator-in-the-loop limit**, deliberately: the alternative is
+  an automated order into a book nobody is watching.
+
+**Procedure.**
+
+1. Read the blocker detail — it names each leg as `EXCHANGE:TRADINGSYMBOL SIDE QUANTITY`.
+2. **Verify every named leg in the broker terminal.** The broker is the authority; our journal is a
+   reconstruction.
+3. Then **one** of:
+   - **Emergency flatten** — acts on exactly this crash-only set, so clearing the blocker necessarily
+     clears the admission gate; or
+   - **Reconcile it into a trade** — gives the exposure an owner without closing it, which also clears
+     the gate.
+4. If the broker does **not** confirm a leg, that is a journal/broker mismatch: reconciliation trips
+   the breaker and entry stays blocked by that route instead. Do not flatten what the broker says you
+   do not hold.
+5. **Do not restart to clear it.** It is rebuilt from the durable journal every boot.
+
+### 6.2 PostgreSQL outage — during the trial
+
+**PostgreSQL is the authoritative operational store, and every reduction needs it BEFORE the broker.**
+An exit, an emergency flatten, the working-order cancel sweep and reconciliation each perform (or
+read) the durable order-intent journal before anything is transmitted. During an outage they are
+**REFUSED, not queued — nothing reaches the broker.**
+
+**Detecting it — and the trap.** `pg_ready` is a **STARTUP LATCH**: it records whether PostgreSQL
+answered when the process booted. A store that dies **mid-session leaves it `true` for the rest of the
+day.** So:
+
+| Signal | Meaning |
+|---|---|
+| `pg_ready: false` | Outage present at startup. Banner `PostgreSQL is unavailable`. |
+| `pg_ready: true` **and** blocker `durable_store_unavailable` | **Mid-session failure.** Banner `PostgreSQL FAILED MID-SESSION`. The PostgreSQL indicator elsewhere may still read healthy — **the banner is authoritative, the field is not.** |
+| All three of `exposure_management.exit_and_reduce`, `.protective_cancel`, `.manage_working_orders` false | Confirms automated reduction is unavailable, whatever any other field says. |
+
+**Procedure.**
+
+1. **Do not wait for the system to exit the position.** It will not, and it will not retry later — the
+   order is never built.
+2. Decide on **exposure**, not on the database: if the open box can tolerate the time PostgreSQL needs,
+   hold. If it cannot, go to step 3 immediately.
+3. **Reduce from the broker terminal.** This is the only remaining route. Record every order id and
+   timestamp as you go — reconciliation will need to adopt this later.
+4. **Do not restart the engine to "reconnect".** A restart cannot write either, budgets are durable so
+   nothing is reset, and you lose the in-flight diagnostic context.
+5. **Do not hand-edit the database** to make the state look right.
+6. When PostgreSQL returns, let **reconciliation adopt reality** from the broker before considering any
+   re-arm. `canArm` will refuse while consumed cycles have not reached FLAT; respect that refusal.
+
+### 6.3 Partial fills and stale books
+
+**A partial entry is the expected failure mode of a first live session**, because four-leg atomicity
+does not exist — the system legs in, hedge-first, and bounds the damage.
+
+| Observation | What it means | Action |
+|---|---|---|
+| Some legs filled, `residual_legs > 0`, **decreasing** | Automatic residual flattening is working | Watch. Stop if it stalls for 2 minutes |
+| `residual_legs > 0` and **flat for 2 minutes** | Not converging | Kill switch, then §6 escalation |
+| `FILLED_EXPOSURE_UNRECORDED` | All four legs filled and the box could not be **recorded**. Exposure is **retained**, ownership **not released**, new entry blocked via the breaker | Verify at the broker, then reconcile or flatten. The candidate key stays reserved until restart |
+| A leg **withheld**, exposure open | Every order is a **bounded LIMIT**; nothing escalates to market. Without a current, fresh, deep-enough book the leg is **not sent** | See below |
+
+**The stale-book limit, stated plainly: automated reduction can be withheld indefinitely while
+exposure stays open.** That is deliberate — an unbounded order into a thin options book can cost more
+than the exposure it removes. But it means **a quiet dashboard is not a closing position.**
+
+- A withheld leg is **never** counted as reduced: exposure decrements only from a broker cumulative
+  fill, so the outstanding quantity is durable and re-planned next cycle.
+- The withheld set is **prose only** — it is joined into a detail string and is **not** a structured
+  field, metric or SSE event. A machine consumer reading `reason: "legging_incomplete"` cannot
+  distinguish "nothing was transmitted" from "we transmitted and got a partial". **A human reading the
+  detail can — so a human must.**
+- **Stop condition:** a leg withheld for more than 2 minutes with exposure open → reduce that leg from
+  the broker terminal. Do not wait for a book that may not return before the close.
 
 ### Escalation when automatic recovery is impossible
 
@@ -185,6 +372,24 @@ gaps 1b and 1d.
    authority for what exists.
 4. **Flatten manually at the broker** if the system cannot. Then let reconciliation adopt reality —
    never hand-edit the database.
+
+#### THE BROKER TERMINAL IS THE FALLBACK, AND IT IS NOT OPTIONAL
+
+**Know before you arm: there are states in which this system will not reduce your exposure, and will
+not retry later.** In every one of them the broker terminal is the only remaining route. Have it
+**open, logged in and tested** before the trial begins — discovering an expired terminal session while
+holding an unmanaged position is the worst version of this.
+
+| State | Why automated reduction will not happen | Detect it by |
+|---|---|---|
+| `durable_store_unavailable` / `PostgreSQL FAILED MID-SESSION` | Every reduction needs a durable write **before** the broker POST. The order is never built, and it is **not queued for later** | The banner, and all three `exposure_management` permissions false. **Not** `pg_ready` |
+| `unowned_attributed_exposure` | No position or residual row exists, so the flatten loop has nothing to work. No timer escalates | The blocker; it names each leg |
+| Leg **withheld** on a stale/absent book | Every order is a bounded LIMIT; nothing escalates to market. Without a fresh, deep-enough book the leg is **not sent** | Exposure open and not decreasing; the withheld set is **prose only**, in the detail string |
+| Circuit breaker tripped on an ambiguous terminal state | Deliberate quarantine — our view of our own exposure is known to be unreliable | `circuit_state`, positions in `RECOVERY` |
+
+**When you use the terminal:** record every order id, quantity and timestamp as you go. Reconciliation
+will have to adopt what you did, and it can only do that from the broker's record — so do **not**
+hand-edit the database to match, and do not re-arm until reconciliation is clean.
 5. **Record** the trade ids, order ids, timestamps and the readiness decision (`instance.boot_ordinal`
    + `decision_generation`) so the sequence can be reconstructed.
 6. **Do not re-arm** until residuals are zero and reconciliation is clean; `canArm` refuses while

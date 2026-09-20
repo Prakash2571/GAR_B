@@ -155,6 +155,8 @@ export interface CoordinatorMetricsSnapshot {
   quantityCapRefusals: number;
   /** Entries refused because `BOX_MAX_OPEN_BOXES` (all modes) was already met. */
   inventoryLimitRefusals: number;
+  /** Entries refused because Box legs are held at the broker that no record accounts for. */
+  orphanedExposureRefusals: number;
   expiredWhileWaiting: number;
   revalidationRejected: number;
   revalidationPassed: number;
@@ -291,6 +293,25 @@ export interface CoordinatorDeps {
    * on top, because those are exposure the engine cannot see yet.
    */
   boxInventory?: () => number;
+  /**
+   * BROKER EXPOSURE NO RECORD OWNS — the enforced half of `unowned_attributed_exposure`.
+   *
+   * Returns the very blocker the operator sees in `operational_readiness`, or null when nothing is
+   * unowned. The engine implements it as ONE call (`unownedAttributedExposure()`) that feeds both
+   * this gate and that verdict, which is the point: the condition was previously REPORTED and never
+   * ENFORCED, and two derivations could drift back into the same disagreement.
+   *
+   * WHY IT CANNOT BE FOLDED INTO `boxInventory` OR `activeUnderlyings`. Both are derived from the
+   * durable position book, and this exposure exists precisely BECAUSE the book has no row for it.
+   * Neither can see it, and `activeUnderlyings` is per-underlying besides — it would not stop a
+   * candidate on a different name, which is the case that matters here.
+   *
+   * SYNCHRONOUS BY CONTRACT, like every other prologue dep. ENTRY ONLY, and emphatically so: exits,
+   * protective cancellation, reconciliation, residual flattening and the operator's emergency
+   * flatten are the ONLY things that can clear this state, so consulting it on any reduction path
+   * would make the block permanent and strand real exposure.
+   */
+  orphanedExposureGate?: () => { code: string; detail: string } | null;
   /**
    * CONSUME one entry attempt from the session's ATTEMPT budget, durably.
    *
@@ -430,6 +451,7 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
     underlyingExcluded: 0,
     quantityCapRefusals: 0,
     inventoryLimitRefusals: 0,
+    orphanedExposureRefusals: 0,
     positionClaimsHeld: 0,
     positionClaimsReleased: 0,
     positionClaimFailures: 0,
@@ -795,6 +817,69 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
         incumbent,
       });
       return { ok: false, reason: "duplicate", detail: `identical opportunity already executing as ${incumbent}` };
+    }
+
+    /*
+     * ── UNOWNED BROKER EXPOSURE — THE GATE THAT DID NOT EXIST ───────────────────────────
+     *
+     * THE DEFECT THIS CLOSES. `operational_readiness` has reported `unowned_attributed_exposure`
+     * — Box legs confirmed at the broker with no open trade and no residual row accounting for
+     * them, i.e. a fill that landed before a previous process could record it — and NOTHING
+     * CONSULTED IT. A readiness blocker is a STATEMENT, not a control. This admission path never
+     * read it, so with four orphaned legs sitting at the broker a brand-new candidate would
+     * cheerfully claim, spend the session attempt, take reservations and POST four more orders.
+     *
+     * WHY NO EXISTING GATE CATCHES IT. Every other inventory gate is derived from the durable
+     * position book, and the defining property of this exposure is that the book has no row for
+     * it — the position write is what failed:
+     *
+     *   `box_inventory_limit`        counts positions/residuals/establishments → sees nothing.
+     *   Layer 1a per-underlying lock keyed on the same book → sees nothing, AND is per-underlying,
+     *                                so it could not stop a candidate on a DIFFERENT name even if
+     *                                it did. A second box on a different underlying is the case
+     *                                this gate is really here for.
+     *   `BOX_LIVE_MAX_OPEN_BOXES`    a manager count refreshed from that book → sees nothing.
+     *
+     * WHY IT IS *HERE* AND NOT IN BoxOrderManager. The manager's per-leg `entryBlockReason` is
+     * consulted on EVERY submit — including the submits that legitimately continue or reduce the
+     * interrupted attempt whose fills these are. Gating there refused the recovery of the very
+     * exposure being complained about, which is strictly worse than the defect. Admission is the
+     * only layer that can distinguish "a NEW box" from "finish/unwind the old one", because it is
+     * the only layer a new box must pass and reduction never enters at all.
+     *
+     * PRECEDENCE — DELIBERATELY ABOVE THE SESSION BUDGET. If the trial is also out of budget,
+     * `session_limit_reached` is a routine end-of-day message and this is a naked position. An
+     * operator told "you have used your one trade" would have no reason to go looking at the
+     * broker. The emergency outranks the bookkeeping. It stays BELOW the duplicate guard only
+     * because that guard protects `activeOpportunities` bookkeeping rather than describing risk.
+     *
+     * COST OF A REFUSAL: nothing. Synchronous, inside the no-await prologue, BEFORE the claim,
+     * before `sessionConsumeAttempt()`, before any reservation and long before any broker POST —
+     * so the refused candidate consumes no attempt, acquires no reservation and sends no bytes.
+     *
+     * ENTRY ONLY. There is no counterpart in `acquireForExit`, `coordinateExit`,
+     * `flattenResidual` or any reconciliation path, and that omission is load-bearing: those are
+     * the ONLY operations that can clear this state. Gating them on it would make the block
+     * permanent and strand the exposure it exists to protect.
+     */
+    const orphaned = this.deps.orphanedExposureGate?.();
+    if (orphaned) {
+      this.stats.orphanedExposureRefusals++;
+      this.log({
+        execution: executionId,
+        broker,
+        underlying: candidate.underlying,
+        status: "suppressed_orphaned_exposure",
+        reason: orphaned.code,
+      });
+      return {
+        ok: false,
+        reason: "unowned_attributed_exposure",
+        detail:
+          `${orphaned.detail} This candidate (${candidate.underlying}) is refused before it can ` +
+          `consume a session attempt, take a reservation or send any order, on EVERY underlying — ` +
+          `not just the affected contracts.`,
+      };
     }
 
     // ── SESSION CYCLE BUDGET ───────────────────────────────────────────────────────────
@@ -2302,6 +2387,7 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
       underlyingExcluded: this.stats.underlyingExcluded,
       quantityCapRefusals: this.stats.quantityCapRefusals,
       inventoryLimitRefusals: this.stats.inventoryLimitRefusals,
+      orphanedExposureRefusals: this.stats.orphanedExposureRefusals,
       expiredWhileWaiting: this.stats.expiredWhileWaiting,
       revalidationRejected: this.stats.revalidationRejected,
       revalidationPassed: this.stats.revalidationPassed,

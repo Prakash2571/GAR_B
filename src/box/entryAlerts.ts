@@ -201,6 +201,19 @@ const REASON_META: Record<
       "boundary, so the action was refused to avoid simulating away real exposure (or sending real " +
       "orders for a simulated one). Reconcile before trading.",
   },
+  unowned_attributed_exposure: {
+    // `fault`, not `operator_action`: the others in that category mean "nothing will trade until you
+    // change a setting". This one means REAL BROKER EXPOSURE IS OPEN AND NOTHING IS MANAGING IT, and
+    // no configuration change is the remedy. It must read as an incident, not a preference.
+    category: "fault",
+    remedy:
+      "ACT NOW — REAL EXPOSURE IS UNMANAGED. Box legs are confirmed at the broker that no open trade " +
+      "and no residual row accounts for, which is what a fill landing just before a crash looks like. " +
+      "Nothing is reducing it automatically and NO new box will be entered on ANY underlying until it " +
+      "is resolved. Verify the positions in the broker terminal, then either flatten the attributed " +
+      "exposure with the emergency control or reconcile it into a trade. Exits, protective " +
+      "cancellation and reconciliation remain available throughout — do not restart to clear this.",
+  },
 
   /* ── infrastructure ───────────────────────────────────────────────────────────────────── */
   feed_unhealthy: {

@@ -113,9 +113,37 @@ test("D2 the completed-trade ceiling is ALSO one, and the two are different boun
 });
 
 test("D3 a profile WITHOUT the attempt key resolves to UNLIMITED (why D1 matters)", () => {
-  // Demonstrates the pre-fix state directly rather than asserting it about history.
-  const cfg = effectiveConfigFromProfile({ BOX_SESSION_MAX_ENTRY_ATTEMPTS: undefined });
+  /*
+   * Demonstrates the pre-fix state directly rather than asserting it about history.
+   *
+   * `BOX_SUPERVISED_ONE_LOT_TRIAL` must be cleared to observe it. The profile now sets that flag,
+   * and the flag's whole purpose is that dropping this key can no longer resolve quietly to
+   * unlimited — see D3b. Clearing it here isolates the CODE DEFAULT, which is the hazard this test
+   * documents and which is unchanged: any deployment NOT running the supervised profile still gets
+   * an unbounded attempt budget from an absent key, and that is exactly why the profile exists.
+   */
+  const cfg = effectiveConfigFromProfile({
+    BOX_SESSION_MAX_ENTRY_ATTEMPTS: undefined,
+    BOX_SUPERVISED_ONE_LOT_TRIAL: undefined,
+  });
   assert.equal(cfg.sessionMaxEntryAttempts, 0, "0 is the code default and means unbounded");
+});
+
+test("D3b ...and with the supervised profile ON, dropping that key now REFUSES STARTUP", () => {
+  // The upgrade. The hazard in D3 was silent: the profile read as "one trade" and permitted an
+  // unbounded run of attempts. It is no longer reachable on a profile that claims the trial.
+  assert.throws(
+    () => effectiveConfigFromProfile({ BOX_SESSION_MAX_ENTRY_ATTEMPTS: undefined }),
+    /BOX_SESSION_MAX_ENTRY_ATTEMPTS=0.*requires exactly 1/s,
+    "the profile flag must convert a silently-unbounded trial into a boot failure",
+  );
+});
+
+test("D3c the profile DECLARES itself a supervised one-lot trial", () => {
+  // Without the flag the four bounds are advisory: correct today, unenforced tomorrow.
+  const cfg = effectiveConfigFromProfile();
+  assert.equal(cfg.supervisedOneLotTrial, true);
+  assert.equal(cfg.maxOpenBoxes, 1, "the MODE-INDEPENDENT ceiling, previously absent and unlimited");
 });
 
 /* ═════════════ 2. one lot, one box, one pipeline ═════════════ */

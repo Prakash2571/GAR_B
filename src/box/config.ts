@@ -19,6 +19,7 @@ import {
   ENTRY_SUBMIT_CONCURRENCY_MIN,
 } from "./executionSchedulingPolicy.js";
 import { normaliseAllowlist } from "./underlyingExclusions.js";
+import { SUPERVISED_TRIAL_ENV, supervisedTrialStartupRefusal } from "./supervisedTrial.js";
 import { readZerodhaStaticIpPolicy, type ZerodhaStaticIpPolicy } from "./zerodhaStaticIp.js";
 import type { BoxQueueModel, BoxScannerConfigSnapshot, ExecutionMode } from "./types.js";
 
@@ -786,6 +787,15 @@ export interface BoxConfig {
    */
   sessionMaxEntryAttempts: number;
   /**
+   * `BOX_SUPERVISED_ONE_LOT_TRIAL` — the opt-in one lot / one box / one attempt profile.
+   *
+   * Changes no behaviour on its own. It REQUIRES `maxOpenBoxes`, `liveMaxOpenBoxes`,
+   * `sessionMaxCompletedTrades` and `sessionMaxEntryAttempts` all to be exactly 1, and refuses
+   * startup otherwise. Outside the profile every general-purpose default is untouched.
+   * See `supervisedTrial.ts` for why all four are independently necessary.
+   */
+  supervisedOneLotTrial: boolean;
+  /**
    * Paper mirror of {@link liveMaxBoxCapitalRupees}, for `live_parity` validation. `0`
    * disables. LIVE remains the authoritative safety gate; this exists so a paper run can
    * exercise the same admission arithmetic.
@@ -1356,7 +1366,7 @@ export function loadBoxConfig(): BoxConfig {
     }
   }
 
-  return {
+  const resolved: BoxConfig = {
     executionMode: mode,
     simulatedDecisionMs: num("BOX_SIMULATED_DECISION_MS", 40),
     simulatedLatencyMs: num("BOX_SIMULATED_LATENCY_MS", 250),
@@ -1604,6 +1614,18 @@ export function loadBoxConfig(): BoxConfig {
     oneActiveBoxPerUnderlying: strictBool("BOX_ONE_ACTIVE_BOX_PER_UNDERLYING", false),
     sessionMaxCompletedTrades: strictLimitInt("BOX_SESSION_MAX_COMPLETED_TRADES", 0, 0, 10_000),
     sessionMaxEntryAttempts: strictLimitInt("BOX_SESSION_MAX_ENTRY_ATTEMPTS", 0, 0, 10_000),
+    /*
+     * THE SUPERVISED ONE-LOT TRIAL PROFILE. Off by default; see `supervisedTrial.ts`.
+     *
+     * `strictBool`, matching every other safety switch here: a typo must not resolve to the
+     * permissive setting. `BOX_SUPERVISED_ONE_LOT_TRIAL=ture` silently dropping the profile — and
+     * with it the requirement that all four one-shot bounds equal 1 — is precisely the failure the
+     * profile exists to prevent.
+     *
+     * The flag itself changes NO behaviour. It only makes the four bounds mandatory, which is
+     * asserted below, after the whole config is resolved.
+     */
+    supervisedOneLotTrial: strictBool(SUPERVISED_TRIAL_ENV, false),
     paperMaxBoxCapitalRupees: clampInt("BOX_PAPER_MAX_BOX_CAPITAL_RUPEES", 0, 0, 1_000_000_000),
 
     legExecutionMode:
@@ -1770,6 +1792,28 @@ export function loadBoxConfig(): BoxConfig {
     closedCacheEnabled: bool("BOX_CLOSED_CACHE_ENABLED", true),
     closedCacheTtlSec: num("BOX_CLOSED_CACHE_TTL_SEC", 3 * 24 * 60 * 60),
   };
+
+  /*
+   * THE SUPERVISED ONE-LOT TRIAL'S FOUR BOUNDS ARE CHECKED HERE, AND ONLY HERE.
+   *
+   * Deliberately AFTER the whole object is resolved rather than beside each `strictLimitInt` call.
+   * The requirement is a relationship BETWEEN four settings, and the values that matter are the
+   * EFFECTIVE ones — post-clamp, post-invalid-fallback. Checking them at their individual parse sites
+   * would compare what was typed, which is exactly the distinction `effectiveConfig.ts` exists to
+   * make. This sees what the engine will actually run with.
+   *
+   * It refuses STARTUP, matching the live-mode kill switches above: a supervised trial whose bounds
+   * are quietly wider than the operator believes is the precise failure the profile exists to
+   * prevent, and three of the four settings default to UNLIMITED, so forgetting one is not a
+   * narrower trial — it is an unbounded one.
+   *
+   * MODE-INDEPENDENT ON PURPOSE. A paper rehearsal of the trial must exercise the same bounds as the
+   * live run, or the rehearsal is evidence about nothing.
+   */
+  const trialRefusal = supervisedTrialStartupRefusal(resolved.supervisedOneLotTrial, resolved);
+  if (trialRefusal !== null) throw new Error(trialRefusal);
+
+  return resolved;
 }
 
 /**
