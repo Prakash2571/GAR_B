@@ -165,6 +165,14 @@ export interface BrokerPosition {
 export interface BrokerMargin {
   available: number | null;
   utilised: number | null;
+  /**
+   * Every numeric field the funds endpoint carried, keyed by the broker's own field name.
+   *
+   * Optional so an adapter that cannot supply it keeps working unchanged. Present, it lets the
+   * admission gate resolve a non-default funds basis from the SAME payload the dashboard shows,
+   * which is what stops the two disagreeing about one account.
+   */
+  components?: Record<string, number | null>;
 }
 
 export interface BrokerHealth {

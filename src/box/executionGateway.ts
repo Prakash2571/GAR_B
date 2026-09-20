@@ -314,6 +314,14 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     funds?: () => Promise<{
       availableRupees: number | null;
       utilisedRupees?: number | null;
+      /**
+       * Every numeric field the funds endpoint carried, keyed by the broker's own field name.
+       *
+       * Optional. Present, it lets `usableFundsRupees` resolve a non-default
+       * `BOX_ZERODHA_FUNDS_BASIS` from the SAME payload the dashboard publishes — which is what stops
+       * the gate and the tile reporting different spendable figures for one account.
+       */
+      components?: Record<string, number | null> | null;
       observedAt: number;
     } | null>;
     /**
@@ -2120,6 +2128,10 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
       broker: currentIdentity?.broker ?? null,
       availableRupees: fundsObs.value?.availableRupees ?? null,
       utilisedRupees: fundsObs.value?.utilisedRupees ?? null,
+      components: fundsObs.value?.components ?? null,
+      // The SAME config field the dashboard tracker reads, so one account cannot yield two spendable
+      // figures depending on which surface is asked.
+      basis: this.deps.cfg.zerodhaFundsBasis,
     });
     const picture = buildEconomicPicture({
       requests,

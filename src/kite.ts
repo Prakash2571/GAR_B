@@ -621,12 +621,17 @@ export class KiteClient {
    * THROWS on an auth failure (and drops the session, like every other authenticated read here), so a
    * dead token surfaces as a dead token rather than as ₹0.
    */
-  async getFunds(): Promise<{ available: number | null; utilised: number | null }> {
+  async getFunds(): Promise<{
+    available: number | null;
+    utilised: number | null;
+    components: Record<string, number | null>;
+  }> {
     const { status, ok, json } = await this.getJson<{
       status: string;
       data?: {
-        available?: { live_balance?: unknown; cash?: unknown };
-        utilised?: { debits?: unknown };
+        net?: unknown;
+        available?: Record<string, unknown>;
+        utilised?: Record<string, unknown>;
       };
       message?: string;
     }>(`${KITE_API_ROOT}/user/margins/equity`);
@@ -636,9 +641,36 @@ export class KiteClient {
     }
     const num = (v: unknown): number | null =>
       typeof v === "number" && Number.isFinite(v) ? v : null;
+    /*
+     * CAPTURE THE WHOLE BREAKDOWN, not just the two headline numbers.
+     *
+     * This response carries a dozen distinct figures and this method used to read two and discard
+     * the rest — so an operator whose headline read far below their own Kite funds screen had no way
+     * to find out which component accounted for the difference. The evidence was fetched, parsed and
+     * thrown away in the same function.
+     *
+     * Every nested numeric is forwarded under its VENDOR field name (`available.collateral`,
+     * `utilised.span`, …) so the published snapshot can be held beside the broker's screen and
+     * compared directly. Non-numeric and absent fields are simply not present — `null` here would
+     * claim the broker reported an unknown, which is different from not reporting the field at all.
+     */
+    const components: Record<string, number | null> = {};
+    const net = num(json.data.net);
+    if (net !== null) components.net = net;
+    for (const group of ["available", "utilised"] as const) {
+      const bag = json.data[group];
+      if (bag === null || typeof bag !== "object") continue;
+      for (const [key, raw] of Object.entries(bag as Record<string, unknown>)) {
+        const value = num(raw);
+        if (value !== null) components[`${group}.${key}`] = value;
+      }
+    }
     return {
+      // Unchanged: the DEFAULT basis stays `available.live_balance`, so nothing about the figure this
+      // method has always returned is altered by capturing more of the payload.
       available: num(json.data.available?.live_balance),
       utilised: num(json.data.utilised?.debits),
+      components,
     };
   }
 

@@ -69,6 +69,53 @@ This is not a hypothetical distinction. It shipped:
 refused?", not "the banner says we are safe".** When in doubt, the honest test is the one the
 regression suites use: assert that **no order reached the broker**.
 
+### 1.2 Trading ANY underlying except the excluded ones
+
+This posture is supported, and it is a configuration, not a code change — but two things have to move
+together or nearly every name is silently refused.
+
+**The two identity controls are separate on purpose:**
+
+| Control | Fails | Right tool for |
+|---|---|---|
+| `BOX_LIVE_ALLOWED_UNDERLYINGS` (allowlist) | **closed** — a name not on a non-empty list cannot be entered | "only these few names" |
+| `box_excluded_underlyings` (operator blocklist) | **open** — a name added to the universe later is not excluded | "everything except these few" |
+
+For "any stock except the ones I excluded": leave `BOX_LIVE_ALLOWED_UNDERLYINGS` **empty** (which
+already means *no identity constraint*) and put the names you refuse in the blocklist. Both are
+**ENTRY-only**: excluding a name never traps an open Box, and an emptied allowlist never affects
+reduction.
+
+**THE PART THAT CATCHES PEOPLE: the quantity caps.** `BOX_LIVE_MAX_OPEN_LEG_QUANTITY` is an absolute
+**unit** count. Exchange lot sizes differ by an order of magnitude, so one unit number cannot mean
+"one lot" for more than one instrument. A cap of `65` refuses NIFTY at a lot of 75 and everything
+larger — while still reading like a one-lot bound. Raising it to cover the biggest lot is not a fix
+either: it then permits **many** lots of everything smaller.
+
+Express the bound in **lots** instead, and keep the unit cap as a real backstop:
+
+```
+BOX_LIVE_ALLOWED_UNDERLYINGS=              # empty = any name; the blocklist does the excluding
+BOX_LIVE_MAX_LOTS_PER_LEG=1                # one lot of WHATEVER this instrument is
+BOX_LIVE_MAX_OPEN_LEG_QUANTITY=2000        # absolute backstop, above the largest lot you will carry
+BOX_LIVE_MAX_GROSS_OPEN_LEG_QUANTITY=8000  # 4x the per-leg backstop
+BOX_LIVE_MAX_BOX_CAPITAL_RUPEES=<figure>   # THE control that matters here — see below
+```
+
+Both bounds are enforced and the tighter governs. The unit cap **cannot** be set to 0: a queued
+reduction is gated on `quantity <= BOX_LIVE_MAX_OPEN_LEG_QUANTITY`, so 0 would refuse to send exits
+and strand exposure.
+
+> **On a multi-underlying posture the rupee ceiling is the real risk control, not the quantity caps.**
+> One lot of a ₹3,000 stock and one lot of a ₹60 stock are not comparable risk and no quantity cap can
+> tell them apart. `BOX_LIVE_MAX_BOX_CAPITAL_RUPEES` can, and is required in live.
+
+**Two things widen at once when you empty the allowlist, and both deserve a decision rather than a
+shrug:** a one-attempt supervised trial now has its single attempt spent on whatever name the board
+happens to surface first, which may be far less liquid than NIFTY; and the margin required per box
+varies with the underlying, so an envelope that clears for one name may not clear for another.
+Consider keeping the allowlist populated for the *first* supervised session and opening it afterwards.
+
 ### Known gaps in the control set
 
 | # | Gap | Consequence for the trial |
@@ -339,6 +386,32 @@ read) the durable order-intent journal before anything is transmitted. During an
 **Detecting it — and the trap.** `pg_ready` is a **STARTUP LATCH**: it records whether PostgreSQL
 answered when the process booted. A store that dies **mid-session leaves it `true` for the rest of the
 day.** So:
+
+### 6.2a "Available margin to trade" looks far too small
+
+Before concluding the figure is wrong, read `account_funds` on `GET /api/box/status`. It now publishes
+the broker's **full** breakdown under the vendor's own field names, so this is decidable rather than a
+guess:
+
+| Check | Conclusion |
+|---|---|
+| `age_ms` large, or `fresh: false` | You are looking at a **stale** figure. A failed refresh keeps the previous number on screen, marked stale. Nothing is wrong with the arithmetic. |
+| `components["available.collateral"]` is large and `basis` is `live_balance` | The headline is the **cash side only**; your pledged-holdings margin is not in it. This is the usual cause of a headline far below the Kite screen. See `BOX_ZERODHA_FUNDS_BASIS` in `.env.example`. |
+| `components["available.cash"]` large but `available.live_balance` small, with a large `utilised.debits` | The headline is **correct** — most of the account is already blocked by existing positions. |
+| `broker_utilised_rupees: null` | A different problem: `encumbrance_netted` goes false and the funding gate refuses on an *unknown* encumbrance rather than on an insufficient one. |
+
+**Why the default is not simply "use the bigger number".** Overstating spendable funds admits an entry
+the account cannot fund; the broker then rejects a leg mid-sequence and leaves partially-executed
+exposure. Understating only refuses affordable entries. Zerodha's support documentation also states
+the available figure already reflects collateral benefits — if that is true of `live_balance`, adding
+collateral double-counts it. So the basis is selected by the operator **from the published
+breakdown**, not guessed by the code.
+
+**This figure gates entry.** With `BOX_LIVE_REQUIRE_STAGE_FUNDING=true`, admission compares it against
+the binding hedge-first stage requirement **plus** `BOX_LIVE_RECOVERY_RESERVE_RUPEES` plus estimated
+charges. An understated figure refuses entry with `insufficient_available_funds` and the readiness
+blocker `funding_insufficient_available_funds` — so getting this right is a precondition for the
+trial, not a cosmetic fix.
 
 | Signal | Meaning |
 |---|---|

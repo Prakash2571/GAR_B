@@ -276,7 +276,24 @@ export class KiteHttpTransport implements KiteBrokerTransport {
     const data = await this.request<Record<string, unknown>>("GET", "/user/margins/equity");
     const available = numericPath(data, "available", "live_balance");
     const utilised = numericPath(data, "utilised", "debits");
-    return { available, utilised };
+    /*
+     * The FULL breakdown travels with the two headline numbers, for the same reason it does on the
+     * dashboard read in `src/kite.ts`: the admission gate resolves the configured funds basis from
+     * these components, and if only this path carried the narrow pair then the gate and the tile
+     * could apply different bases to the same account. `usableFundsRupees` is the single place the
+     * basis is honoured; both callers must be able to feed it.
+     */
+    const components: Record<string, number | null> = {};
+    const net = typeof data.net === "number" && Number.isFinite(data.net) ? data.net : null;
+    if (net !== null) components.net = net;
+    for (const group of ["available", "utilised"] as const) {
+      const bag = data[group];
+      if (bag === null || typeof bag !== "object") continue;
+      for (const [key, raw] of Object.entries(bag as Record<string, unknown>)) {
+        if (typeof raw === "number" && Number.isFinite(raw)) components[`${group}.${key}`] = raw;
+      }
+    }
+    return { available, utilised, components };
   }
 
   async health(): Promise<BrokerHealth> {
