@@ -209,11 +209,22 @@ export interface TrialQuantityArithmetic {
  */
 export function supervisedTrialQuantities(input: TrialQuantityInput): TrialQuantityArithmetic {
   const { perLegCap, grossCap } = input;
-  const lotSize = Math.floor(input.lotSize);
-  if (!Number.isFinite(lotSize) || lotSize <= 0) {
+  /*
+   * NO ROUNDING. THIS USED TO BE `Math.floor(input.lotSize)`.
+   *
+   * `--lot-size=65.5` therefore became 65, and the report then stated "one lot (live instrument
+   * master) = 65 unit(s)" — presenting a fabricated number as a reading taken from the broker. A lot
+   * size is an integer contract property, so a fractional input is not an imprecise reading that can
+   * be tidied up: it means the operator mistyped it, read the wrong field, or is guessing. Every one
+   * of those has to stop the preflight, because the entire envelope is computed from this number and
+   * the whole point of the report is that it is not invented.
+   */
+  const lotSize = input.lotSize;
+  if (!Number.isInteger(lotSize) || lotSize <= 0) {
     throw new Error(
-      `supervisedTrialQuantities: lotSize must be a positive integer read from the live instrument ` +
-        `master, got ${String(input.lotSize)}. Do not assume 75 or 65 — read it.`,
+      `supervisedTrialQuantities: lotSize must be a POSITIVE INTEGER read from the live instrument ` +
+        `master, got ${String(input.lotSize)}. A fractional or non-numeric value is refused rather ` +
+        `than rounded — rounding it would report a lot size nobody read. Do not assume 75 or 65.`,
     );
   }
   const perLeg = lotSize;
@@ -257,20 +268,60 @@ export function supervisedTrialQuantities(input: TrialQuantityInput): TrialQuant
 
 /* ══════════════════════════════ the preflight report ══════════════════════════════ */
 
+/** Exit status for the preflight CLI. Distinct codes so a wrapper script can tell them apart. */
+export const PREFLIGHT_EXIT = {
+  /** Everything required is satisfied AND one lot is admissible under both caps. */
+  PASS: 0,
+  /** The preflight did NOT pass: a cap refuses, a bound is wrong, or the quantity is UNVERIFIED. */
+  FAIL: 1,
+  /** The invocation or the configuration is unusable — bad `--lot-size`, or a config that cannot boot. */
+  INVALID: 2,
+} as const;
+
+/**
+ * THE STRUCTURED PREFLIGHT VERDICT — `ok` is the exit code, and the text can never disagree with it.
+ *
+ * WHY THIS TYPE EXISTS. `renderSupervisedTrialPreflight` used to return only a string, and the CLI
+ * derived nothing from it, so with `--lot-size=101` the report printed
+ *
+ *     per-leg cap  BOX_LIVE_MAX_OPEN_LEG_QUANTITY=100 -> 101 <= 100 ? REFUSED
+ *     gross cap    BOX_LIVE_MAX_GROSS_OPEN_LEG_QUANTITY=400 -> 404 <= 400 ? REFUSED
+ *
+ * and then finished with "VERDICT: the four required settings are satisfied and the quantity
+ * arithmetic is shown above." and **exit code 0**. Every individual line was true; the verdict and
+ * the exit status were not. A preflight that exits 0 while stating that no leg of the box can be sent
+ * is worse than no preflight, because a wrapper script — and a tired operator scrolling to the last
+ * line — reads the verdict, not the arithmetic.
+ *
+ * `ok` is computed from the same facts the text is rendered from, in one place, so the two cannot
+ * drift apart again.
+ */
+export interface SupervisedTrialPreflight {
+  /** TRUE only when this configuration could actually run the trial, quantities included. */
+  readonly ok: boolean;
+  /** Process exit code. See {@link PREFLIGHT_EXIT}. */
+  readonly exitCode: number;
+  /** Machine-readable reasons the preflight did not pass. Empty iff `ok`. */
+  readonly failures: readonly string[];
+  /** The operator-facing report. */
+  readonly text: string;
+}
+
 /**
  * The operator-facing preflight block: the four pinned settings, then the quantity arithmetic.
  *
  * `lotSize` is optional ONLY so the settings half can be printed before an operator has read the
- * instrument master. When it is absent the report says the arithmetic is unverified rather than
- * filling in a plausible number, because a plausible number is what this is meant to prevent.
+ * instrument master. When it is absent the report says the arithmetic is UNVERIFIED rather than
+ * filling in a plausible number — and does NOT pass, because an unverified envelope is not a checked
+ * one.
  */
-export function renderSupervisedTrialPreflight(args: {
+export function supervisedTrialPreflight(args: {
   readonly enabled: boolean;
   readonly settings: SupervisedTrialSettings;
   readonly lotSize?: number | null;
   readonly perLegCap: number;
   readonly grossCap: number;
-}): string {
+}): SupervisedTrialPreflight {
   const out: string[] = ["SUPERVISED ONE-LOT TRIAL PREFLIGHT", "=================================="];
   out.push(`${SUPERVISED_TRIAL_ENV}=${args.enabled ? "true" : "false"}`);
   if (!args.enabled) {
@@ -304,34 +355,108 @@ export function renderSupervisedTrialPreflight(args: {
     out.push(`  ${mark}  ${spec.env}=${actual}${note}`);
   }
 
+  const failures: string[] = [];
+  for (const v of violations.values()) {
+    if (args.enabled) failures.push(`${v.env}=${v.actual} (requires 1)`);
+  }
+
   out.push("", "QUANTITY ARITHMETIC");
+  let quantities: TrialQuantityArithmetic | null = null;
   if (args.lotSize == null) {
     out.push(
       "  UNVERIFIED — no lot size supplied. Read the CURRENT lot size for the contract being traded",
       "  from the live instrument master and re-run with --lot-size=<n>. Do not assume 75 or 65.",
     );
+    // UNVERIFIED IS NOT A PASS. The envelope is the thing most likely to be wrong on the day, and an
+    // exit code of 0 here would let a wrapper script treat "we did not check" as "we checked".
+    failures.push("quantity envelope UNVERIFIED (no --lot-size supplied)");
   } else {
-    for (const line of supervisedTrialQuantities({
+    quantities = supervisedTrialQuantities({
       lotSize: args.lotSize,
       perLegCap: args.perLegCap,
       grossCap: args.grossCap,
-    }).lines) {
-      out.push(`  ${line}`);
+    });
+    for (const line of quantities.lines) out.push(`  ${line}`);
+    /*
+     * A REFUSED CAP IS A PREFLIGHT FAILURE. This is the correction: these two conditions were
+     * rendered into the text and then ignored by the verdict and the exit code.
+     *
+     * Either one means NO leg of a one-lot box can be sent, so the trial cannot run at all — a
+     * strictly worse state than a mis-set bound, because it is invisible until the first entry is
+     * refused at the send boundary.
+     */
+    if (!quantities.perLegOk) {
+      failures.push(
+        `per-leg quantity ${quantities.perLeg} exceeds BOX_LIVE_MAX_OPEN_LEG_QUANTITY=${quantities.perLegCap}`,
+      );
+    }
+    if (!quantities.grossOk) {
+      failures.push(
+        `gross quantity ${quantities.gross} exceeds BOX_LIVE_MAX_GROSS_OPEN_LEG_QUANTITY=${quantities.grossCap}`,
+      );
     }
   }
 
   const refusal = supervisedTrialStartupRefusal(args.enabled, args.settings);
-  out.push(
-    "",
-    !args.enabled
-      ? `VERDICT: NOT CONFIGURED FOR THE SUPERVISED TRIAL. Set ${SUPERVISED_TRIAL_ENV}=true (and all ` +
-        `four settings to 1) on the host that will run it.`
-      : refusal === null
-        ? args.lotSize == null
-          ? "VERDICT: the four required settings are satisfied. The QUANTITY envelope is still " +
-            "UNVERIFIED — supply the live lot size."
-          : "VERDICT: the four required settings are satisfied and the quantity arithmetic is shown above."
-        : `VERDICT: STARTUP WOULD BE REFUSED.\n${refusal}`,
-  );
-  return out.join("\n");
+
+  /*
+   * THE VERDICT, computed from `failures` rather than written independently of it.
+   *
+   * The profile being OFF is reported as NOT CONFIGURED rather than as a pass: this command exists to
+   * answer "is this host set up for the supervised trial?", and "no" is not a success.
+   */
+  const ok = args.enabled && refusal === null && failures.length === 0;
+  out.push("");
+  if (!args.enabled) {
+    out.push(
+      `VERDICT: NOT CONFIGURED FOR THE SUPERVISED TRIAL. Set ${SUPERVISED_TRIAL_ENV}=true (and all ` +
+        `four settings to 1) on the host that will run it.`,
+    );
+  } else if (refusal !== null) {
+    out.push(`VERDICT: FAILED — STARTUP WOULD BE REFUSED.\n${refusal}`);
+  } else if (failures.length > 0) {
+    // The four bounds are satisfied, so name what is actually wrong instead of implying all is well.
+    const unverified = args.lotSize == null;
+    out.push(
+      unverified
+        ? "VERDICT: NOT VERIFIED — the four required settings are satisfied, but the QUANTITY envelope " +
+          "was not checked. Supply the lot size you read from the live instrument master."
+        : "VERDICT: FAILED — the four required settings are satisfied, but ONE LOT CANNOT BE SENT " +
+          "under the configured quantity caps:",
+    );
+    if (!unverified) {
+      for (const f of failures) out.push(`  · ${f}`);
+      out.push(
+        "  No leg of a one-lot box would be admitted, so the trial cannot run. Either raise the cap " +
+          "you intend to carry, or trade a contract whose lot fits the envelope. Do NOT raise a cap " +
+          "merely to make this line go away.",
+      );
+    }
+  } else {
+    out.push(
+      `VERDICT: PASS — the four required settings are satisfied and one lot of ${quantities?.lotSize} ` +
+        `unit(s) is admissible under both quantity caps.`,
+    );
+  }
+
+  // Every non-pass reached here is a FAIL. `INVALID` (2) is reserved for the CLI's own input and
+  // boot-failure paths, which never get as far as building a report.
+  return { ok, exitCode: ok ? PREFLIGHT_EXIT.PASS : PREFLIGHT_EXIT.FAIL, failures, text: out.join("\n") };
+}
+
+/**
+ * Text-only view, kept for callers that render the report and nothing else.
+ *
+ * DO NOT use this to decide anything. It deliberately cannot express the verdict, which is exactly
+ * how the original defect happened — the report was printed and the outcome discarded. Use
+ * {@link supervisedTrialPreflight} and read `ok` / `exitCode`.
+ */
+export function renderSupervisedTrialPreflight(args: {
+  readonly enabled: boolean;
+  readonly settings: SupervisedTrialSettings;
+  readonly lotSize?: number | null;
+  readonly perLegCap: number;
+  readonly grossCap: number;
+}): string {
+  return supervisedTrialPreflight(args).text;
 }

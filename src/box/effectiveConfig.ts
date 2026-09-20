@@ -55,7 +55,7 @@
  */
 
 import { loadBoxConfig, type BoxConfig } from "./config.js";
-import { renderSupervisedTrialPreflight } from "./supervisedTrial.js";
+import { PREFLIGHT_EXIT, supervisedTrialPreflight } from "./supervisedTrial.js";
 
 /** Where a resolved value came from. */
 export type ConfigProvenance =
@@ -446,24 +446,46 @@ export function main(argv: readonly string[] = process.argv.slice(2)): void {
       process.exitCode = 2;
       return;
     }
+    /*
+     * `--lot-size` PARSING. Rejected rather than coerced, on every bad input.
+     *
+     * `Number("65.5")` is 65.5 and passed `Number.isFinite`, and the arithmetic then floored it to
+     * 65 and reported "one lot (live instrument master) = 65 unit(s)" — a fabricated figure
+     * presented as a broker reading. A lot size is an integer contract property, so a fractional
+     * value is not an imprecise reading to tidy up; it means the operator mistyped it, read the
+     * wrong field, or is guessing. Each of those must stop the preflight.
+     *
+     * `Number("")` is 0 and `Number(" ")` is 0, which is why the empty/blank case is handled
+     * explicitly instead of relying on the numeric test.
+     */
     const raw = argv.find((a) => a.startsWith("--lot-size="))?.slice("--lot-size=".length);
-    const lotSize = raw === undefined || raw === "" ? null : Number(raw);
-    if (lotSize !== null && (!Number.isFinite(lotSize) || lotSize <= 0)) {
-      process.stderr.write(`--lot-size must be a positive integer read from the live instrument master, got "${raw}"\n`);
-      process.exitCode = 2;
-      return;
+    let lotSize: number | null = null;
+    if (raw !== undefined) {
+      const trimmed = raw.trim();
+      const parsed = trimmed === "" ? Number.NaN : Number(trimmed);
+      if (!Number.isInteger(parsed) || parsed <= 0) {
+        process.stderr.write(
+          `--lot-size must be a POSITIVE INTEGER read from the live instrument master, got "${raw}".\n` +
+            `A fractional value is refused rather than rounded: rounding it would report a lot size ` +
+            `nobody read. Read the current lot for the contract being traded and pass that exact ` +
+            `integer. Do not assume 75 or 65.\n`,
+        );
+        process.exitCode = PREFLIGHT_EXIT.INVALID;
+        return;
+      }
+      lotSize = parsed;
     }
-    process.stdout.write(
-      `${renderSupervisedTrialPreflight({
-        enabled: cfg.supervisedOneLotTrial,
-        settings: cfg,
-        lotSize,
-        perLegCap: cfg.liveMaxOpenLegQuantity,
-        grossCap: cfg.liveMaxGrossOpenLegQuantity,
-      })}\n`,
-    );
-    // A non-zero exit so a preflight script cannot mistake an unsatisfied profile for a pass.
-    if (cfg.supervisedOneLotTrial && lotSize === null) process.exitCode = 1;
+
+    // ONE call, and its `ok` decides the exit code — so the text and the status cannot disagree.
+    const verdict = supervisedTrialPreflight({
+      enabled: cfg.supervisedOneLotTrial,
+      settings: cfg,
+      lotSize,
+      perLegCap: cfg.liveMaxOpenLegQuantity,
+      grossCap: cfg.liveMaxGrossOpenLegQuantity,
+    });
+    process.stdout.write(`${verdict.text}\n`);
+    process.exitCode = verdict.exitCode;
     return;
   }
 

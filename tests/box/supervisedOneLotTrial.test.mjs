@@ -453,13 +453,22 @@ test("THE TRAP: a SMALLER lot lets the caps permit more than one box, and it say
 });
 
 test("a missing or nonsensical lot size is REFUSED, never defaulted", () => {
-  for (const bad of [0, -75, Number.NaN, Number.POSITIVE_INFINITY]) {
+  // FRACTIONS ARE REFUSED TOO, and that is the important addition: this used to `Math.floor` the
+  // input, so 65.5 silently became 65 and was then reported as a reading from the instrument master.
+  // A lot size is an integer contract property, so a fractional value means the operator mistyped it
+  // or is guessing — neither is something to tidy up.
+  for (const bad of [0, -75, Number.NaN, Number.POSITIVE_INFINITY, 65.5, 74.9, 0.5]) {
     assert.throws(
       () => supervisedTrialQuantities({ lotSize: bad, perLegCap: 100, grossCap: 400 }),
-      /Do not assume 75 or 65 — read it/,
+      /POSITIVE INTEGER/,
       `lotSize=${String(bad)} must throw`,
     );
   }
+  // And the refusal still says where to get the real number.
+  assert.throws(
+    () => supervisedTrialQuantities({ lotSize: 65.5, perLegCap: 100, grossCap: 400 }),
+    /refused rather than rounded/,
+  );
 });
 
 test("a disabled cap is reported as disabled, not as a pass", () => {
@@ -486,7 +495,11 @@ test("the preflight report shows the four settings AND the arithmetic", () => {
   for (const spec of SUPERVISED_ONE_SHOT_SETTINGS) assert.ok(text.includes(`${spec.env}=1`), `${spec.env} shown`);
   assert.match(text, /per-leg quantity/);
   assert.match(text, /gross quantity     = 75 x 4 legs = 300/);
-  assert.match(text, /VERDICT: the four required settings are satisfied/);
+  // The verdict now states PASS explicitly, and only when the quantities are admissible too — the
+  // old wording ("the four required settings are satisfied and the quantity arithmetic is shown
+  // above") was printed even when both caps REFUSED the lot.
+  assert.match(text, /VERDICT: PASS/);
+  assert.match(text, /one lot of 75 unit\(s\) is admissible under both quantity caps/);
 });
 
 test("the preflight report says UNVERIFIED rather than guessing a lot size", () => {
@@ -494,7 +507,8 @@ test("the preflight report says UNVERIFIED rather than guessing a lot size", () 
   assert.match(text, /UNVERIFIED/);
   assert.match(text, /Do not assume 75 or 65/);
   assert.doesNotMatch(text, /gross quantity\s+=/, "no arithmetic may be printed without a real lot size");
-  assert.match(text, /QUANTITY envelope is still UNVERIFIED/);
+  assert.match(text, /VERDICT: NOT VERIFIED/, "UNVERIFIED is not a pass");
+  assert.doesNotMatch(text, /VERDICT: PASS/);
 });
 
 test("the preflight report does NOT cry FAIL when the profile is off", () => {
