@@ -158,6 +158,7 @@ import { orderStreamStatus } from "./orderStreamStatus.js";
 // runtime-status endpoint so the two can never publish disagreeing verdicts.
 import {
   buildOperationalReadiness,
+  unownedAttributedExposureBlocker,
   type OperationalReadinessDecision,
   type ReadinessBlocker,
   type MarketDataSource,
@@ -7956,6 +7957,27 @@ export class BoxEngine {
           (mismatchedPositions.length + foreignResiduals.length > parts.length ? " …" : ""),
       });
     }
+    /*
+     * EXPOSURE WE RECONSTRUCTED BUT NOTHING OWNS — see `unownedAttributedExposureBlocker` for the
+     * full reasoning. The derivation is shared with its tests so the two cannot drift, and it uses
+     * the SAME crash-only filter as `flattenAttributedBoxExposure`, so what is reported here is
+     * exactly what the emergency control would act on.
+     */
+    if (this.orderManager) {
+      const projectedSymbols = new Set<string>();
+      for (const position of this.positions.list()) {
+        for (const role of BOX_LEG_ROLES) {
+          const instrument = position.legs[role];
+          projectedSymbols.add(`${instrument.exchange}:${instrument.tradingsymbol}`);
+        }
+      }
+      const unownedBlocker = unownedAttributedExposureBlocker({
+        attributed: this.orderManager.attributedRecoveryExposure(),
+        projectedSymbols,
+      });
+      if (unownedBlocker !== null) engineBlockers.push(unownedBlocker);
+    }
+
     // FUNDING ADMISSION, surfaced in the ONE authoritative readiness decision.
     //
     // Previously a funding refusal existed only inside the OPEN `economic_admission` blob, so the
@@ -7981,6 +8003,17 @@ export class BoxEngine {
       // The ordering identity travels WITH the decision it orders, so a client never has to
       // correlate two responses to work out which process spoke.
       instance: this.backendInstance.identity(),
+      /*
+       * The durable store's health, so the reduction verdict cannot claim exits are available while
+       * the write that precedes every broker order would fail. Both signals are needed:
+       * `isBoxDbEnabled()` is the pool latch (probed once at init), and `health.persistence` is the
+       * observed-write-outcome latch that catches a mid-session outage the pool latch misses.
+       * `"unknown"` (no write attempted yet) is passed through as-is and is not read as an outage.
+       */
+      persistence: {
+        durableStoreReady: isBoxDbEnabled(),
+        durableWrites: live ? live.health.persistence : "unknown",
+      },
       identity: {
         broker: activeBroker,
         // `brokerAccountRef` is already documented as a NON-SECRET reference (masked id / hash,

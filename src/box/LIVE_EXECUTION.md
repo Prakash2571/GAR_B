@@ -11,7 +11,7 @@ BOX_EXECUTION_MODE=live
 BOX_LIVE_TRADING_ENABLED=true
 ```
 
-`BOX_EXECUTION_MODE` defaults to `paper_latency`; `BOX_LIVE_TRADING_ENABLED` defaults to `false`. Unknown execution modes fail during configuration instead of falling back to paper. Live startup also requires a ready Box Mongo connection, `KITE_API_KEY`, and a current restored Kite access-token session.
+`BOX_EXECUTION_MODE` defaults to `paper_latency`; `BOX_LIVE_TRADING_ENABLED` defaults to `false`. Unknown execution modes fail during configuration instead of falling back to paper. Live startup also requires a ready **PostgreSQL** connection (the authoritative operational store), `KITE_API_KEY`, and a current restored Kite access-token session. MongoDB is **not** required to boot or to trade: it is an asynchronous reporting replica fed from a durable outbox.
 
 Live additionally requires `BOX_LIVE_MAX_BOX_CAPITAL_RUPEES` to name a positive rupee figure. Unset and `0` both mean "no ceiling" for that variable, so `loadBoxConfig()` refuses either while the mode is `live`: it is the only *monetary* containment on a single Box, and the two quantity ceilings are not a substitute because they bound lots, and a Box can satisfy both while committing an arbitrary rupee amount — notional is price × quantity, and neither cap constrains price. Paper is untouched, where the equivalent `BOX_PAPER_MAX_BOX_CAPITAL_RUPEES=0` costs nothing. Paper profiles cannot reach broker mutations even if credentials are present: no live manager/adapter is constructed, and poison-adapter regressions fail on any accidental mutation.
 
@@ -64,19 +64,66 @@ This reduces, but does not remove, legging risk. See "Remaining broker leg risk"
 
 ## Source of truth and persistence
 
-Broker orders and broker positions are authoritative for live fills and exposure. Mongo stores the durable strategy/accounting projection and the append-only order-intent journal. A deterministic identity such as `BOX:<trade-id>:ENTRY:k1_ce:attempt-1` is persisted before submission. `CREATED -> SUBMITTING` is an expected-state compare-and-set: only the manager whose durable transition was applied may POST, while losers adopt or reconcile the existing intent. Ambiguous or working outcomes retain identity and are never blindly resubmitted.
+Broker orders and broker positions are authoritative for live fills and exposure. **PostgreSQL** stores the durable strategy/accounting projection and the append-only order-intent journal; it is the operational authority. **MongoDB is an asynchronous, non-authoritative reporting replica** fed through the outbox — a Mongo backlog, dead-letter or outage delays reporting and blocks nothing operational. A deterministic identity such as `BOX:<trade-id>:ENTRY:k1_ce:attempt-1` is persisted before submission. `CREATED -> SUBMITTING` is an expected-state compare-and-set: only the manager whose durable transition was applied may POST, while losers adopt or reconcile the existing intent. Ambiguous or working outcomes retain identity and are never blindly resubmitted.
 
 Residual reduction uses the same rule explicitly: **same logical submission means the same identity; a new flatten attempt for still-outstanding quantity means a new identity**. `ResidualLegExposure.flatten_attempt` advances only after a terminal broker result or an applied local `REJECTED` transition that proves no broker mutation occurred. Partial retries submit the exact durable remainder.
 
 Guarded order persistence reports the durable pre-write and post-write cumulative quantities. Position attribution uses that durable delta, never a caller's potentially stale snapshot. Broker cumulative quantity remains fill authority; an ACK or state label alone never creates exposure.
 
-Redis is a cache, **not** a write-ahead log. There is no filesystem WAL or broker-only recovery mode. During a total Mongo outage the service fails closed and cannot create a new durable exit or residual intent. If live boot fails because Mongo is unavailable, restore Mongo and restart the process before operating live Box execution. A mid-session persistence failure blocks new risk, trips the circuit breaker, and moves affected projections to recovery where applicable.
+Redis is a cache, **not** a write-ahead log. There is no filesystem WAL and no broker-only recovery mode.
+
+### What a PostgreSQL outage actually stops
+
+**Everything that reaches the broker needs PostgreSQL first, including every reduction.** This is the
+single most important operational fact in this document, and it is easy to get wrong in the other
+direction:
+
+| Operation | During a PostgreSQL outage |
+|---|---|
+| New ENTRY | Refused. Fails closed. |
+| Normal EXIT | **Refused, and nothing is transmitted.** `execute()` performs two awaited durable writes before the transport call — `persistence.create` (the CREATED row) and the `CREATED -> SUBMITTING` compare-and-set — for *every* purpose. The guard after the CAS reads "broker POST blocked". |
+| EMERGENCY_RESIDUAL flatten | **Refused.** Identical code path to a normal exit. |
+| Protective cancel sweep | **Refused, nothing attempted.** The bare cancel does POST before writing, but `cancelWorkingBoxOrders` must first READ the intent journal (`loadNonterminal()`) to know *which* orders to cancel. It returns a structured `{ ok: false, attempted: false, blocked_reason }` rather than throwing. |
+| Reconciliation | **Fails closed.** It opens with `loadNonterminal()` + `loadOwned()`, sets `health.persistence = "unhealthy"`, reports reconciliation incomplete and trips the breaker. |
+
+A reduction during an outage is therefore **refused, not queued**: nothing is transmitted, and open
+exposure is unchanged and still owned. The readiness surface reports this as the ENTRY-and-REDUCTION
+scoped blocker `durable_store_unavailable`, and `exposure_management.exit_and_reduce`,
+`protective_cancel` and `manage_working_orders` all report `false`.
+
+**The only remaining route for exposure that cannot wait is the broker terminal.** Cancel or square
+off there; this process cannot act until PostgreSQL returns.
+
+A **mid-session** failure is distinct from an unavailable pool: `pg_ready` / `isPgReady()` is probed
+once at init and never re-probed, so it can read `true` while every query fails. The
+observed-write-outcome latch `health.persistence` is what catches that, and the readiness verdict
+consults both.
+
+If live boot fails because PostgreSQL is unavailable, restore PostgreSQL and restart before operating
+live Box execution. A mid-session persistence failure blocks new risk, trips the circuit breaker, and
+moves affected projections to recovery where applicable.
+
+### Recovery limits after a post-fill persistence failure
+
+A confirmed fill can outlive the process that made it: all four legs are broker-confirmed FILLED (so
+four terminal rows exist in the intent journal) and the position/execution-attempt write then fails.
+On restart, reconciliation **reconstructs** that exposure from the journal and the broker into
+`attributedBoxPositions`, so `attributedRecoveryExposure()` reports it — but **no position row and no
+residual row is ever rebuilt from intents alone**. `openBoxes` and `residualLegs` stay `0`, so the
+residual flatten loop has nothing to work and nothing reduces it automatically.
+
+New ENTRY is therefore blocked by the ENTRY-scoped readiness blocker
+`unowned_attributed_exposure`, which names the symbols and the required operator action. Reduction
+stays fully available, because reducing is how the operator resolves it: verify the positions at the
+broker, then flatten the attributed exposure with the emergency control (which acts on exactly this
+crash-only set) or reconcile it into a trade. **This is a deliberate operator-in-the-loop limit, not
+an automatic recovery.**
 
 ## Startup and reconciliation
 
 Live boot performs these steps before discovery can be enabled:
 
-1. Require Mongo and a current Kite session.
+1. Require PostgreSQL (the operational authority) and a current Kite session. MongoDB is not required.
 2. Restore open Box projections and unresolved residual attempts.
 3. Seed daily P&L, rejection, and failure counters from durable state.
 4. Reconcile the complete nonterminal intent/ownership journal with broker orders and positions.
@@ -100,7 +147,7 @@ chart, so the distinction is stated here rather than left implicit:
 
 | | Artificial PAPER latency | Real LIVE transport latency |
 |---|---|---|
-| What | `BOX_SIMULATED_DECISION_MS`, `BOX_SIMULATED_LATENCY_MS`, recorded latency samples and distributions, paper POST→ACK and ACK→terminal models, the simulated cancel race, paper persistence simulation, the paper scheduler | Broker rate-limit pacing, durable Mongo writes, reservation acquisition, feed validation, the broker HTTP request, the broker ACK, working-order observation, cancellation confirmation, reconciliation, recovery |
+| What | `BOX_SIMULATED_DECISION_MS`, `BOX_SIMULATED_LATENCY_MS`, recorded latency samples and distributions, paper POST→ACK and ACK→terminal models, the simulated cancel race, paper persistence simulation, the paper scheduler | Broker rate-limit pacing, durable PostgreSQL writes, reservation acquisition, feed validation, the broker HTTP request, the broker ACK, working-order observation, cancellation confirmation, reconciliation, recovery |
 | Purpose | A *model*, so a simulated fill is not instantaneous | A *constraint*, imposed by the broker, the network and our own durability requirements |
 | On the live path? | **NEVER** | Always |
 
@@ -297,7 +344,7 @@ Emergency flatten requires the explicit runtime arm plus completed reconciliatio
 This must not be misunderstood, because it is the single most dangerous misreading of the safety model:
 
 - **Zerodha and Dhan provide no transaction spanning four independent orders.** There is no API in which the four legs commit or abort together. Each order is accepted, rejected or left working on its own.
-- **A database transaction is not a broker transaction.** MongoDB CAS, MongoDB multi-document transactions, PostgreSQL, Redis, fencing tokens and idempotency keys all constrain *our own records*. None of them constrains the exchange.
+- **A database transaction is not a broker transaction.** PostgreSQL transactions and compare-and-set, Redis, fencing tokens and idempotency keys all constrain *our own records*. None of them constrains the exchange.
 - **A database rollback cannot undo an order already accepted or filled at the broker.** Rolling back our write only makes our books disagree with reality — which is strictly worse than recording the truth. This is why the durable intent is written *before* submission and why an ambiguous submission is quarantined rather than rolled back.
 - **Migrating the database would change none of this.** A store swap addresses no part of broker-side non-atomicity, and would add migration risk for no safety gain.
 
@@ -410,7 +457,7 @@ CREATED → QUEUED → POSTING → BROKER_ACCEPTED → ACKNOWLEDGED → WORKING
 ```
 
 The durable vocabulary (`BoxOrderIntentState`) is **unchanged**, because it is enforced as a
-Mongo query guard and is the mechanism that makes restart safety work; widening it would need a
+PostgreSQL query guard and is the mechanism that makes restart safety work; widening it would need a
 migration for zero safety benefit. `durableStateForStage()` is the total mapping, and the lossy
 choices are documented at the mapping itself (`QUEUED → CREATED`, `BROKER_ACCEPTED →
 ACKNOWLEDGED`, `CANCEL_PENDING → CANCEL_REQUESTED`, `EXPIRED → CANCELLED`).
@@ -644,7 +691,7 @@ merely checked before submitting gets bypassed by new code paths and error handl
 
 `BOX_PAPER_EXECUTION_PROFILE=stress` is the profile reserved for resilience testing: broker
 slowdown, feed outage, WebSocket gap, HTTP timeout, delayed ACK, delayed cancel, partial fill,
-broker reject, Mongo failure, Redis failure, process restart, duplicate event, out-of-order event.
+broker reject, PostgreSQL failure, Redis failure, process restart, duplicate event, out-of-order event.
 
 **STATUS: the profile and its isolation are complete; the fault injection itself is NOT yet plumbed
 into the simulator's fill path.** `StressInjector` defines the fault schedule deterministically and
@@ -824,7 +871,7 @@ claim, and a claim needs evidence.
   separates "reaching the exchange" from "working at the exchange" instead of collapsing both.
 - **Durable-persistence delay** → the measured `persistence_wait_ms` p50 when calibrated, else
   `BOX_PAPER_PERSISTENCE_MS` (default **0**). Zero is deliberate and it makes paper *optimistic*
-  on this stage: the live path really does pay two Mongo round trips inside the held concurrency
+  on this stage: the live path really does pay two PostgreSQL round trips inside the held concurrency
   slot before it may transmit, but until that has been observed we do not know its size, and a
   guessed database latency would be a fabrication. `calibrationStatus()` reports
   `persistence_window_measured` so the difference is visible rather than assumed.

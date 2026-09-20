@@ -153,6 +153,55 @@ position** to RECOVERY — on the strength of the one outcome the broker was exp
 - **[CODE]** A partial fill on another leg is still credited, and its hedge release is still sized
   only from the proven closed quantity.
 
+### 2.6 A PostgreSQL outage stops reduction too, and the surfaces now say so — **[CODE]**
+
+The architecture is **PostgreSQL-authoritative**. MongoDB is an asynchronous, non-authoritative
+reporting replica fed through an outbox: a Mongo backlog, dead-letter or outage delays reporting and
+blocks nothing operational. (`src/box/LIVE_EXECUTION.md` has been corrected — it previously described
+Mongo as the durable store and told operators to restore Mongo before trading live.)
+
+- **[CODE]** Every order reaching the broker needs PostgreSQL FIRST, for every purpose.
+  `BoxOrderManager.execute()` performs two awaited durable writes before the transport call —
+  `persistence.create` and the `CREATED → SUBMITTING` compare-and-set — and the guard after the CAS
+  reads "broker POST blocked".
+- **[CODE]** So during an outage: a normal EXIT and an EMERGENCY_RESIDUAL flatten are **refused with
+  nothing transmitted**; the protective-cancel sweep is refused because it must first READ the intent
+  journal to know what to cancel; and reconciliation fails closed on the same read.
+- **[CODE]** A reduction is therefore **refused, not queued**. Exposure is unchanged and still owned,
+  and **the broker terminal is the only remaining route**.
+- **[CODE]** Readiness now reports this: a `both`-scoped `durable_store_unavailable` blocker, with
+  `exit_and_reduce`, `protective_cancel` and `manage_working_orders` all `false`. The frontend banner
+  no longer claims "Exits, protective cancellation and reconciliation are unaffected."
+- **[CODE]** The cancel sweep now returns its structured `{ ok: false, attempted: false,
+  blocked_reason }` refusal instead of throwing a raw database error.
+- **[CODE]** `pg_ready` is a pool latch probed once at init and never re-probed, so it can read `true`
+  while every query fails. The observed-write latch `health.persistence` catches that, and the verdict
+  consults both. Paper deployments are exempt — they have no durable intent journal.
+
+### 2.7 A confirmed fill that outlived its process blocks new entry — **[CODE]**
+
+All four legs broker-confirmed FILLED, then the position/execution-attempt write fails and the process
+stops. On restart, reconciliation **reconstructs** the exposure from the intent journal and the broker,
+so `attributedRecoveryExposure()` reports all four legs.
+
+- **[CODE]** But **no position or residual row is ever rebuilt from intents alone.** `openBoxes` and
+  `residualLegs` stay `0`, so the residual flatten loop has nothing to work and nothing reduces it
+  automatically.
+- **[CODE]** Measured on the real wiring before the fix: `canEnter()` returned `true` and
+  `entryBlockReason()` returned `null` — a brand-new four-leg box was admissible on top of four legs
+  nobody was managing. `crashRecoveryEntryQuarantined` did not cover it (it is refreshed only from
+  `onReconciliationIssue`, and additionally requires the crash-recovery *index* to be unverified, so a
+  clean restart with a healthy database never triggers it).
+- **[CODE]** New ENTRY is now blocked by the ENTRY-scoped `unowned_attributed_exposure` blocker, which
+  names the symbols, quantities and the required operator action. Reduction stays fully available,
+  because reducing is how it gets resolved.
+- **Remaining limit, [CODE]:** this is an **operator-in-the-loop** stop, not automatic recovery.
+  Nothing reconstructs a durable position or residual row from the journal. The operator must verify
+  the positions at the broker and then flatten the attributed exposure with the emergency control
+  (which acts on exactly this crash-only set) or reconcile it into a trade.
+- **[CODE]** If the broker does **not** confirm the reconstructed exposure, that is a
+  journal/broker mismatch: reconcile trips the breaker and blocks entry that way instead.
+
 ## 3. Reduction under degraded market data — the accepted trade-off
 
 - **[CODE]** Every order, entry and reduction alike, is a **bounded LIMIT** order. Nothing anywhere
@@ -264,7 +313,9 @@ and that scope — not the field's position on a panel — is what decides wheth
 
 The code-side blockers found so far are closed and tested: the rejection/fill race (§2.1), three
 operator-facing misreports (§2.2), the two post-fill failure paths that could lose a confirmed
-four-leg position (§2.4), and the exit rejection that manufactured broker uncertainty (§2.5).
+four-leg position (§2.4), the exit rejection that manufactured broker uncertainty (§2.5), the
+PostgreSQL-outage claim that exits were unaffected (§2.6), and the restart that admitted a new box on
+top of un-owned exposure (§2.7).
 
 **Fixing code does not authorise a live test.** The following are each independently disqualifying and
 **all four remain open**:

@@ -1734,7 +1734,40 @@ export class BoxOrderManager {
         failures: [],
       };
     }
-    const intents = await this.deps.persistence.loadNonterminal();
+    /*
+     * THE JOURNAL READ IS PART OF THE SWEEP, SO ITS FAILURE IS A SWEEP REFUSAL.
+     *
+     * THE DEFECT THIS CLOSES. This read was unguarded. With PostgreSQL unavailable it rejected the
+     * whole `cancelWorkingBoxOrders()` promise — so the one method deliberately rewritten to return
+     * a structured `{ ok, attempted, blocked_reason }` (see the docblock above) threw instead, and
+     * the operator's panic button surfaced a raw database error rather than the refusal shape the
+     * route knows how to render. Nothing was attempted either way; only the reporting was wrong.
+     *
+     * A cancel needs no market data, which is why the bare-cancel path posts to the broker before
+     * writing anything — but it cannot know WHICH orders to cancel without this journal, and there
+     * is no other source of working-order identity. So an unreadable journal is a genuine inability
+     * to sweep, reported as such.
+     */
+    let intents: IBoxOrderIntent[];
+    try {
+      intents = await this.deps.persistence.loadNonterminal();
+    } catch (error) {
+      this.health.persistence = "unhealthy";
+      const reason =
+        `The durable order-intent journal could not be read (${errorMessage(error)}), so the ` +
+        "working orders to cancel cannot be identified and NOTHING was attempted. Exposure is " +
+        "unchanged and still owned. Restore PostgreSQL, or cancel from the broker terminal.";
+      console.error(`[BoxOrderManager] cancel-working REFUSED, nothing attempted: ${reason}`);
+      return {
+        ok: false,
+        attempted: false,
+        blocked_reason: reason,
+        examined: 0,
+        eligible: 0,
+        cancelled: [],
+        failures: [],
+      };
+    }
     const cancelled: BrokerOrder[] = [];
     const failures: string[] = [];
     let eligible = 0;
@@ -3514,6 +3547,7 @@ export class BoxOrderManager {
             this.trip(`broker-position mismatch for attributed Box symbol ${symbol}: expected ${expected}, actual ${actual}`);
           }
         }
+
       } else {
         /*
          * DELIBERATELY NOT `invariantViolation`. This is a race that was DETECTED AND HANDLED

@@ -86,6 +86,95 @@ export const OPERATIONAL_READINESS_VERSION = "1.7.0";
 export type BlockerScope = "entry" | "reduction" | "both";
 
 /** One named, operator-readable reason something is not permitted. Never a stack, never a secret. */
+/**
+ * Whether the authoritative operational store can actually be used right now.
+ *
+ * Two independent signals, because neither alone is sufficient:
+ *   • `durableStoreReady` — the pool-level latch (`isPgReady()`, published as `pg_ready`). It is
+ *     probed once at init and NOT re-probed per query, so it can read `true` during a mid-session
+ *     outage while every query fails.
+ *   • `durableWrites` — the OrderManager's observed-write-outcome latch (`health.persistence`),
+ *     which is exactly what catches that case. `"unknown"` means no write has been attempted yet
+ *     and is NOT an outage.
+ */
+/** The minimum an attributed leg must expose for the unowned-exposure check. */
+export interface AttributedLegForOwnership {
+  readonly tradingsymbol: string;
+  readonly exchange?: string | undefined;
+  readonly side: "BUY" | "SELL";
+  readonly quantity: number;
+}
+
+/**
+ * EXPOSURE WE RECONSTRUCTED BUT NOTHING OWNS — an ENTRY-only stop with a named action.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────────────────────
+ * THE GAP THIS CLOSES
+ * ─────────────────────────────────────────────────────────────────────────────────────────────
+ * Four live legs are broker-confirmed FILLED, so four terminal COMPLETE rows exist in the durable
+ * intent journal — then the position/execution-attempt write fails and the process stops. On restart
+ * `performReconcile` faithfully rebuilds `attributedBoxPositions` from those rows, and the broker
+ * confirms the same four positions, so there is NO mismatch, nothing trips, and
+ * `reconciliation_complete` becomes true. But no position row was ever written: `openBoxes` and
+ * `residualLegs` are both 0, the residual flatten loop has nothing to work, and the only route that
+ * can see the exposure (`flattenAttributedBoxExposure`, via this same crash-only filter) is
+ * OPERATOR-INVOKED rather than automatic.
+ *
+ * Measured on the real wiring before this existed: `canEnter()` returned true and
+ * `entryBlockReason()` returned null, so a brand-new four-leg box was admissible on top of four legs
+ * the system knew it held and nobody was managing.
+ *
+ * `crashRecoveryEntryQuarantined` does not cover it. That flag is refreshed only from
+ * `onReconciliationIssue` (which does not fire when reconcile finds no mismatch), and
+ * `isCrashRecoveryEntryQuarantined()` additionally requires the crash-recovery INDEX to be
+ * unverified — so a cleanly restarted process with a healthy database is never quarantined by it.
+ * That axis asks "can we RECORD recovery state?"; this one asks "does any durable row ACCOUNT for
+ * exposure we have already reconstructed?".
+ *
+ * WHY READINESS AND NOT THE ORDER MANAGER'S ENTRY GATE. That gate is consulted per LEG at all five
+ * checkpoints, so blocking there also refuses the legitimate continuation of the very attempt that
+ * left the orphan — a crash mid-attempt can leave one leg terminal-filled while its siblings were
+ * never posted, and that trade must still be able to reconcile and unwind. Readiness is evaluated
+ * when deciding to open a NEW box, which is exactly the decision that must stop.
+ *
+ * `scope: "entry"`, so exits, protective cancellation, the residual flatten loop and reconciliation
+ * all remain available — they are how an operator resolves it.
+ *
+ * Exported and pure so the engine and its tests share ONE derivation rather than two that can drift.
+ */
+export function unownedAttributedExposureBlocker(args: {
+  /** `orderManager.attributedRecoveryExposure()`. */
+  readonly attributed: readonly AttributedLegForOwnership[];
+  /** Every leg symbol projected by the durable position book, as `EXCHANGE:TRADINGSYMBOL`. */
+  readonly projectedSymbols: ReadonlySet<string>;
+}): ReadinessBlocker | null {
+  const unowned = args.attributed.filter(
+    (leg) => !args.projectedSymbols.has(`${leg.exchange ?? "NFO"}:${leg.tradingsymbol}`),
+  );
+  if (unowned.length === 0) return null;
+  const named = unowned
+    .slice(0, 4)
+    .map((leg) => `${leg.exchange ?? "NFO"}:${leg.tradingsymbol} ${leg.side} ${leg.quantity}`)
+    .join(", ");
+  return {
+    code: "unowned_attributed_exposure",
+    scope: "entry",
+    detail:
+      `${unowned.length} attributed Box leg(s) are held at the broker with NO open trade or residual ` +
+      `row accounting for them (${named}${unowned.length > 4 ? " …" : ""}) — almost certainly a fill ` +
+      `that was confirmed before a previous process could record it. Nothing is reducing this ` +
+      `automatically. OPERATOR ACTION REQUIRED: verify these positions at the broker, then flatten ` +
+      `the attributed exposure with the emergency control (or reconcile it into a trade). New entry ` +
+      `stays blocked until it is resolved; exits, protective cancellation and reconciliation remain ` +
+      `available.`,
+  };
+}
+
+export interface ReadinessPersistenceInput {
+  readonly durableStoreReady: boolean;
+  readonly durableWrites: "healthy" | "unhealthy" | "unknown";
+}
+
 export interface ReadinessBlocker {
   /** Stable machine code, for the UI to key and group on. snake_case. */
   readonly code: string;
@@ -244,6 +333,16 @@ export interface OperationalReadinessInput {
    * token state, session budget, scanner state, reservations, recovery. Each carries its scope, so
    * an entry-only fact can never leak into the reduction answer.
    */
+  /**
+   * THE DURABLE STORE'S OWN HEALTH, because reduction depends on it as much as entry does.
+   *
+   * REQUIRED, deliberately: a production caller that forgets it is a COMPILE ERROR, which is the
+   * only reliable guard against the class of defect this field exists to close (a readiness verdict
+   * computed from transport lifecycle alone, publishing "exits are unaffected" during a PostgreSQL
+   * outage). The builder reads it defensively so untyped `.mjs` test harnesses that predate the
+   * field still resolve to "available" rather than inventing an outage.
+   */
+  readonly persistence: ReadinessPersistenceInput;
   readonly blockers: readonly ReadinessBlocker[];
   readonly openExposure: ReadinessExposureInput;
 }
@@ -619,7 +718,15 @@ const EXPOSURE_LIMITATIONS: readonly string[] = Object.freeze([
   "A reduction is itself an order into the market: it can partially fill, be rejected, or fill at a worse price. Permission is not a fill.",
   "Four-leg atomicity is not available from any broker; legs are reduced one order at a time and an intermediate state is unavoidable.",
   "A reduction needs a usable book for the leg being reduced. Whole-feed readiness is not required, but an unpriceable leg cannot be reduced on a limit price.",
-  "Protective cancellation reduces exposure and is permitted in every state except an expired session, where the broker itself refuses.",
+  /*
+   * CORRECTED. This previously read "Protective cancellation reduces exposure and is permitted in
+   * every state except an expired session, where the broker itself refuses" — which was the
+   * backend's own source for the frontend's "exits, protective cancellation and reconciliation are
+   * unaffected" claim during a PostgreSQL outage. An expired session is not the only exception: the
+   * durable store is a precondition too.
+   */
+  "Protective cancellation reduces exposure and needs no market data, so it is permitted in almost every state — but NOT with an expired broker session (the broker itself refuses) and NOT while the durable store is unavailable (the sweep must read the intent journal to know what to cancel).",
+  "EVERY automated reduction — exit, emergency flatten, protective cancel, reconciliation — requires PostgreSQL. An order records a durable intent BEFORE it reaches the broker. During an outage a reduction is REFUSED rather than queued, nothing is transmitted, exposure is unchanged and still owned, and the broker terminal is the only way to reduce it.",
 ]);
 
 /**
@@ -712,6 +819,68 @@ export function buildOperationalReadiness(
   }
   for (const b of input.blockers) {
     if (b.scope === "reduction" || b.scope === "both") reductionReasons.push(b);
+  }
+
+  /*
+   * ═══════════════════════════════════════════════════════════════════════════════════════════
+   * THE DURABLE STORE IS A PRECONDITION OF REDUCTION, NOT ONLY OF ENTRY.
+   * ═══════════════════════════════════════════════════════════════════════════════════════════
+   *
+   * THE DEFECT THIS CLOSES. This builder had no persistence input at all, so every reduction
+   * verdict was computed from transport lifecycle alone. With PostgreSQL unavailable it published
+   * `exit_and_reduce: true`, `protective_cancel: true` and `manage_working_orders: true` while
+   * EVERY one of those operations would in fact be refused — and the frontend rendered that as
+   * "Exits, protective cancellation and reconciliation are unaffected."
+   *
+   * WHY IT IS FALSE. `BoxOrderManager.execute()` performs TWO awaited durable writes before the
+   * transport call — `persistence.create` (the CREATED row) and the CREATED→SUBMITTING
+   * compare-and-set — for EVERY purpose. There is no purpose branch around them, and the guard
+   * after the CAS is explicit: "did not durably enter SUBMITTING; broker POST blocked". So an
+   * EXIT and an EMERGENCY_RESIDUAL flatten are refused at the first write, having transmitted
+   * nothing. The bare-cancel path (`executeCancel`) does POST before writing, but its only caller
+   * (`cancelWorkingBoxOrders`) must first READ `loadNonterminal()` to learn what to cancel, and
+   * reconciliation opens with `loadNonterminal()` + `loadOwned()`. Nothing reduces exposure
+   * without PostgreSQL.
+   *
+   * THIS DOES NOT WEAKEN THE ENTRY-ONLY RULE. The invariant is that an ENTRY-SCOPED control must
+   * never block reduction, and it still holds: `entryReasons` and `reductionReasons` remain
+   * separately filtered, and an unfunded account, a spent attempt budget or a daily-loss trip
+   * still leave every reduction route open. Persistence is not an entry control — it is a shared
+   * physical precondition, which is why it is reported on BOTH scopes and why the honest verdict
+   * is "cannot", not "not allowed".
+   *
+   * FAIL-SAFE READ. `durableStoreReady === false` is the pool-level latch (`isPgReady()`, what the
+   * runtime status publishes as `pg_ready`); `durableWrites === "unhealthy"` is the OrderManager's
+   * observed-write-outcome latch, which catches a mid-session outage the pool latch can miss
+   * because it is probed once at init and never re-probed. `"unknown"` — no write attempted yet —
+   * is deliberately NOT treated as an outage: absence of evidence is not evidence of failure.
+   *
+   * LIVE-CAPABLE DEPLOYMENTS ONLY. The precondition being described is the DURABLE ORDER-INTENT
+   * journal, and only the live path writes one: a paper reduction goes through the deterministic
+   * simulator, which performs no pre-POST intent write and needs no journal read to act. PostgreSQL
+   * is optional for a paper deployment, so raising this there would report a blocked reduction on a
+   * deployment that has nothing to block — which is the mirror image of the falsehood being fixed.
+   */
+  const durableStoreReady = input.persistence?.durableStoreReady !== false;
+  const durableWritesFailing = input.persistence?.durableWrites === "unhealthy";
+  const persistenceUnavailable = identity.deploymentLiveCapable
+    && (!durableStoreReady || durableWritesFailing);
+  if (persistenceUnavailable) {
+    const detail = !durableStoreReady
+      ? "PostgreSQL, the authoritative operational store, is not available. Every order — an exit " +
+        "and an emergency flatten included — records a durable intent BEFORE it reaches the " +
+        "broker, and the working-order sweep and reconciliation must first READ that journal. So " +
+        "automated reduction is refused, not queued: nothing is transmitted. Existing exposure is " +
+        "unchanged and still owned. Restore PostgreSQL, or reduce the position from the broker " +
+        "terminal if it cannot wait."
+      : "A durable order-intent write has FAILED, so the operational store cannot be trusted to " +
+        "record an order. Automated reduction records a durable intent before it reaches the " +
+        "broker and is therefore refused, not queued. Existing exposure is unchanged and still " +
+        "owned. Check PostgreSQL, or reduce the position from the broker terminal if it cannot wait.";
+    // `both`: it genuinely stops creating exposure AND reducing it.
+    const blocker: PublishedBlocker = { code: "durable_store_unavailable", scope: "both", detail };
+    entryReasons.push(blocker);
+    reductionReasons.push(blocker);
   }
 
   // Reconciliation blockers: what is owed, and anything the caller flagged as recovery work.
@@ -839,8 +1008,18 @@ export function buildOperationalReadiness(
     exposure_management: {
       // Reduction is scored from the table plus reduction-scoped blockers ONLY.
       exit_and_reduce: permissions.exitAndReduce && reductionReasons.length === 0,
-      protective_cancel: permissions.protectiveCancel,
-      manage_working_orders: permissions.manageWorkingOrders,
+      /*
+       * `protective_cancel` and `manage_working_orders` are deliberately NOT gated on
+       * `reductionReasons`, because most reduction blockers are market-data facts and a CANCEL
+       * needs no book — that permissiveness is correct and is preserved.
+       *
+       * They ARE gated on the durable store, because that is a physical precondition rather than a
+       * pricing one: the sweep cannot even enumerate what to cancel without reading the intent
+       * journal. Reporting `true` here while the sweep would refuse is the specific falsehood being
+       * corrected, and it is the one an operator is most likely to act on under pressure.
+       */
+      protective_cancel: permissions.protectiveCancel && !persistenceUnavailable,
+      manage_working_orders: permissions.manageWorkingOrders && !persistenceUnavailable,
       blocked_reasons: reductionReasons,
       limitations: EXPOSURE_LIMITATIONS,
       open_positions: openExposure.openPositions,
