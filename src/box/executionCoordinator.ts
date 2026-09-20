@@ -71,6 +71,7 @@
 
 import { entrySideFor, evaluateCandidate } from "./math.js";
 import { BOX_ENTRY_LEG_COUNT } from "./universeView.js";
+import { evaluateQuantityEnvelope } from "./quantityEnvelope.js";
 import {
   boxInstrumentRefs,
   classifyConflict,
@@ -975,18 +976,26 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
       const lotSize = candidate.lot_size;
       const perLegCap = this.deps.cfg.liveMaxOpenLegQuantity;
       const grossCap = this.deps.cfg.liveMaxGrossOpenLegQuantity;
-      const fourLegs = lotSize * BOX_ENTRY_LEG_COUNT;
+      /*
+       * BOTH quantity bounds, from the ONE shared derivation the send boundary also uses.
+       *
+       * This used to compare the lot size against the absolute unit cap only. That is correct for a
+       * trial pinned to a single underlying, but a unit number cannot mean "one lot" for instruments
+       * with different lot sizes — so on an open allowlist it refused nearly every name as
+       * `lot_exceeds_quantity_cap` while the configuration read like a one-lot bound.
+       * `BOX_LIVE_MAX_LOTS_PER_LEG` expresses the bound in lots instead; see quantityEnvelope.ts.
+       */
+      const envelope = evaluateQuantityEnvelope({
+        lotSize,
+        perLegUnitCap: perLegCap,
+        grossUnitCap: grossCap,
+        maxLotsPerLeg: this.deps.cfg.liveMaxLotsPerLeg,
+      });
       const capDetail =
-        perLegCap > 0 && lotSize > perLegCap
-          ? `one lot of ${candidate.underlying} is ${lotSize} unit(s), above ` +
-            `BOX_LIVE_MAX_OPEN_LEG_QUANTITY=${perLegCap}. No leg of this box can be sent, so the ` +
-            `attempt is refused before it costs an attempt, a reservation or a broker round trip. ` +
-            `Raise the cap only if you intend to carry that much per leg, or exclude this underlying.`
-          : grossCap > 0 && fourLegs > grossCap
-            ? `four legs of one lot of ${candidate.underlying} need ${fourLegs} unit(s), above ` +
-              `BOX_LIVE_MAX_GROSS_OPEN_LEG_QUANTITY=${grossCap}. The whole attempt is refused before ` +
-              `it costs an attempt, a reservation or a broker round trip.`
-            : null;
+        envelope.refusal === null
+          ? null
+          : `${candidate.underlying}: ${envelope.refusal} The attempt is refused before it costs an ` +
+            `attempt, a reservation or a broker round trip.`;
       if (capDetail !== null) {
         this.stats.quantityCapRefusals++;
         this.log({

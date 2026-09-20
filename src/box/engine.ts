@@ -1462,6 +1462,10 @@ export class BoxEngine {
           // encumbrance stays a required UNKNOWN component of the binding requirement and stage
           // funding refuses. Either way an absent utilisation refuses rather than being assumed idle.
           utilisedRupees: typeof m.utilised === "number" && Number.isFinite(m.utilised) ? m.utilised : null,
+          // The vendor breakdown travels to the GATE too, not just to the dashboard: the configured
+          // funds basis is resolved inside `usableFundsRupees`, and if only the tile carried the
+          // components then the two could resolve different bases for the same account.
+          components: m.components ?? null,
           observedAt: Date.now(),
         };
       },
@@ -1509,6 +1513,9 @@ export class BoxEngine {
     this.accountFunds = new AccountFundsTracker({
       freshnessMaxAgeMs: this.cfg.accountFundsFreshnessMaxAgeMs,
       now: () => Date.now(),
+      // The SAME basis the admission gate uses, from the one config field, so the tile and the gate
+      // can never report different spendable figures for one account.
+      basis: this.cfg.zerodhaFundsBasis,
     });
 
     this.session = new BoxTradingSessionManager({
@@ -5575,6 +5582,9 @@ export class BoxEngine {
       this.accountFunds.record(this.deps.activeBroker(), {
         availableRupees: funds.available,
         utilisedRupees: funds.utilised,
+        // The full vendor breakdown, so the published headline can be checked against the broker's
+        // own funds screen component by component rather than taken on trust.
+        components: funds.components ?? null,
       });
     } catch (error) {
       // The PREVIOUS figure is kept and marked stale by the tracker — an operator mid-session is

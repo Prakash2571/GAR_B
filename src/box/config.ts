@@ -20,6 +20,7 @@ import {
 } from "./executionSchedulingPolicy.js";
 import { normaliseAllowlist } from "./underlyingExclusions.js";
 import { SUPERVISED_TRIAL_ENV, supervisedTrialStartupRefusal } from "./supervisedTrial.js";
+import { DEFAULT_FUNDS_BASIS, isFundsBasis, type FundsBasis } from "./fundsSemantics.js";
 import { readZerodhaStaticIpPolicy, type ZerodhaStaticIpPolicy } from "./zerodhaStaticIp.js";
 import type { BoxQueueModel, BoxScannerConfigSnapshot, ExecutionMode } from "./types.js";
 
@@ -626,6 +627,15 @@ export interface BoxConfig {
    */
   liveExactOneLot: boolean;
   /**
+   * `BOX_LIVE_MAX_LOTS_PER_LEG` — a LOT-RELATIVE per-leg ceiling. 0 disables.
+   *
+   * The companion to `liveMaxOpenLegQuantity`, which is an absolute UNIT ceiling and therefore cannot
+   * mean "one lot" for more than one instrument at a time. Set this to trade one lot across several
+   * underlyings with different lot sizes. Both bounds are enforced; the tighter governs.
+   * See `quantityEnvelope.ts`.
+   */
+  liveMaxLotsPerLeg: number;
+  /**
    * Underlyings a NEW live box may be entered on, normalised, de-duplicated and sorted. Empty means
    * no identity constraint. Never consulted for exits, reductions or reconciliation.
    */
@@ -702,6 +712,12 @@ export interface BoxConfig {
    * This is NOT the gross cap and NOT an approved-budget copy: it compares real, freshly observed
    * funds against a computed requirement. See boxCapital.ts.
    */
+  /**
+   * `BOX_ZERODHA_FUNDS_BASIS` — which reported component is treated as spendable funds.
+   *
+   * Defaults to `live_balance`, the shipped behaviour. See `fundsSemantics.ts`.
+   */
+  zerodhaFundsBasis: FundsBasis;
   liveRequireFundsCover: boolean;
   /**
    * Require FRESH, broker-confirmed margin evidence (a basket/multi-order margin estimate) before
@@ -1351,6 +1367,25 @@ export function loadBoxConfig(): BoxConfig {
   if (mode === "live" && strictBool("BOX_LIVE_EXACT_ONE_LOT", false)) {
     const perLeg = strictLimitInt("BOX_LIVE_MAX_OPEN_LEG_QUANTITY", 100, 1, 1_000_000);
     const gross = strictLimitInt("BOX_LIVE_MAX_GROSS_OPEN_LEG_QUANTITY", 400, 1, 4_000_000);
+    /*
+     * EXACT-ONE-LOT AND A MULTI-LOT ALLOWANCE ARE A CONTRADICTION, so it is refused rather than
+     * resolved. `BOX_LIVE_EXACT_ONE_LOT=true` asserts that the envelope describes exactly one lot;
+     * `BOX_LIVE_MAX_LOTS_PER_LEG=3` asserts it describes three. Picking a winner silently would leave
+     * the operator's own declaration untrue in one direction or the other.
+     *
+     * `lots=1` is CONSISTENT with the assertion and is the intended any-underlying pairing: the
+     * lot-relative bound states "one lot" for every instrument, which is precisely what the unit
+     * ceilings cannot do across differing lot sizes.
+     */
+    const lots = strictLimitInt("BOX_LIVE_MAX_LOTS_PER_LEG", 0, 0, 10);
+    if (lots > 1) {
+      throw new Error(
+        `[Box] BOX_LIVE_EXACT_ONE_LOT=true declares an envelope of exactly ONE lot per leg, but ` +
+          `BOX_LIVE_MAX_LOTS_PER_LEG=${lots} permits ${lots}. Set BOX_LIVE_MAX_LOTS_PER_LEG=1 to keep ` +
+          `the one-lot assertion (the correct pairing for trading one lot across underlyings with ` +
+          `different lot sizes), or unset BOX_LIVE_EXACT_ONE_LOT if you genuinely intend ${lots} lots.`,
+      );
+    }
     if (gross !== perLeg * 4) {
       throw new Error(
         `[Box] BOX_LIVE_EXACT_ONE_LOT=true declares that the live quantity ceilings describe exactly ` +
@@ -1554,6 +1589,16 @@ export function loadBoxConfig(): BoxConfig {
     liveMaxGrossOpenLegQuantity: strictLimitInt("BOX_LIVE_MAX_GROSS_OPEN_LEG_QUANTITY", 400, 1, 4_000_000),
     liveExactOneLot: strictBool("BOX_LIVE_EXACT_ONE_LOT", false),
     /*
+     * A LOT-RELATIVE per-leg ceiling. DEFAULT 0 = DISABLED, so every existing deployment keeps its
+     * absolute unit cap and behaves exactly as before.
+     *
+     * `strictLimitInt`, like the other quantity bounds: a typo must not silently disable a ceiling.
+     * Capped at 10 because this is a per-leg LOT count on a four-leg structure — anything larger is
+     * far more likely to be a mistaken unit count than an intended position, and the rupee bound
+     * (`BOX_LIVE_MAX_BOX_CAPITAL_RUPEES`, required in live) is the correct control for real size.
+     */
+    liveMaxLotsPerLeg: strictLimitInt("BOX_LIVE_MAX_LOTS_PER_LEG", 0, 0, 10),
+    /*
      * The live ENTRY allowlist. Empty means "no identity constraint" — see `allowlistEntryRefusal`
      * for why the absent case is not read as "nothing may be traded". Normalisation happens here,
      * once, with the same rules the operator blocklist uses, so the two layers cannot disagree about
@@ -1592,6 +1637,21 @@ export function loadBoxConfig(): BoxConfig {
 
     // Economic admission (Task 8). Both controls default OFF so existing behaviour is unchanged;
     // enabling either makes missing/stale funds or margin evidence BLOCK entry.
+    /*
+     * WHICH reported component is treated as spendable funds. See `fundsSemantics.ts` for the three
+     * values and their risk directions.
+     *
+     * DEFAULTS TO THE SHIPPED BEHAVIOUR (`live_balance`), and an unrecognised value falls back to it
+     * rather than throwing: this selects which number a REPORT shows and which number a funding gate
+     * compares, so a typo must resolve to the conservative reading, never to the permissive one.
+     * `live_balance_plus_collateral` is the only value that can report MORE than the default and is
+     * therefore the only one that can admit an entry the default refuses — it is opt-in for that
+     * reason, and the published breakdown is how an operator justifies choosing it.
+     */
+    zerodhaFundsBasis: (() => {
+      const raw = process.env.BOX_ZERODHA_FUNDS_BASIS?.trim().toLowerCase();
+      return isFundsBasis(raw) ? raw : DEFAULT_FUNDS_BASIS;
+    })(),
     liveRequireFundsCover: bool("BOX_LIVE_REQUIRE_FUNDS_COVER", false),
     liveRequireMarginEvidence: bool("BOX_LIVE_REQUIRE_MARGIN_EVIDENCE", false),
     liveFundsFreshnessMaxAgeMs: clampInt("BOX_LIVE_FUNDS_FRESHNESS_MAX_AGE_MS", 5_000, 250, 600_000),

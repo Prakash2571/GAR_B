@@ -17,9 +17,24 @@
     "fresh",
     "unavailable_reason",
     "last_error",
-    "note"
+    "note",
+    "components",
+    "basis"
   ],
   "properties": {
+    "components": {
+      "type": "object",
+      "additionalProperties": { "type": ["number", "null"] },
+      "description": "THE FULL BREAKDOWN the broker reported, keyed by the broker's OWN field names (Zerodha: `net`, `available.live_balance`, `available.cash`, `available.collateral`, `available.opening_balance`, `utilised.debits`, `utilised.span`, …). Published so the headline can be CHECKED rather than believed: an operator whose broker screen shows a much larger figure can read down this object and see exactly which component the headline does and does not include. Keyed by vendor field name DELIBERATELY, rather than normalised into our own vocabulary, so it can be held beside the broker's documentation and the broker's funds screen and compared directly — a normalised name would put our interpretation between the operator and the fact. An empty object means the provider supplied no breakdown; components are never fabricated, and a field the broker did not report is ABSENT rather than null.",
+      "examples": [
+        { "net": 96000, "available.live_balance": 96000, "available.cash": 96000, "available.collateral": 294000, "utilised.debits": 0 }
+      ]
+    },
+    "basis": {
+      "type": "string",
+      "enum": ["live_balance", "net", "live_balance_plus_collateral"],
+      "description": "WHICH component of `components` was treated as spendable to produce `free_to_trade_rupees` (BOX_ZERODHA_FUNDS_BASIS). `live_balance` is the shipped default. `net` is the segment's own bottom line and in most observed responses equals live_balance. `live_balance_plus_collateral` is the only basis that can report MORE than the default and therefore the only one that can admit an entry the default would refuse — it is opt-in, because Zerodha's support documentation says the available figure already reflects collateral benefits, and if that is true for live_balance then adding collateral DOUBLE-COUNTS it and overstates spendable funds. Select it only after confirming against `components` that live_balance does not already include collateral for the account in question."
+    },
     "free_to_trade_rupees": {
       "type": ["number", "null"],
       "description": "THE HEADLINE: spendable rupees, derived through the DECLARED per-broker semantics in src/box/fundsSemantics.ts — the same interpretation the live admission gate applies, so the screen and the engine cannot disagree about whether an entry was affordable. null means NOT KNOWN and must never be rendered as ₹0; see `unavailable_reason`."

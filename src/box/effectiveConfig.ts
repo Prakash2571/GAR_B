@@ -127,6 +127,11 @@ const KNOBS: readonly KnobSpec[] = [
   { key: "shadowModeEnabled", envVar: "BOX_SHADOW_MODE_ENABLED", kind: "bool", default: false },
   { key: "paperExecutionProfile", envVar: "BOX_PAPER_EXECUTION_PROFILE", kind: "enum", default: "standard",
     choices: ["standard", "live_parity", "stress"] },
+  // WHICH reported component is treated as spendable funds. Reported here because it decides the
+  // rupee figure both the dashboard and the funding gate use, and an operator diagnosing a headline
+  // that disagrees with their broker's screen needs to see which basis is actually in force.
+  { key: "zerodhaFundsBasis", envVar: "BOX_ZERODHA_FUNDS_BASIS", kind: "enum", default: "live_balance",
+    choices: ["live_balance", "net", "live_balance_plus_collateral"] },
 
   // ---- Size / session ----
   { key: "liveMaxOpenBoxes", envVar: "BOX_LIVE_MAX_OPEN_BOXES", kind: "int", default: 1, min: 0, max: 20 },
@@ -149,6 +154,10 @@ const KNOBS: readonly KnobSpec[] = [
 
   // ---- Quantity envelope ----
   { key: "liveMaxOpenLegQuantity", envVar: "BOX_LIVE_MAX_OPEN_LEG_QUANTITY", kind: "int", default: 100, min: 1, max: 1_000_000, strict: true },
+  // The LOT-RELATIVE companion to the unit cap above. Reported here because "is the per-leg bound
+  // expressed in units or in lots?" changes which instruments can trade at all, and that is exactly
+  // the kind of question this provenance report exists to answer before arming.
+  { key: "liveMaxLotsPerLeg", envVar: "BOX_LIVE_MAX_LOTS_PER_LEG", kind: "int", default: 0, min: 0, max: 10, strict: true },
   { key: "liveMaxGrossOpenLegQuantity", envVar: "BOX_LIVE_MAX_GROSS_OPEN_LEG_QUANTITY", kind: "int", default: 400, min: 1, max: 4_000_000, strict: true },
 
   // ---- Capital / loss breaker ----

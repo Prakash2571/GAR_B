@@ -83,7 +83,12 @@ export interface BoxMarketDataProvider {
    * May throw. A throw is recorded as a failed read (the previous figure is kept and marked stale),
    * which is why it must not be swallowed into a zero by the implementation.
    */
-  getFunds?(): Promise<{ available: number | null; utilised: number | null }>;
+  getFunds?(): Promise<{
+    available: number | null;
+    utilised: number | null;
+    /** Every numeric field the funds endpoint carried, keyed by the broker's own field name. */
+    components?: Record<string, number | null>;
+  }>;
 }
 
 /** One leg of a basket-margin request, broker-neutral. */

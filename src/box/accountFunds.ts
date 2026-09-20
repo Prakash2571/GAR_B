@@ -41,9 +41,12 @@
 
 import type { BrokerId } from "../brokers/types.js";
 import {
+  DEFAULT_FUNDS_BASIS,
   knownBrokerFundsSemantics,
   usableFundsRupees,
   type AvailableFundsSemantics,
+  type FundsBasis,
+  type FundsComponents,
 } from "./fundsSemantics.js";
 
 /** What a broker's funds endpoint returned, verbatim. Nulls are UNKNOWN, never zero. */
@@ -52,6 +55,15 @@ export interface RawFundsObservation {
   readonly availableRupees: number | null;
   /** What the broker reports as already blocked/utilised, in rupees. */
   readonly utilisedRupees: number | null;
+  /**
+   * EVERY numeric field the endpoint carried, keyed by the broker's own field name.
+   *
+   * Optional, so a provider that supplies only the headline pair behaves exactly as before. Present,
+   * it is what makes the headline EXPLAINABLE: an operator comparing our figure against their
+   * broker's own funds screen can see which component accounts for a difference instead of having to
+   * take the single number on trust.
+   */
+  readonly components?: FundsComponents | null;
 }
 
 /** Why no usable figure is being published. */
@@ -82,6 +94,19 @@ export interface AccountFundsSnapshot {
   readonly broker_available_rupees: number | null;
   /** What the broker says is already blocked. Null when unknown — NOT zero. */
   readonly broker_utilised_rupees: number | null;
+  /**
+   * THE FULL BREAKDOWN the broker reported, keyed by its own field names.
+   *
+   * Published so the headline can be CHECKED rather than believed. An operator whose broker screen
+   * shows a much larger figure can read down this object and see exactly which component the
+   * headline does and does not include — which is the difference between "the number looks wrong"
+   * and "the number excludes `available.collateral`, and here it is".
+   *
+   * Empty when the provider supplied no breakdown; never fabricated.
+   */
+  readonly components: FundsComponents;
+  /** Which component was treated as spendable (`BOX_ZERODHA_FUNDS_BASIS`). */
+  readonly basis: FundsBasis;
   /** Which broker the figure is about. */
   readonly broker: BrokerId | null;
   /** How `broker_available_rupees` was interpreted to reach the headline. */
@@ -112,6 +137,8 @@ export function unavailableFunds(
     free_to_trade_rupees: null,
     broker_available_rupees: null,
     broker_utilised_rupees: null,
+    components: {},
+    basis: DEFAULT_FUNDS_BASIS,
     broker,
     semantics: null,
     encumbrance_netted: false,
@@ -135,6 +162,13 @@ export interface AccountFundsTrackerOptions {
   /** How old a figure may be and still be called fresh. */
   readonly freshnessMaxAgeMs: number;
   readonly now: () => number;
+  /**
+   * Which reported component is spendable (`BOX_ZERODHA_FUNDS_BASIS`).
+   *
+   * Optional; omitted ⇒ {@link DEFAULT_FUNDS_BASIS}, the shipped behaviour. Passed through to
+   * `usableFundsRupees` so this tile and the live admission gate resolve the basis identically.
+   */
+  readonly basis?: FundsBasis;
 }
 
 export class AccountFundsTracker {
@@ -240,6 +274,8 @@ export class AccountFundsTracker {
       broker: this.broker,
       availableRupees: this.raw.availableRupees,
       utilisedRupees: this.raw.utilisedRupees,
+      components: this.raw.components,
+      basis: this.opts.basis,
     });
     // The DECLARED semantics enum, read from the registry rather than from the verdict: the verdict's
     // `basis` is a prose audit sentence for a log line, not a machine-readable classification, and
@@ -263,6 +299,8 @@ export class AccountFundsTracker {
       free_to_trade_rupees: verdict.value_rupees,
       broker_available_rupees: this.raw.availableRupees,
       broker_utilised_rupees: this.raw.utilisedRupees,
+      components: this.raw.components ?? {},
+      basis: this.opts.basis ?? DEFAULT_FUNDS_BASIS,
       broker: this.broker,
       semantics,
       encumbrance_netted: verdict.encumbranceNettedFromAvailable,

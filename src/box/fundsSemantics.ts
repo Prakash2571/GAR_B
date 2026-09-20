@@ -121,6 +121,169 @@ export const BROKER_FUNDS_SEMANTICS: Readonly<Record<BrokerId, BrokerFundsSemant
   },
 };
 
+/* ════════════════════════ THE FULL BREAKDOWN, AND WHICH PART IS SPENDABLE ════════════════════════ */
+
+/**
+ * EVERY numeric field the broker's funds endpoint carried, keyed by the BROKER'S OWN field name.
+ *
+ * WHY THIS EXISTS. The adapter used to read exactly two numbers out of a response that carries a
+ * dozen, and discard the rest. An operator who saw a headline far below what their broker's own
+ * screen showed had no way to find out why, and neither did anyone reading the code: the evidence
+ * needed to explain the number was fetched, parsed and thrown away in the same function.
+ *
+ * Keyed by the vendor's field names (`available.live_balance`, `utilised.span`, …) rather than
+ * normalised into our own vocabulary, deliberately — the whole point is to be able to hold this
+ * beside the broker's documentation and the broker's screen and compare them directly. A normalised
+ * name would put our interpretation between the operator and the fact.
+ *
+ * `null` is UNKNOWN, never zero, exactly as everywhere else in this module.
+ */
+export type FundsComponents = Readonly<Record<string, number | null>>;
+
+/**
+ * WHICH reported component is treated as spendable.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────────────────────
+ * WHY THIS IS CONFIGURABLE AND WHY THE DEFAULT DOES NOT CHANGE
+ * ─────────────────────────────────────────────────────────────────────────────────────────────
+ * Kite's equity margins response carries several distinct notions of "available", and which one
+ * matches the figure an operator reads off the Kite funds screen is exactly the identification this
+ * module already records as NOT VERIFIED against a live account. A large gap between our headline
+ * and the screen is therefore expected to be a FIELD-SELECTION question, not an arithmetic one.
+ *
+ * It is not safe for this code to pick differently on a guess. From the header: overstating spendable
+ * funds admits an entry the account cannot fund, the broker rejects a leg mid-sequence, and there is
+ * partially-executed exposure to recover from. Understating merely refuses affordable entries.
+ *
+ * So the choice is exposed as configuration with the CONSERVATIVE default unchanged, and the full
+ * breakdown is published beside it. An operator compares the published components against their own
+ * funds screen, sees which one the screen agrees with, and selects it on EVIDENCE. That is a
+ * one-line change they can justify; it is not a guess this file can make for them.
+ */
+export type FundsBasis =
+  /** `available.live_balance` — the shipped default. Cash-side, already net of debits. */
+  | "live_balance"
+  /**
+   * The segment's top-level `net`.
+   *
+   * Kite's own bottom line for the segment. In most observed responses this equals `live_balance`,
+   * so selecting it is usually a no-op — which is precisely why it is safe to offer.
+   */
+  | "net"
+  /**
+   * `available.live_balance + available.collateral`.
+   *
+   * FOR AN ACCOUNT WHOSE TRADING POWER COMES FROM PLEDGED HOLDINGS. This is the only basis that can
+   * report materially MORE than the default, and therefore the only one that can admit an entry the
+   * default would refuse.
+   *
+   * THE RISK, STATED PLAINLY: Zerodha's support documentation says the available figure already
+   * reflects collateral benefits. If that is true for `live_balance`, this basis DOUBLE-COUNTS the
+   * collateral and OVERSTATES spendable funds — the dangerous direction. Select it only after
+   * confirming against the published breakdown that `live_balance` does NOT already include
+   * `collateral` for your account.
+   */
+  | "live_balance_plus_collateral";
+
+export const FUNDS_BASES: readonly FundsBasis[] = [
+  "live_balance",
+  "net",
+  "live_balance_plus_collateral",
+];
+
+/** The default basis: the shipped behaviour, unchanged. */
+export const DEFAULT_FUNDS_BASIS: FundsBasis = "live_balance";
+
+export function isFundsBasis(value: unknown): value is FundsBasis {
+  return typeof value === "string" && (FUNDS_BASES as readonly string[]).includes(value);
+}
+
+/** Canonical component keys, so the resolver and the adapters cannot drift on spelling. */
+export const FUNDS_COMPONENT_KEYS = {
+  net: "net",
+  cash: "available.cash",
+  liveBalance: "available.live_balance",
+  collateral: "available.collateral",
+  openingBalance: "available.opening_balance",
+  intradayPayin: "available.intraday_payin",
+  adhocMargin: "available.adhoc_margin",
+  debits: "utilised.debits",
+  span: "utilised.span",
+  exposure: "utilised.exposure",
+  optionPremium: "utilised.option_premium",
+  m2mRealised: "utilised.m2m_realised",
+  m2mUnrealised: "utilised.m2m_unrealised",
+} as const;
+
+function component(components: FundsComponents | null | undefined, key: string): number | null {
+  if (!components) return null;
+  const value = components[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+/**
+ * Resolve the spendable-side figure for the requested basis.
+ *
+ * Falls back to the caller's `availableRupees` whenever the basis cannot be satisfied from the
+ * components — a basis naming a field the broker did not report must not silently become ₹0, and it
+ * must not become a refusal either, because the DEFAULT reading may still be perfectly usable. The
+ * fallback is reported in `detail` so the substitution is never silent.
+ */
+export function resolveAvailableForBasis(args: {
+  readonly basis: FundsBasis;
+  readonly components: FundsComponents | null | undefined;
+  /** The figure the adapter already selected (the default basis). Used as the fallback. */
+  readonly availableRupees: number | null;
+}): { readonly value: number | null; readonly detail: string; readonly satisfied: boolean } {
+  const { basis, components } = args;
+
+  if (basis === "live_balance") {
+    const value = component(components, FUNDS_COMPONENT_KEYS.liveBalance) ?? args.availableRupees;
+    return { value, detail: FUNDS_COMPONENT_KEYS.liveBalance, satisfied: value !== null };
+  }
+
+  if (basis === "net") {
+    const net = component(components, FUNDS_COMPONENT_KEYS.net);
+    if (net !== null) return { value: net, detail: "net (the segment's own bottom line)", satisfied: true };
+    return {
+      value: args.availableRupees,
+      detail:
+        `BOX_ZERODHA_FUNDS_BASIS=net was requested but 'net' was not reported, so ` +
+        `${FUNDS_COMPONENT_KEYS.liveBalance} is used instead`,
+      satisfied: false,
+    };
+  }
+
+  // live_balance_plus_collateral
+  const live = component(components, FUNDS_COMPONENT_KEYS.liveBalance) ?? args.availableRupees;
+  const collateral = component(components, FUNDS_COMPONENT_KEYS.collateral);
+  if (live === null) {
+    return {
+      value: null,
+      detail: `${FUNDS_COMPONENT_KEYS.liveBalance} was not reported, so no figure can be formed`,
+      satisfied: false,
+    };
+  }
+  if (collateral === null) {
+    return {
+      value: live,
+      detail:
+        `BOX_ZERODHA_FUNDS_BASIS=live_balance_plus_collateral was requested but ` +
+        `${FUNDS_COMPONENT_KEYS.collateral} was not reported, so ${FUNDS_COMPONENT_KEYS.liveBalance} ` +
+        `alone is used — the conservative outcome`,
+      satisfied: false,
+    };
+  }
+  return {
+    value: live + collateral,
+    detail:
+      `${FUNDS_COMPONENT_KEYS.liveBalance} ₹${live} plus ${FUNDS_COMPONENT_KEYS.collateral} ` +
+      `₹${collateral} (operator-selected basis; verify the broker does not already include ` +
+      `collateral in live_balance, or this OVERSTATES spendable funds)`,
+    satisfied: true,
+  };
+}
+
 /** The declared semantics for a broker name, or null when none are declared for it. */
 export function knownBrokerFundsSemantics(broker: string | null): BrokerFundsSemantics | null {
   if (broker === null) return null;
@@ -182,6 +345,17 @@ export function usableFundsRupees(args: {
   readonly broker: string | null;
   readonly availableRupees: number | null;
   readonly utilisedRupees: number | null;
+  /**
+   * Every numeric field the funds endpoint carried. Optional: callers that have only the two
+   * headline numbers still work exactly as before.
+   */
+  readonly components?: FundsComponents | null | undefined;
+  /**
+   * Which component to treat as spendable. Omitted ⇒ {@link DEFAULT_FUNDS_BASIS}, i.e. the shipped
+   * behaviour. Resolved HERE so the dashboard tile and the live admission gate cannot end up
+   * applying different bases to the same account — the same reason the netting arithmetic lives here.
+   */
+  readonly basis?: FundsBasis | null | undefined;
 }): UsableFundsVerdict {
   const semantics = knownBrokerFundsSemantics(args.broker);
   if (!semantics) {
@@ -196,13 +370,30 @@ export function usableFundsRupees(args: {
       encumbranceNettedFromAvailable: false,
     };
   }
-  const available = args.availableRupees;
+  /*
+   * THE BASIS IS RESOLVED FIRST, and only then are the netting semantics applied.
+   *
+   * The two questions are independent and must stay so: "which reported number is the spendable
+   * side?" (this) and "is that number already net of the encumbrance?" (the switch below). Folding
+   * them together is how a field-selection change would silently alter the netting.
+   */
+  const requestedBasis = args.basis ?? DEFAULT_FUNDS_BASIS;
+  const resolved = resolveAvailableForBasis({
+    basis: requestedBasis,
+    components: args.components,
+    availableRupees: args.availableRupees,
+  });
+  const available = resolved.value;
   const utilised = args.utilisedRupees;
+  /** Prefix appended to every basis string below, so the selected field is always on the record. */
+  const basisPrefix = requestedBasis === DEFAULT_FUNDS_BASIS ? "" : `[basis=${requestedBasis}] `;
 
   if (available === null || !Number.isFinite(available)) {
     return {
       value_rupees: null,
-      basis: `${args.broker}: no available-funds figure was supplied (${semantics.availableField} missing)`,
+      basis:
+        `${basisPrefix}${args.broker}: no available-funds figure was supplied ` +
+        `(${resolved.detail})`,
       semanticsUnverified: semantics.availableIsNetOfEncumbrance === "unverified",
       encumbranceMissing: utilised === null,
       encumbranceNettedFromAvailable: false,
@@ -228,8 +419,8 @@ export function usableFundsRupees(args: {
       return {
         value_rupees: available,
         basis:
-          `${args.broker}: ${semantics.availableField} is documented as already net of ` +
-          `encumbrances, so ${semantics.utilisedField} is NOT subtracted again` +
+          `${basisPrefix}${args.broker}: ₹${available} from ${resolved.detail}, documented as ` +
+          `already net of encumbrances, so ${semantics.utilisedField} is NOT subtracted again` +
           (encumbranceKnown
             ? ` (${semantics.utilisedField} ₹${utilised} corroborates it)`
             : `; but ${semantics.utilisedField} was NOT reported, so the already-net claim cannot ` +
