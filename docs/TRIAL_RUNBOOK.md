@@ -206,9 +206,25 @@ egress to the deployment.** Every step below is written to be executed by an aut
 
 `--lot-size=L` is **read from the live instrument master** for the contract actually being traded. It
 is not optional and it is **not guessable**: the whole envelope scales with it, the test fixtures use
-`75`, and an earlier note in this repository guessed `65`. The command refuses a missing or
-non-positive value rather than substituting one, and prints `UNVERIFIED` instead of plausible
-arithmetic if you omit it.
+`75`, and an earlier note in this repository guessed `65`.
+
+**The command's exit status is the verdict — read it, not just the last line.** A wrapper script must
+branch on it:
+
+| Exit | Meaning | What to do |
+|---|---|---|
+| **0** | `VERDICT: PASS` — the four bounds are 1 **and** one lot of `L` fits both caps | Proceed to the rest of Gate B |
+| **1** | `VERDICT: FAILED` (a cap refuses the lot) or `VERDICT: NOT VERIFIED` (no `--lot-size` given) or the profile is off | Do not arm. Fix the cause named in the verdict |
+| **2** | Unusable `--lot-size`, or a configuration that would not boot | Do not arm. Re-read the lot size, or fix the four bounds |
+
+**Bad input is refused, never coerced.** `--lot-size=65.5` is **rejected** with exit 2 — it is not
+rounded to `65`. A lot size is an integer contract property, so a fractional value means it was
+mistyped, read from the wrong field, or guessed; rounding it would print a lot size nobody read in the
+one report whose entire purpose is that the number is not invented. Zero, negative, empty and
+non-numeric values are refused the same way.
+
+**Omitting `--lot-size` prints `UNVERIFIED` and exits 1, not 0.** "We did not check" must not be
+mistakable for "we checked".
 
 For a lot size `L`, a one-lot box is:
 
@@ -222,22 +238,28 @@ boxes the gross cap alone permits            = floor(gross cap / 4L)
 
 Worked, at the shipped caps (`100` per leg, `400` gross):
 
-| Lot `L` | Per leg | Gross `4L` | Per-leg cap 100 | Gross cap 400 | Boxes the gross cap alone permits |
-|---|---|---|---|---|---|
-| 75 | 75 | 300 | PASS | PASS | `floor(400/300)` = **1** |
-| 65 | 65 | 260 | PASS | PASS | `floor(400/260)` = **1** |
-| 50 | 50 | 200 | PASS | PASS | `floor(400/200)` = **2** ⚠ |
-| 120 | 120 | 480 | PASS | **REFUSED** | — |
-| 150 | 150 | 600 | **REFUSED** | REFUSED | — |
+| Lot `L` | Per leg | Gross `4L` | Per-leg cap 100 | Gross cap 400 | Boxes gross cap alone permits | Exit |
+|---|---|---|---|---|---|---|
+| 75 | 75 | 300 | PASS | PASS | `floor(400/300)` = **1** | **0** |
+| 65 | 65 | 260 | PASS | PASS | `floor(400/260)` = **1** | **0** |
+| 100 | 100 | 400 | PASS (equal) | PASS (equal) | `floor(400/400)` = **1** | **0** |
+| 50 | 50 | 200 | PASS | PASS | `floor(400/200)` = **2** ⚠ | **0** |
+| 101 | 101 | 404 | **REFUSED** | **REFUSED** | `floor(400/404)` = 0 | **1** |
+| 150 | 150 | 600 | **REFUSED** | **REFUSED** | 0 | **1** |
 
-**Two things to take from that table.**
+**Three things to take from that table.**
 
-1. **A lot size above the per-leg cap means the trial cannot run at all** — every entry is refused
-   before any order is sent. Better to learn that from this command than from a refusal at 09:20.
-2. **The last column is the one nobody computes.** At a *smaller* lot the caps permit **more than one
-   box**, so the quantity caps are **not** a one-box control. `BOX_MAX_OPEN_BOXES=1` is what bounds the
-   trial to a single box, which is exactly why it is a required setting and why its previous absence
-   from two shipped profiles mattered.
+1. **A lot that breaches either cap means the trial cannot run at all** — every entry would be refused
+   before any order is sent, and the preflight now exits **1** so that is impossible to miss. Better
+   to learn it from this command than from a refusal at 09:20.
+2. **At the shipped caps the two rules move together**, because the gross cap (`400`) is exactly
+   4 × the per-leg cap (`100`): any lot that breaches gross has already breached per-leg. A
+   gross-only rejection is only reachable if you raise one cap without the other — and if you do, the
+   preflight reports it on its own.
+3. **The "boxes the gross cap alone permits" column is the one nobody computes.** At a *smaller* lot
+   the caps permit **more than one box**, so the quantity caps are **not** a one-box control.
+   `BOX_MAX_OPEN_BOXES=1` is what bounds the trial to a single box — which is why it is a required
+   setting, and why its previous absence from two shipped profiles mattered.
 
 > **Rows 3, 4, 5, 9, 10, 11, 13, 15 and 17–19 are read from a surface that reports rather than
 > enforces.** `operationalReadiness()` is consumed only by `getStatus()` and the runtime-status
@@ -321,8 +343,26 @@ day.** So:
 | Signal | Meaning |
 |---|---|
 | `pg_ready: false` | Outage present at startup. Banner `PostgreSQL is unavailable`. |
-| `pg_ready: true` **and** blocker `durable_store_unavailable` | **Mid-session failure.** Banner `PostgreSQL FAILED MID-SESSION`. The PostgreSQL indicator elsewhere may still read healthy — **the banner is authoritative, the field is not.** |
+| `pg_ready: true` **and** `durable_store_unavailable` in **either** `/api/runtime/status` `live_entry.reasons` **or** the Box readiness blockers | **Mid-session failure.** Banner `PostgreSQL FAILED MID-SESSION`. The PostgreSQL indicator elsewhere may still read healthy — **the banner is authoritative, the field is not.** |
 | All three of `exposure_management.exit_and_reduce`, `.protective_cancel`, `.manage_working_orders` false | Confirms automated reduction is unavailable, whatever any other field says. |
+| Banner `CONFLICTING READINESS SNAPSHOTS` | The two payloads **disagree** — see below. Treat the restrictive reading as correct. |
+
+**The dashboard reads two sources, on separate timers, and they can disagree.**
+`/api/runtime/status` and the Box status' `operational_readiness` are fetched independently and share
+no ordering field, so a fresh runtime response carrying `durable_store_unavailable` can sit beside an
+older readiness snapshot that still lists all three reduction permissions as available. The display
+now **fails closed**: a durable-store outage from *either* source overrides a "reduction available"
+claim from the other, and it raises the `CONFLICTING READINESS SNAPSHOTS` banner so you know the
+display made that choice rather than silently picking one.
+
+Two consequences for you as operator:
+
+- **Never resolve the disagreement in favour of the reassuring panel.** An unwritable store blocks
+  exiting, protective cancellation and working-order management alike; the permissive snapshot is
+  either stale or wrong.
+- **A stale or failed refresh makes the exit claim `UNKNOWN`, not "available".** If the readiness
+  reading on screen is not current, a permission read from it is not a permission. Verify at the
+  broker.
 
 **Procedure.**
 
