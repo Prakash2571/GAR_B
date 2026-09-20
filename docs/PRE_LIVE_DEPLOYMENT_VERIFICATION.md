@@ -247,15 +247,58 @@ A green readiness panel is therefore **necessary evidence, not sufficient proof*
 
 Decide on these before a first live order, not after.
 
-1. **Migration count discrepancy — unresolved.** A production check reported **16** applied migrations.
-   This tree ships **14**, `001_outbox.sql` through `014_box_settings_constraint_scope.sql` (verified by
-   `ls migrations/*.sql | wc -l`). Two unexplained migrations on a live trading database is not a
-   rounding error. Run:
+1. **Migration count discrepancy — STILL UNRESOLVED.** A production check reported **16** applied
+   migrations. This tree ships **14**, `001_outbox.sql` through `014_box_settings_constraint_scope.sql`
+   (re-verified against the current tree: `ls migrations/*.sql | wc -l` → 14). Two unexplained
+   migrations on a live trading database is not a rounding error, and **nothing below modifies
+   migration history** — every command is read-only. Do not guess which two files were applied.
+
+   **1a. Read the full applied set, with checksums.** The migrator records every applied file in
+   `schema_migrations (filename, checksum, applied_at)` — `src/pg/migrate.ts:85`.
    ```sql
-   select filename, applied_at from schema_migrations order by filename desc limit 6;
+   -- READ-ONLY. The complete applied set, in application order.
+   SELECT filename, checksum, applied_at
+     FROM schema_migrations
+    ORDER BY applied_at, filename;
+
+   -- READ-ONLY. The count the production check disagreed with.
+   SELECT count(*) AS applied_count FROM schema_migrations;
    ```
-   The migrator records every applied file in `schema_migrations (filename, checksum, applied_at)` —
-   `src/pg/migrate.ts:85` — so anything beyond `014_…` was applied by something other than this tree.
+
+   **1b. Identify the deployed commit**, so you are comparing against the right file set. On the host:
+   ```bash
+   # READ-ONLY. Whatever records the running build's revision for your deploy method:
+   git -C <deploy-dir> rev-parse HEAD
+   git -C <deploy-dir> status --porcelain     # must be EMPTY; a dirty deploy invalidates the compare
+   ```
+
+   **1c. Compute the repository-side checksums for that commit** and diff the two sets. The migrator
+   hashes the file **contents including comments**, so reproduce it exactly:
+   ```bash
+   # READ-ONLY. Run at the DEPLOYED commit, not at main.
+   for f in migrations/*.sql; do
+     printf '%s  %s\n' "$(sha256sum "$f" | cut -d" " -f1)" "$(basename "$f")"
+   done | sort -k2
+   ```
+   Compare filename-by-filename and checksum-by-checksum against 1a. (Confirm the digest algorithm
+   and any encoding normalisation in `src/pg/migrate.ts` before treating a mismatch as real — the
+   comparison is only as good as its reproduction of the migrator's own hashing.)
+
+   **1d. Stop conditions.** Treat each of these as a **NO-GO for a live order** until explained in
+   writing:
+
+   | Finding | What it means | Action |
+   |---|---|---|
+   | **EXTRA** rows in `schema_migrations` with no matching repository file (the reported 16 vs 14) | Some other tree, branch or manual `psql` session wrote this database. The schema may contain objects this code does not know about, or objects it will later try to create. | **STOP.** Identify the two filenames and who applied them before anything else. Do not delete the rows and do not re-run the migrator. |
+   | **MISSING** repository file with no `schema_migrations` row | The deployed code expects schema that may not exist. Boot may appear fine and fail on first use of the missing object. | **STOP.** Do not hand-apply; establish why the migrator did not run it. |
+   | **CHECKSUM MISMATCH** on a filename present in both | An applied migration file was edited after it was applied. The migrator treats this as a **hard boot error** ("Migration … was modified after it was applied"), so the running process either predates the edit or never restarted. | **STOP.** The database and the code disagree about history. |
+   | **`applied_at` ordering** differs from filename ordering | Migrations were applied out of sequence, so a later migration's assumptions may not have held. | Investigate before proceeding. |
+   | Counts and checksums all match, 14 for 14 | The "16" was a mis-read (e.g. a different database, a different schema, or a tool counting header rows). | Record which it was, then proceed. |
+
+   **1e. What resolves this item.** Paste the actual output of 1a and 1c into this document, name the
+   two extra filenames (or show that there are none), and state who applied them. Until that exists,
+   this item is unresolved and the production database must be treated as being of **unknown
+   provenance**.
 2. **The frontend has not been redeployed.** `GAR_F` main is green, but production still serves the older
    bundle, so recent Configuration-tab and Box-page work is absent. Readiness will be read through the
    older UI. Contract digests still match, so this is a cosmetic and workflow gap, not a protocol one.
