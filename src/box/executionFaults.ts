@@ -281,6 +281,13 @@ export type BoxParentAttemptReason =
   | BoxExecutionFailureReason
   | ExecutionFaultClass
   | "persistence_unavailable"
+  /**
+   * ALL FOUR legs filled and the Box could not be RECORDED — the qualification callback threw, or the
+   * durable position insert failed. Distinct from `persistence_unavailable`, which describes a store
+   * that could not be reached BEFORE exposure was taken: this one means exposure EXISTS at the broker
+   * and we hold it without a position row. It is the most actionable reason in this taxonomy.
+   */
+  | "filled_exposure_unrecorded"
   | "internal_error";
 
 /**

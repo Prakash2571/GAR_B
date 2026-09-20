@@ -103,6 +103,56 @@ statement about test coverage, not about the code: every suite set the limit to 
 
 ---
 
+### 2.4 A failure after four confirmed fills no longer loses the position — **[CODE]**
+
+Two paths could take a complete four-leg fill and leave no record of it.
+
+- **[CODE]** `simulateLeggingEntry` called the scanner-supplied `qualify` callback with no `try/catch`.
+  A throw propagated out of the gateway and discarded the four `BrokerOrder` snapshots: no failure
+  record, so no durable attempt row and no `residual_exposure`; no `outcome_class`; no
+  `invariantViolation`, so the breaker never tripped and new entry was never blocked. The scanner
+  classified it as a technical fault with `exposure_existed: false` and released the candidate.
+- **[CODE]** `finalizeOpen`'s two post-fill failure branches (unbuildable charge legs, and a null
+  insert from a duplicate-open-box index or a failed write) ended in `positions.release(cand.key)`
+  after a `console.error`, with a comment admitting residual adoption "is not built yet".
+
+Both now route through one path. It **retains** the exposure (never unwound: a throw is the *absence*
+of an economic verdict, so reversing would pay a four-leg round trip on a position that may have been
+fine), **keeps ownership** (`positions.release` is deliberately not called), **reconstructs the
+exposure** as `residual_exposure` for the flatten loop, **blocks new entry** via `invariantViolation`
+→ breaker, and labels it `FILLED_EXPOSURE_UNRECORDED` with a new `filled_exposure_unrecorded` alert
+reason whose remedy tells the operator to verify the four legs at the broker. Because the durable
+write is fire-and-forget, the message states that persistence **could not be confirmed** rather than
+claiming the exposure was saved.
+
+**Remaining limits, [CODE]:**
+- The candidate key stays reserved, so that strike pair cannot be re-entered until the process
+  restarts. Deliberate and fail-closed, but it is a manual cleanup, not self-healing.
+- On the **atomic** paper path there is no per-leg broker record, so the retained quantities are
+  reconstructed from the evaluation's touch prices rather than from broker fills. Live mode always
+  uses the legging path, which carries real fill detail.
+- `onExecutionAttempt` returns `void`, so the gateway/scanner cannot verify the durable row landed.
+  The breaker is the backstop that holds when it does not.
+
+### 2.5 A proven zero-fill exit rejection is no longer treated as broker uncertainty — **[CODE]**
+
+`BrokerOrderRejectedError` had no branch in the exit wave, so it fell into the catch-all that sets
+`uncertain = true`. That tripped the breaker (blocking **new entry**) and produced the detail
+"exit terminal quantity uncertain", which `positionMonitor` regex-matches to move the **whole
+position** to RECOVERY — on the strength of the one outcome the broker was explicit about.
+
+- **[CODE]** A rejection whose snapshot passes `verifyZeroBrokerExposure` (terminal `REJECTED`,
+  verified `filled_quantity === 0`, no fill records, no missing quantity evidence) is now reported as
+  a **failed reduction with the broker's reason**: `REJECTED BY BROKER: <role> … <reason>`, with the
+  still-open quantity named. No invented uncertainty, no breaker trip, no whole-position RECOVERY.
+- **[CODE]** The leg's outstanding quantity is unchanged and its hedge stays on. `certain: true` with
+  a zero fill cannot release cover — `releasableHedgeQuantity` requires `confirmedClosed > 0` — and a
+  test asserts zero hedge POSTs.
+- **[CODE]** A **contradicted** rejection, an ambiguous submission and a persistence-after-fill
+  failure all still quarantine and fail closed, unchanged.
+- **[CODE]** A partial fill on another leg is still credited, and its hedge release is still sized
+  only from the proven closed quantity.
+
 ## 3. Reduction under degraded market data — the accepted trade-off
 
 - **[CODE]** Every order, entry and reduction alike, is a **bounded LIMIT** order. Nothing anywhere
@@ -212,9 +262,12 @@ and that scope — not the field's position on a panel — is what decides wheth
 
 **NO-GO for a supervised one-lot live test at the time of writing.**
 
-The code-side blocker from the previous record (the rejection/fill race) is closed and tested, and
-three operator-facing misreports are fixed. That is not sufficient. The following are each
-independently disqualifying and **all four remain open**:
+The code-side blockers found so far are closed and tested: the rejection/fill race (§2.1), three
+operator-facing misreports (§2.2), the two post-fill failure paths that could lose a confirmed
+four-leg position (§2.4), and the exit rejection that manufactured broker uncertainty (§2.5).
+
+**Fixing code does not authorise a live test.** The following are each independently disqualifying and
+**all four remain open**:
 
 1. The production migration discrepancy (16 applied vs 14 shipped) is **unexplained**. §4 item 1.
 2. The host's egress IP and the Zerodha whitelist are **unconfirmed**. §4 items 2–3, §4.1.

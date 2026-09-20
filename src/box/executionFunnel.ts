@@ -58,6 +58,8 @@ export type SubmittedFailureReason =
   | "partial_entry_unwound"
   | "partial_entry_residual"
   | "economics_abort_after_fill"
+  /** All four legs filled but the Box could not be recorded; the exposure is retained. */
+  | "filled_exposure_unrecorded"
   | "quarantined_unknown";
 
 export interface FunnelRatio {
@@ -129,7 +131,8 @@ const ZERO_POST_REASONS: readonly ZeroPostRefusalReason[] = [
   "coherence", "capital", "entry_guard", "hedge_coverage", "deadline", "depth", "ownership", "other",
 ];
 const SUBMITTED_FAILURE_REASONS: readonly SubmittedFailureReason[] = [
-  "no_fill", "partial_entry_unwound", "partial_entry_residual", "economics_abort_after_fill", "quarantined_unknown",
+  "no_fill", "partial_entry_unwound", "partial_entry_residual", "economics_abort_after_fill",
+  "filled_exposure_unrecorded", "quarantined_unknown",
 ];
 
 function ratio(numerator: number, denominator: number, basis: string): FunnelRatio {
@@ -252,6 +255,20 @@ export class ExecutionFunnel {
           // both are published; neither is allowed to hide the other.
           this.submittedFailures++;
           this.submittedFailureByReason.economics_abort_after_fill++;
+          break;
+        case "FILLED_EXPOSURE_UNRECORDED":
+          /*
+           * A SUBMITTED FAILURE, and deliberately its own reason.
+           *
+           * Four legs really filled, so this belongs in the submitted denominator — but it is not
+           * `no_fill` (they filled), not `partial_entry_*` (all four filled and none was unwound),
+           * not `economics_abort_after_fill` (no economic verdict was ever reached) and not
+           * `quarantined_unknown` (the broker state is fully proven; ours is what failed). Folding
+           * it into any of those would hide the one outcome in this enum where a live position
+           * exists that the system never recorded.
+           */
+          this.submittedFailures++;
+          this.submittedFailureByReason.filled_exposure_unrecorded++;
           break;
         case "QUARANTINED_UNKNOWN":
           this.submittedFailures++;

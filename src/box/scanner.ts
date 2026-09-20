@@ -52,6 +52,7 @@ import {
   type BoxExecutionRecord,
   type BoxOpportunity,
   type PaperLeggingExecutionRecord,
+  type ResidualLegExposure,
 } from "./types.js";
 
 /** At most one hot-path evaluation-fault log line per this interval. */
@@ -847,14 +848,10 @@ export class BoxScanner {
   ): Promise<boolean> {
     const legs = buildEntryChargeLegs(evaluation.candidate, evaluation.legs);
     if (!legs) {
-      // Should be unreachable: a filled evaluation always has four priced legs. But
-      // we are PAST the fill here, so if it ever happens the position exists and we
-      // failed to record it — that must never be silent.
-      console.error(
-        `[Box] LOST FILL: ${cand.key} filled but its charge legs could not be built, ` +
-          `so no position was recorded. This is an accounting hole — investigate.`,
-      );
-      this.deps.positions.release(cand.key);
+      // Should be unreachable: a filled evaluation always has four priced legs. But we are PAST the
+      // fill here, so if it ever happens the position exists and we failed to record it — that must
+      // never be silent, and it must never be released as though nothing filled.
+      this.retainUnrecordedFill(cand, evaluation, legging, "its entry charge legs could not be built");
       return false;
     }
     const orders = legs.map((l) => ({
@@ -882,17 +879,151 @@ export class BoxScanner {
       this.markStatus(cand.key, this.deps.cfg.executionMode === "live" ? "LIVE_OPENED" : "PAPER_OPENED");
     } else {
       // The legs FILLED but nothing was persisted — either the unique index says this
-      // box is already open, or the write failed. Either way simulated exposure was
-      // taken on and is now unrecorded, so the P&L is understated. Loud by design:
-      // durable retry / residual-exposure adoption for this path is not built yet.
-      console.error(
-        `[Box] LOST FILL: ${cand.key} filled but no position was persisted ` +
-          `(duplicate open box, or the insert failed). Simulated exposure is unrecorded — ` +
-          `treat today's P&L as incomplete until this is reconciled.`,
+      // box is already open, or the write failed. Either way the exposure was taken on
+      // and is now unrecorded.
+      this.retainUnrecordedFill(
+        cand,
+        evaluation,
+        legging,
+        "no position was persisted (duplicate open box, or the insert failed)",
       );
-      this.deps.positions.release(cand.key);
     }
     return id !== null;
+  }
+
+  /**
+   * A CONFIRMED FILL WE COULD NOT RECORD — retained, never released.
+   *
+   * ─────────────────────────────────────────────────────────────────────────────────────────────
+   * THE DEFECT THIS CLOSES
+   * ─────────────────────────────────────────────────────────────────────────────────────────────
+   * Both post-fill failure branches in `finalizeOpen` used to end in `positions.release(cand.key)`
+   * after a `console.error`. The comment was honest that "durable retry / residual-exposure adoption
+   * for this path is not built yet" — but the consequence was that a COMPLETE FOUR-LEG POSITION,
+   * already filled at the broker, was handed back to the candidate pool as though nothing had
+   * happened: no durable attempt row, no residual exposure, nothing blocking the next entry, and a
+   * log line as the only trace. In live mode that is real money with no owner.
+   *
+   * ─────────────────────────────────────────────────────────────────────────────────────────────
+   * WHAT THIS DOES INSTEAD
+   * ─────────────────────────────────────────────────────────────────────────────────────────────
+   *   1. KEEPS OWNERSHIP. `positions.release` is deliberately NOT called, so the candidate key stays
+   *      taken and this underlying cannot be re-entered on top of exposure we already hold.
+   *   2. RECONSTRUCTS THE EXPOSURE from the legging record's own filled legs and publishes it as
+   *      `residual_exposure` on a durable attempt row, which is what the residual/flatten loop
+   *      adopts and what `residualLegs` uses to block new entry.
+   *   3. BLOCKS NEW ENTRY IMMEDIATELY via `invariantViolation`, which trips the breaker and sets
+   *      `recoveryActive`. This is process-local and therefore holds even when the durable write is
+   *      the very thing that just failed.
+   *   4. NAMES THE LIMIT. The durable write is fire-and-forget (`onExecutionAttempt` returns void),
+   *      so this can NOT claim the exposure was safely persisted — and says so, with the broker
+   *      order ids an operator needs to verify the legs directly.
+   *
+   * It does NOT unwind. The position is complete and hedged, quantities are certain, and reversing
+   * it is an economic decision this path has no verdict for — the residual machinery reduces it
+   * under the existing exposure-aware rules (shorts first, hedges held while any short is unproven).
+   */
+  private retainUnrecordedFill(
+    cand: BoxCandidate,
+    evaluation: BoxEvaluation,
+    legging: PaperLeggingExecutionRecord | null,
+    why: string,
+  ): void {
+    const now = Date.now();
+    /*
+     * RECONSTRUCTED FROM WHICHEVER RECORD THIS PATH HAS.
+     *
+     * The legging path carries per-leg broker execution detail (`fill_qty`, average price); the
+     * ATOMIC path (`simulateEntry`) reaches `finalizeOpen` with `legging === null` and only an
+     * evaluation. Both can lose a fill, so both must be able to describe the exposure they hold —
+     * an atomic fill that could not be recorded is no less real for having no per-leg record.
+     */
+    const filledLegs = (legging?.legs ?? []).filter((leg) => leg.fill_qty > 0);
+    const retained: ResidualLegExposure[] = filledLegs.length > 0
+      ? filledLegs.map((leg) => ({
+        token: leg.token,
+        tradingsymbol: leg.tradingsymbol,
+        role: leg.role,
+        side: leg.side,
+        quantity: leg.fill_qty,
+        // NEVER a fabricated 0: an unpublished average price is absent data, not a free fill.
+        average_price: leg.average_fill_price ?? leg.fill_price ?? 0,
+        source: "partial_entry" as const,
+        created_at: now,
+      }))
+      : evaluation.legs
+        .filter((leg) => leg.price !== null && leg.price > 0)
+        .map((leg) => ({
+          token: leg.token,
+          tradingsymbol: leg.tradingsymbol,
+          role: leg.role,
+          side: leg.side,
+          quantity: evaluation.candidate.lot_size,
+          average_price: leg.price as number,
+          source: "partial_entry" as const,
+          created_at: now,
+        }));
+    const brokerIdentity = retained.length > 0
+      ? retained.map((leg) => `${leg.role} ${leg.side} ${leg.quantity} @ ${leg.average_price}`).join("; ")
+      : "no per-leg execution detail available";
+
+    if (legging) {
+      legging.outcome_class = "FILLED_EXPOSURE_UNRECORDED";
+      // Reconstructed only when the record does not already carry one, so a residual the gateway
+      // computed (which knows the broker snapshots) is never overwritten by a weaker projection.
+      if (legging.residual_exposure.length === 0) legging.residual_exposure = retained;
+    }
+
+    const detail =
+      `LOST FILL: ${cand.key} filled all four legs but ${why}. The exposure is REAL and is NOT ` +
+      `unwound; it is retained for broker-authoritative reconciliation and new entry is blocked. ` +
+      `Durable recording of this attempt could NOT be confirmed from here, so do not assume it was ` +
+      `persisted — verify the legs at the broker: ${brokerIdentity}`;
+
+    // Loud, and on the operator alert surface beside the market refusals rather than only in a log.
+    console.error(`[Box] ${detail}`);
+    this.deps.faults?.record({
+      at: Date.now(),
+      fault_class: "trade_persistence_error",
+      stage: "trade_persistence",
+      execution_mode: this.deps.cfg.executionMode,
+      paper_profile: this.deps.cfg.paperExecutionProfile,
+      broker: this.deps.activeBroker?.() ?? null,
+      error_type: "LostFillUnrecorded",
+      message: detail,
+      stack: null,
+      candidate_key: cand.key,
+      reservation_held: this.deps.positions.isTaken(cand.key),
+      // TRUE, unlike the generic catch which reports `positions.getByKey(...) !== undefined` and so
+      // asserted "no exposure existed" for precisely this case.
+      exposure_existed: true,
+      reached_broker: this.deps.cfg.executionMode === "live"
+        ? this.deps.reachedBroker?.() ?? null
+        : null,
+    });
+    this.deps.onEntryRejected?.({
+      underlying: cand.underlying,
+      reason: "filled_exposure_unrecorded",
+      detail,
+      candidateKey: cand.key,
+    });
+
+    // The durable attempt row carries the reconstructed residual, which is what the flatten loop
+    // adopts. Fire-and-forget by the dependency's own contract, hence the disclaimer above.
+    if (legging) {
+      this.deps.onExecutionAttempt?.(
+        cand,
+        legging,
+        "legging_incomplete",
+        detail,
+        evaluation.gross_edge ?? 0,
+      );
+    }
+
+    // Blocks new entry regardless of whether anything above reached storage.
+    this.deps.executionSim.invariantViolation(`${cand.key}: ${detail}`);
+
+    // NOTE: `positions.release(cand.key)` is deliberately absent. See the docblock.
   }
 
   private recordExecutionFailure(

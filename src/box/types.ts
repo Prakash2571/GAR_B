@@ -1089,6 +1089,21 @@ export type BoxEntryOutcomeClass =
   | "PARTIAL_ENTRY_UNWOUND"
   | "PARTIAL_ENTRY_RESIDUAL"
   | "FILLED_THEN_ECONOMICS_ABORT"
+  /**
+   * ALL FOUR legs filled, but the Box could not be RECORDED as an open position — the final
+   * qualification callback threw, or the durable position insert failed.
+   *
+   * Distinct from `FILLED_THEN_ECONOMICS_ABORT`, where a verdict was reached and the box was
+   * deliberately reversed, and from `QUARANTINED_UNKNOWN`, where the BROKER state is unprovable.
+   * Here the broker state is fully proven — four terminal legs with confirmed cumulative fills —
+   * and it is OUR OWN bookkeeping that failed. The exposure is real, its quantities are certain,
+   * and it is retained as residual exposure for reconciliation rather than unwound on an unknown
+   * verdict. New entry is blocked while it is outstanding.
+   *
+   * It must NEVER be presented as an ordinary rejected candidate: a candidate that never traded
+   * and a live four-leg position nobody recorded demand opposite responses.
+   */
+  | "FILLED_EXPOSURE_UNRECORDED"
   | "QUARANTINED_UNKNOWN";
 
 export interface PaperLeggingExecutionRecord {

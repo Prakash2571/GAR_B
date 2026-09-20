@@ -867,7 +867,69 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
 
     const evaluation = evaluationFromFills(args.detection, orders);
     const measured = slippageFromFills(args.detection.legs, orders);
-    const decision = args.qualify(evaluation, measured);
+    /*
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     * PAST THIS LINE, FOUR LEGS ARE CONFIRMED FILLED. NOTHING MAY THROW OUT OF THIS METHOD.
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     *
+     * THE DEFECT THIS CLOSES. `args.qualify` is a CALLBACK supplied by the scanner, which runs the
+     * final charge/economics calculation inside it. It can throw. There was no try/catch, so the
+     * exception propagated out of `simulateLeggingEntry` with `orders` — the four confirmed fills,
+     * with their broker order ids — held only in this local array, which was then discarded.
+     *
+     * Everything that makes a post-fill outcome survivable was skipped: no `liveEntryFailure`
+     * record, so no durable attempt row and no `residual_exposure`; no `outcome_class`; no
+     * `invariantViolation`, so the breaker never tripped and new entry was never blocked. The
+     * scanner's catch then classified it as a technical fault, recorded `ENTRY_REJECTED_EXECUTION`
+     * with `exposure_existed: false`, and released the candidate — publishing a complete four-leg
+     * live position as an ordinary rejected candidate that never traded.
+     *
+     * WHY THE EXPOSURE IS RETAINED RATHER THAN UNWOUND. The economics-abort branch below reverses
+     * the box, but it may only do that because `qualify` RETURNED a verdict: "these executed prices
+     * do not clear the bar" is a decision. A THROW is the absence of a decision — we do not know
+     * whether this box should be held or reversed, and unwinding on an unknown verdict would pay a
+     * four-leg round trip on a position that may have been perfectly good. So the confirmed
+     * exposure is retained and handed to the durable residual/flatten machinery, which is
+     * exposure-aware (shorts before longs, hedges held while any short is unproven).
+     *
+     * The quantities are CERTAIN here — every leg is terminal with a broker-confirmed cumulative
+     * fill — so this is not "acting on an uncertain quantity"; it is refusing to act on an
+     * uncertain ECONOMIC verdict.
+     */
+    let decision: BoxEntryDecision;
+    try {
+      decision = args.qualify(evaluation, measured);
+    } catch (error) {
+      // BLOCKS NEW ENTRY. `invariantViolation` sets `recoveryActive` and trips the breaker, so
+      // `entryBlockReason` refuses every subsequent entry until an operator resolves it. This is
+      // the process-local backstop that holds even if the durable write below fails.
+      manager.invariantViolation(
+        `live entry ${attemptId} filled all four legs and then final qualification THREW ` +
+          `(${errorMessage(error)}); the confirmed exposure is retained for reconciliation`,
+      );
+      // No residual override: `liveEntryFailure` derives residual from every order with a positive
+      // cumulative fill, which is exactly the four confirmed legs at their broker fill quantities
+      // and prices. That is what makes the exposure durable and visible to the flatten loop.
+      const unrecorded = liveEntryFailure(
+        args.candidate,
+        args.detection.at,
+        submittedAt,
+        orders,
+        "legging_incomplete",
+        `all four legs FILLED, then final qualification threw (${errorMessage(error)}). ` +
+          "The box was NOT opened and the confirmed exposure was NOT unwound — it is retained as " +
+          "residual exposure for broker-authoritative reconciliation. New entry is blocked. " +
+          "Verify the four legs at the broker: " +
+          orders
+            .map((order) => `${order.role} ${order.side} ${order.filled_quantity} ` +
+              `broker_order_id=${order.broker_order_id ?? "unknown"}`)
+            .join("; "),
+        this.deps.cfg,
+        tradeId,
+      );
+      unrecorded.legging.outcome_class = "FILLED_EXPOSURE_UNRECORDED";
+      return unrecorded;
+    }
     if (!decision.qualifies) {
       // ── 4/4 FILLED, THEN ECONOMICS FAILED ────────────────────────────────────────────
       //
@@ -1156,6 +1218,22 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     let attempted = 0;
     const withheld: string[] = [];
     /*
+     * LEGS THE BROKER POSITIVELY REFUSED, WITH A PROVEN ZERO FILL.
+     *
+     * Kept apart from both other buckets because it is a third, distinct operational fact. The leg
+     * WAS transmitted (so it is not "not submitted"), the broker answered definitively, and
+     * `verifyZeroBrokerExposure` confirmed the snapshot is a terminal REJECTED with a verified
+     * `filled_quantity === 0`. So this leg's outstanding quantity is exactly what it was, its hedge
+     * must stay on, and there is nothing uncertain about any of it.
+     */
+    const brokerRejected: string[] = [];
+    /*
+     * HEDGES DELIBERATELY HELD BACK AS COVER — tracked in its own array rather than recovered by
+     * string-matching `withheld`, which is how the previous `!entry.includes("not submitted:")`
+     * filter worked and would have silently mis-bucketed the broker-rejected entries below.
+     */
+    const heldForCover: string[] = [];
+    /*
      * THE SUBSET OF `withheld` THAT WAS NEVER TRANSMITTED AT ALL.
      *
      * `withheld` mixes two operationally opposite situations: a hedge DELIBERATELY held back because
@@ -1272,6 +1350,46 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
           byRole.set(role, { filled: item.reason.order.filled_quantity, certain: false });
           return;
         }
+        /*
+         * A PROVEN ZERO-FILL BROKER REJECTION IS A FAILED REDUCTION, NOT AN UNKNOWN.
+         *
+         * THE DEFECT THIS CLOSES. `BrokerOrderRejectedError` had no branch here, so it fell into the
+         * catch-all below: `uncertain = true` and `{filled: 0, certain: false}`. The consequences
+         * were entirely out of proportion to the event. `uncertain` trips
+         * `manager.invariantViolation` — which sets `recoveryActive` and opens the circuit breaker,
+         * blocking all new entry — and sets the detail to "exit terminal quantity uncertain;
+         * position moved to recovery". `positionMonitor.applyLeggingExitResult` regex-matches
+         * /uncertain|reconcil/i on that detail and moves the WHOLE POSITION to RECOVERY with an
+         * `UNCERTAIN` exit attempt whose broker orders are rewritten to RECONCILIATION_REQUIRED.
+         *
+         * But the broker TOLD US what happened: it refused the order and confirmed nothing
+         * executed. That is the least uncertain outcome available. The leg's outstanding quantity is
+         * unchanged and known, its hedge is still required and still on, and the correct response is
+         * to report a failed reduction with the broker's reason and try again next cycle — not to
+         * declare the position's quantities unknowable and freeze entry.
+         *
+         * The guard is `verifyZeroBrokerExposure`, the same single authority the entry path uses, so
+         * a rejection whose snapshot CONTRADICTS itself (a positive fill, fill records, a
+         * nonterminal/RECONCILIATION_REQUIRED state, missing quantity evidence, a conflicting broker
+         * order id) is NOT caught here. It falls through to the catch-all and still fails closed —
+         * as do `BrokerAmbiguousSubmitError` (including `BrokerRejectionContradictedError`) and
+         * `OrderPersistenceAfterFillError` above.
+         */
+        if (
+          item.reason instanceof BrokerOrderRejectedError
+          && verifyZeroBrokerExposure(item.reason.order).proven
+        ) {
+          // CERTAIN ZERO. Identical evidence to a proven no-POST refusal: nothing executed, and we
+          // know it. `releasableHedgeQuantity` therefore releases NOTHING for this short, because
+          // its outstanding quantity is untouched — the hedge stays exactly where it is.
+          byRole.set(role, { filled: 0, certain: true });
+          const brokerReason = item.reason.order.reject_reason ?? errorMessage(item.reason);
+          const entry = `${role} rejected by broker: ${withheldReason(brokerReason)}`;
+          // Recorded as withheld so `clean` can never be true: the reduction did not happen.
+          withheld.push(entry);
+          brokerRejected.push(entry);
+          return;
+        }
         uncertain = true;
         byRole.set(role, { filled: 0, certain: false });
       });
@@ -1305,11 +1423,15 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
         },
       });
       if (releasable <= 0) {
-        withheld.push(`${slot.role} held back ${slot.outstanding} covering ${short}`);
+        const entry = `${slot.role} held back ${slot.outstanding} covering ${short}`;
+        withheld.push(entry);
+        heldForCover.push(entry);
         continue;
       }
       if (releasable < slot.outstanding) {
-        withheld.push(`${slot.role} held back ${slot.outstanding - releasable} covering ${short}`);
+        const entry = `${slot.role} held back ${slot.outstanding - releasable} covering ${short}`;
+        withheld.push(entry);
+        heldForCover.push(entry);
       }
       releases.push({ role: slot.role, quantity: releasable });
     }
@@ -1323,7 +1445,9 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
         await runWave(releases);
       } catch (error) {
         // Defence in depth, as for wave 0.
-        withheld.push(`hedge release blocked: ${errorMessage(error)}`);
+        const entry = `hedge release blocked: ${errorMessage(error)}`;
+        withheld.push(entry);
+        heldForCover.push(entry);
       }
     }
 
@@ -1357,8 +1481,6 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     const openSummary = stillOpen.length > 0
       ? stillOpen.map(({ role, remaining }) => `${role} ${remaining}`).join(", ")
       : "none";
-    // Held for cover is the REST of `withheld` — the deliberate, self-healing holds.
-    const heldForCover = withheld.filter((entry) => !entry.includes("not submitted:"));
 
     /*
      * THE WORDING IS LOAD-BEARING IN TWO DIRECTIONS.
@@ -1370,15 +1492,37 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
      * That is why `withheldReason()` scrubs those two tokens out of the per-leg reasons, and why the
      * operator instruction below is phrased without them.
      */
+    // The deliberate cover holds are self-healing and must keep their calm wording; the two
+    // "this did not reduce" categories are what an operator has to act on.
+    const coverSuffix = heldForCover.length > 0 ? ` Held as required cover: ${heldForCover.join("; ")}.` : "";
     const detail = uncertain
       ? "exit terminal quantity uncertain; position moved to recovery"
-      : notSubmitted.length > 0
-        // NOTHING WAS SENT on these legs. Never describe this as a fill.
-        ? `live exit NOT SUBMITTED on ${notSubmitted.length} leg(s) — no order reached the broker, ` +
-          `so this exposure was NOT reduced: ${notSubmitted.join("; ")}. Still open: ${openSummary}. ` +
-          `Automated reduction will retry, but if it keeps failing the position must be reduced ` +
-          `MANUALLY AT THE BROKER TERMINAL.` +
-          (heldForCover.length > 0 ? ` Held as required cover: ${heldForCover.join("; ")}.` : "")
+      : brokerRejected.length > 0 || notSubmitted.length > 0
+        /*
+         * A FAILED REDUCTION, WITH THE REASON, AND WITHOUT INVENTING UNCERTAINTY.
+         *
+         * Both categories mean the outstanding quantity did not come down, so both belong in one
+         * sentence — but they are named separately because they need different operator responses:
+         * `NOT SUBMITTED` is our own send boundary refusing on a dead book (it will retry when the
+         * book returns), whereas `REJECTED BY BROKER` is the broker declining an order we did
+         * transmit (margin, RMS, price band, freeze quantity — usually it will keep declining until
+         * something changes at the broker).
+         *
+         * The wording avoids the /uncertain|reconcil/ tokens deliberately: those are what
+         * `positionMonitor.applyLeggingExitResult` matches to move the whole position to RECOVERY,
+         * and neither case is uncertain — the outstanding quantities below are exact. The broker's
+         * own reason text is passed through `withheldReason()` for the same purpose, so a broker
+         * message that happens to contain one of those words cannot trigger the routing either.
+         */
+        ? `live exit FAILED to reduce ${brokerRejected.length + notSubmitted.length} leg(s); ` +
+          `exposure is unchanged on those legs.` +
+          (brokerRejected.length > 0 ? ` REJECTED BY BROKER: ${brokerRejected.join("; ")}.` : "") +
+          (notSubmitted.length > 0
+            ? ` NOT SUBMITTED (no order reached the broker): ${notSubmitted.join("; ")}.`
+            : "") +
+          ` Still open: ${openSummary}. Automated reduction will retry, but if it keeps failing the ` +
+          `position must be reduced MANUALLY AT THE BROKER TERMINAL.` +
+          coverSuffix
         : heldForCover.length > 0
           ? `live exit preserved required hedge cover: ${heldForCover.join("; ")}. Still open: ${openSummary}.`
           : `live exit partially filled; the broker confirmed less than the outstanding quantity. ` +
