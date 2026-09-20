@@ -55,6 +55,7 @@
  */
 
 import { loadBoxConfig, type BoxConfig } from "./config.js";
+import { renderSupervisedTrialPreflight } from "./supervisedTrial.js";
 
 /** Where a resolved value came from. */
 export type ConfigProvenance =
@@ -140,6 +141,10 @@ const KNOBS: readonly KnobSpec[] = [
   // configured for one trade can otherwise submit orders indefinitely so long as none completes.
   // Its absence also meant the effective-config drift test could not cover it.
   { key: "sessionMaxEntryAttempts", envVar: "BOX_SESSION_MAX_ENTRY_ATTEMPTS", kind: "int", default: 0, min: 0, max: 10_000, strict: true },
+  // The supervised one-lot trial PROFILE. It constrains the four settings above/below it rather than
+  // setting anything itself, so it belongs in this report for the same reason they do: an operator
+  // needs to see whether the profile is actually ON, from the resolved environment, before arming.
+  { key: "supervisedOneLotTrial", envVar: "BOX_SUPERVISED_ONE_LOT_TRIAL", kind: "bool", default: false, strict: true },
   { key: "maxConcurrentPerUnderlying", envVar: "BOX_MAX_CONCURRENT_PER_UNDERLYING", kind: "int", default: 2, min: 0, max: 16, strict: true },
 
   // ---- Quantity envelope ----
@@ -417,6 +422,51 @@ export function renderEffectiveConfig(report: EffectiveConfigReport): string {
  * confirm, before arming, exactly what the process will run with.
  */
 export function main(argv: readonly string[] = process.argv.slice(2)): void {
+  /*
+   * `--supervised-trial [--lot-size=N]` prints the one lot / one box / one attempt preflight.
+   *
+   * It is served from THIS command because this is already the one place that reports EFFECTIVE
+   * values with provenance, and the trial's whole question is "are the four bounds really 1 in the
+   * configuration this host will boot?" — which cannot be answered from the `.env` text.
+   *
+   * `--lot-size` is READ FROM THE OPERATOR, who reads it from the live instrument master. There is
+   * deliberately no default: the arithmetic scales entirely with it, the fixtures use 75 and an
+   * earlier note guessed 65, and substituting either would manufacture exactly the false assurance
+   * this report exists to remove. Omitting it prints the settings half and says the arithmetic is
+   * UNVERIFIED.
+   */
+  if (argv.includes("--supervised-trial")) {
+    let cfg: BoxConfig;
+    try {
+      cfg = loadBoxConfig();
+    } catch (err) {
+      // A refusal here is itself the answer: the profile is on and the bounds are wrong.
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`configuration would NOT boot:\n${msg}\n`);
+      process.exitCode = 2;
+      return;
+    }
+    const raw = argv.find((a) => a.startsWith("--lot-size="))?.slice("--lot-size=".length);
+    const lotSize = raw === undefined || raw === "" ? null : Number(raw);
+    if (lotSize !== null && (!Number.isFinite(lotSize) || lotSize <= 0)) {
+      process.stderr.write(`--lot-size must be a positive integer read from the live instrument master, got "${raw}"\n`);
+      process.exitCode = 2;
+      return;
+    }
+    process.stdout.write(
+      `${renderSupervisedTrialPreflight({
+        enabled: cfg.supervisedOneLotTrial,
+        settings: cfg,
+        lotSize,
+        perLegCap: cfg.liveMaxOpenLegQuantity,
+        grossCap: cfg.liveMaxGrossOpenLegQuantity,
+      })}\n`,
+    );
+    // A non-zero exit so a preflight script cannot mistake an unsatisfied profile for a pass.
+    if (cfg.supervisedOneLotTrial && lotSize === null) process.exitCode = 1;
+    return;
+  }
+
   let report: EffectiveConfigReport;
   try {
     report = resolveEffectiveConfig();

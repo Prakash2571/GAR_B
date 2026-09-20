@@ -707,7 +707,30 @@ export type BoxExecutionFailureReason =
    * session attempt is consumed — see the long note at that gate for what this previously cost.
    * LIVE ONLY: the caps live in BoxOrderManager, which paper never constructs.
    */
-  | "lot_exceeds_quantity_cap";
+  | "lot_exceeds_quantity_cap"
+  /**
+   * Box legs are held AT THE BROKER that no open trade and no residual attempt accounts for —
+   * almost certainly a fill confirmed before a previous process could record it. Nothing is
+   * reducing that exposure automatically, so no NEW box is admitted until an operator resolves it.
+   *
+   * DELIBERATELY DISTINCT FROM `underlying_already_active`, and this distinction is the whole
+   * point: unowned exposure is not attached to a *known* position, so the per-underlying lock
+   * cannot see it — its input is the durable position book, which by definition has no row for
+   * this exposure. It is equally invisible to `box_inventory_limit`, whose count is derived from
+   * that same book. A candidate on a COMPLETELY DIFFERENT underlying therefore used to sail
+   * through every admission gate while four unowned legs sat at the broker.
+   *
+   * Decided in the coordinator's synchronous prologue from the SAME shared derivation that
+   * produces the operator's `unowned_attributed_exposure` readiness blocker, BEFORE the claim,
+   * BEFORE the session attempt is consumed, BEFORE any reservation and long before any broker
+   * POST — so a refusal costs nothing and, critically, cannot be converted into new exposure.
+   *
+   * Blocks NEW ENTRY ONLY, in every mode that attributes broker exposure. Exits, protective
+   * cancellation, reconciliation, residual flattening and the operator-invoked emergency flatten
+   * all remain available — they are the only things that can clear this state, so gating them on
+   * it would make it permanent.
+   */
+  | "unowned_attributed_exposure";
 
 /** One leg's detection → execution comparison. */
 export interface BoxExecutionLeg {

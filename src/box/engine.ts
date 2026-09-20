@@ -388,6 +388,10 @@ function zeroPostReasonFor(reason: BoxExecutionFailureReason | null | undefined)
       return "deadline";
     case "underlying_already_active":
     case "duplicate":
+    // Exposure at the broker that no record owns. `ownership` is exactly right — it is an
+    // ownership failure, not an entry-guard preference — and it keeps the funnel's account of
+    // WHY nothing was posted truthful for the one refusal that means real exposure is loose.
+    case "unowned_attributed_exposure":
       return "ownership";
     case "insufficient_quantity":
     case "price_moved":
@@ -1543,6 +1547,11 @@ export class BoxEngine {
       underlyingExclusion: (underlying) => this.underlyingExclusionRefusal(underlying),
       // THE MODE-INDEPENDENT INVENTORY CEILING's durable term. Synchronous.
       boxInventory: () => this.boxInventoryCount(),
+      // UNOWNED BROKER EXPOSURE, enforced. The SAME call that produces the operator's
+      // `unowned_attributed_exposure` readiness blocker, so the verdict and the gate cannot
+      // disagree. Synchronous (legal in the no-await prologue) and ENTRY only — every reduction
+      // path bypasses it, because reduction is the only thing that can clear it.
+      orphanedExposureGate: () => this.unownedAttributedExposure(),
       // The session cycle budget, INTERSECTED with "is the residual picture known?". ENTRY only;
       // every reduction path bypasses it.
       sessionEntryGate: () => this.entryGateVerdict(),
@@ -5689,6 +5698,55 @@ export class BoxEngine {
     return this.positions.size + this.residualByAttempt.size + this.pendingEstablishments;
   }
 
+  /**
+   * BROKER EXPOSURE THAT NO RECORD OWNS — the ONE derivation behind BOTH the operator's
+   * `unowned_attributed_exposure` readiness blocker AND the coordinator's entry-admission refusal.
+   *
+   * WHY THIS IS ONE FUNCTION AND MUST STAY ONE. It previously existed only as an inline block inside
+   * the readiness builder, so the verdict an operator read and the rule the engine enforced were not
+   * merely separate implementations — the second one did not exist. Readiness reported the condition
+   * accurately while `coordinateEntry` admitted new boxes straight past it. Deriving it twice would
+   * re-open exactly that gap in a subtler form: the banner and the gate could disagree about whether
+   * a given leg is owned, and the operator would be told one thing while the engine did another.
+   *
+   * WHAT MAKES IT INVISIBLE TO EVERY OTHER GATE. `projectedSymbols` is built from the durable
+   * position book, and the defining property of this exposure is that the book has NO row for it —
+   * the position write is precisely what failed. So:
+   *
+   *   `boxInventoryCount()`            counts positions/residuals/establishments → does not see it.
+   *   Layer 1a (`activeUnderlyings`)   keyed on the same book, per-underlying → does not see it, and
+   *                                    would not stop a candidate on a DIFFERENT underlying anyway.
+   *   `BOX_LIVE_MAX_OPEN_BOXES`        a manager count refreshed from the book → does not see it.
+   *
+   * That is why this needs its own gate rather than a term added to one of theirs.
+   *
+   * THE CRASH-ONLY FILTER IS THE ORDER MANAGER'S. `attributedRecoveryExposure()` returns only legs
+   * reconstructed from the durable intent journal and confirmed against the broker — the same set
+   * `flattenAttributedBoxExposure` acts on. So what is reported, what is enforced, and what the
+   * emergency control would flatten are guaranteed to be the same legs; an operator who clears the
+   * blocker has necessarily cleared the gate.
+   *
+   * PAPER IS EXEMPT BY CONSTRUCTION, not by a mode check: there is no `orderManager` in paper, hence
+   * no attributed broker exposure and nothing to own.
+   *
+   * Synchronous, side-effect-free and allocation-bounded — the coordinator's no-await prologue
+   * requires all three.
+   */
+  private unownedAttributedExposure(): ReadinessBlocker | null {
+    if (!this.orderManager) return null;
+    const projectedSymbols = new Set<string>();
+    for (const position of this.positions.list()) {
+      for (const role of BOX_LEG_ROLES) {
+        const instrument = position.legs[role];
+        projectedSymbols.add(`${instrument.exchange}:${instrument.tradingsymbol}`);
+      }
+    }
+    return unownedAttributedExposureBlocker({
+      attributed: this.orderManager.attributedRecoveryExposure(),
+      projectedSymbols,
+    });
+  }
+
   /** How many residual legs are still outstanding across all attempts. */
   private residualLegCount(): number {
     let n = 0;
@@ -7958,25 +8016,13 @@ export class BoxEngine {
       });
     }
     /*
-     * EXPOSURE WE RECONSTRUCTED BUT NOTHING OWNS — see `unownedAttributedExposureBlocker` for the
-     * full reasoning. The derivation is shared with its tests so the two cannot drift, and it uses
-     * the SAME crash-only filter as `flattenAttributedBoxExposure`, so what is reported here is
-     * exactly what the emergency control would act on.
+     * EXPOSURE WE RECONSTRUCTED BUT NOTHING OWNS — see `unownedAttributedExposure()` for the full
+     * reasoning. This is REPORTING only; the SAME call is the coordinator's `orphanedExposureGate`
+     * dep, which is what actually refuses admission. Reporting it here without enforcing it there
+     * was the original defect: the verdict was correct and nothing acted on it.
      */
-    if (this.orderManager) {
-      const projectedSymbols = new Set<string>();
-      for (const position of this.positions.list()) {
-        for (const role of BOX_LEG_ROLES) {
-          const instrument = position.legs[role];
-          projectedSymbols.add(`${instrument.exchange}:${instrument.tradingsymbol}`);
-        }
-      }
-      const unownedBlocker = unownedAttributedExposureBlocker({
-        attributed: this.orderManager.attributedRecoveryExposure(),
-        projectedSymbols,
-      });
-      if (unownedBlocker !== null) engineBlockers.push(unownedBlocker);
-    }
+    const unownedBlocker = this.unownedAttributedExposure();
+    if (unownedBlocker !== null) engineBlockers.push(unownedBlocker);
 
     // FUNDING ADMISSION, surfaced in the ONE authoritative readiness decision.
     //
