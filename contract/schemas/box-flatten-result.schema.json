@@ -1,0 +1,131 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "box-flatten-result.schema.json",
+  "title": "POST /api/box/live/flatten (200 | 207 | 409)",
+  "description": "WHAT AN EMERGENCY FLATTEN ACHIEVED, per item. Source: src/box/flattenOutcome.ts buildAttributedFlattenResult(), published by src/box/routes.ts POST /api/box/live/flatten. This route previously answered a hardcoded `ok: true` with HTTP 200 over an untyped `results: unknown[]`, so per-position and per-residual failures were invisible; there was no schema at all. `ok` and the status code are now DERIVED: 200 only on positive evidence that nothing remains, 409 when nothing was reduced and every reason is known, 207 for anything mixed or unproven. CRITICAL: `remaining_quantity` null means UNKNOWN and must never be rendered as zero. `status` is the engine-owned box-status blob (OPEN, validated by box-status.schema.json).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "requested",
+    "attempted",
+    "items",
+    "results",
+    "settlement",
+    "outcome",
+    "ok",
+    "remaining_exposure_known",
+    "remaining_quantity",
+    "blockers",
+    "next_action",
+    "operation_id",
+    "deduplicated"
+  ],
+  "properties": {
+    "requested": {
+      "description": "How many attributed items the flatten was asked to reduce.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "attempted": {
+      "description": "How many of those it actually tried to reduce. Never greater than `requested`; a shortfall withholds `ok`.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "operation_id": {
+      "description": "Stable identity for this unit of work, shared by every caller that joined it. Lets a client correlate a retry with the operation it already started \u2014 browser abort does not cancel the server operation.",
+      "type": "string"
+    },
+    "deduplicated": {
+      "description": "True when this request did NOT start a new flatten and instead joined one already running, receiving its real result. No additional broker action was taken.",
+      "type": "boolean"
+    },
+    "items": {
+      "description": "One entry per position or crash-only residual group. Always present, even when the item failed.",
+      "type": "array",
+      "items": {
+        "$ref": "box-flatten-item.schema.json"
+      }
+    },
+    "results": {
+      "description": "Legacy alias of `items`, retained so a client written against the old untyped array still receives one. Additive: the old field name now carries typed entries instead of `unknown`.",
+      "type": "array",
+      "items": {
+        "$ref": "box-flatten-item.schema.json"
+      }
+    },
+    "settlement": {
+      "description": "What happened BEFORE the reduction was planned: the working-order cancellation sweep and the post-cancellation reconcile.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cancelled",
+        "failures",
+        "blocked",
+        "reconciled"
+      ],
+      "properties": {
+        "cancelled": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failures": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "blocked": {
+          "description": "Non-null when the cancellation sweep was REFUSED outright and nothing was attempted.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reconciled": {
+          "type": "boolean"
+        }
+      }
+    },
+    "outcome": {
+      "description": "The aggregate disposition. Pessimistic: one unresolved item makes the whole result unresolved.",
+      "enum": [
+        "flat_on_fill_evidence",
+        "partially_reduced",
+        "unresolved",
+        "not_reduced",
+        "nothing_to_flatten"
+      ]
+    },
+    "ok": {
+      "description": "TRUE only on positive evidence that nothing remains: every item flat on fill evidence, settlement clean, every requested item accounted for, and no unknown quantity anywhere. Never a literal.",
+      "type": "boolean"
+    },
+    "remaining_exposure_known": {
+      "description": "False when ANY item's remaining quantity is unknown. When false, `remaining_quantity` is null and must not be displayed as a number.",
+      "type": "boolean"
+    },
+    "remaining_quantity": {
+      "description": "Total quantity still outstanding, or NULL when it cannot be totalled because something is unknown. Null is NOT zero.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "blockers": {
+      "description": "Every distinct reason exposure remains or is unproven, including per-item reasons, settlement failures and unattempted items. Deduplicated.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "next_action": {
+      "description": "The concrete instruction for the operator. Never empty and never 'nothing' \u2014 asserted behaviourally in tests/invariants/flattenOutcome.test.mjs rather than with minLength, which the dependency-free validator and the frontend type generator both deliberately refuse.",
+      "type": "string"
+    },
+    "status": {
+      "description": "The engine-owned box-status projection, as every mutating Box route returns. OPEN here; validated in full by box-status.schema.json.",
+      "type": "object"
+    }
+  }
+}

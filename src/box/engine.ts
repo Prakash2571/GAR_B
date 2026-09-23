@@ -134,6 +134,14 @@ import {
 import { mintOwnerId } from "./reservations/identity.js";
 import { BoxExecutionLeaseManager, executionLeaseStatus } from "./executionLease.js";
 import {
+  buildAttributedFlattenResult,
+  classifyPositionClose,
+  classifyResidualFlatten,
+  type AttributedFlattenResult,
+  type FlattenItemOutcome,
+} from "./flattenOutcome.js";
+import { ExposureOperationRegistry } from "./exposureOperations.js";
+import {
   BoxOrderManager,
   orderManagerLimitsFromConfig,
   type CancelWorkingBoxOrdersResult,
@@ -861,6 +869,17 @@ export class BoxEngine {
    * cannot retract a request already on the wire, and that neither broker accepts a fencing token.
    */
   private readonly executionLease: BoxExecutionLeaseManager;
+  /**
+   * SERVER-SIDE SINGLE-FLIGHT for the exposure-reducing operations.
+   *
+   * A browser that abandons a request does not cancel the server operation, so bounding the client's
+   * wait creates the risk that an operator retries and a SECOND cancellation or flatten begins while the
+   * first is still working. A second caller joins the running operation and receives its real result;
+   * no second broker action is taken. See `exposureOperations.ts`.
+   */
+  private readonly exposureOperations = new ExposureOperationRegistry({
+    log: (message) => console.warn(message),
+  });
   /**
    * The live broker adapter, when one was constructed.
    *
@@ -3057,17 +3076,47 @@ export class BoxEngine {
    * Typed concretely (it was `Promise<unknown>`) so the route cannot accidentally publish a refusal
    * as a success — the compiler now knows there is an `attempted`/`ok`/`blocked_reason` to inspect.
    */
-  async cancelWorkingBoxOrders(): Promise<CancelWorkingBoxOrdersResult> {
-    if (!this.orderManager) throw new Error("Live order manager is unavailable.");
-    return this.orderManager.cancelWorkingBoxOrders();
-  }
-
-  async flattenAttributedBoxExposure(): Promise<{
-    attempted: number;
-    results: unknown[];
-    settlement: { cancelled: number; failures: string[]; blocked: string | null; reconciled: boolean };
+  async cancelWorkingBoxOrders(): Promise<CancelWorkingBoxOrdersResult & {
+    operation_id: string;
+    deduplicated: boolean;
   }> {
     if (!this.orderManager) throw new Error("Live order manager is unavailable.");
+    const manager = this.orderManager;
+    // SINGLE-FLIGHT BY OPERATION KIND. A client whose request timed out and retried must not cause a
+    // second sweep: browser abort does not cancel the server operation. A second caller JOINS the one
+    // already running and receives its real result, so the operator learns what happened instead of
+    // being told "no" about work that is in progress. See `exposureOperations.ts`.
+    const outcome = await this.exposureOperations.run("cancel_working", () =>
+      manager.cancelWorkingBoxOrders(),
+    );
+    return {
+      ...outcome.result,
+      operation_id: outcome.operation_id,
+      deduplicated: outcome.deduplicated,
+    };
+  }
+
+  async flattenAttributedBoxExposure(): Promise<AttributedFlattenResult & {
+    operation_id: string;
+    deduplicated: boolean;
+  }> {
+    // SINGLE-FLIGHT BY OPERATION KIND, for the same reason as the cancellation sweep: a client that
+    // gave up waiting and pressed the button again must not start a second flatten racing the first.
+    // Two flattens over one position can double-close it. A second caller joins and receives the real
+    // result. Kinds are independent, so a wedged cancel sweep does not block this.
+    const outcome = await this.exposureOperations.run("flatten", () =>
+      this.flattenAttributedBoxExposureOnce(),
+    );
+    return {
+      ...outcome.result,
+      operation_id: outcome.operation_id,
+      deduplicated: outcome.deduplicated,
+    };
+  }
+
+  private async flattenAttributedBoxExposureOnce(): Promise<AttributedFlattenResult> {
+    if (!this.orderManager) throw new Error("Live order manager is unavailable.");
+    const manager = this.orderManager;
     const managerStatus = this.orderManager.status();
     if (!managerStatus.controls.emergencyFlatten) {
       throw new Error("box_emergency_flatten is disabled.");
@@ -3105,7 +3154,12 @@ export class BoxEngine {
       cancelled: 0, failures: [], blocked: null, reconciled: false,
     };
     try {
-      const sweep = await this.orderManager.cancelWorkingBoxOrders();
+      // Through the registry, so this JOINS an operator-initiated sweep that is already running rather
+      // than issuing a duplicate that would race it. Dedup, not blocking: the kinds are independent, so
+      // the flatten is never held up by anything other than a cancel sweep it genuinely needs.
+      const sweep = (await this.exposureOperations.run("cancel_working", () =>
+        manager.cancelWorkingBoxOrders(),
+      )).result;
       settlement.cancelled = sweep.cancelled.length;
       settlement.failures = sweep.failures;
       settlement.blocked = sweep.blocked_reason;
@@ -3141,7 +3195,8 @@ export class BoxEngine {
         projectedSymbols.add(`${inst.exchange}:${inst.tradingsymbol}`);
       }
     }
-    const results: unknown[] = [];
+    const items: FlattenItemOutcome[] = [];
+    let attempted = 0;
     for (const position of positions) {
       if (position.position_state === "RECOVERY") {
         // Reconciliation established exact broker equality with the durable map;
@@ -3153,7 +3208,23 @@ export class BoxEngine {
           ? "PARTIALLY_EXITED"
           : deriveBoxPositionState(position.remaining_qty_by_role);
       }
-      results.push(await this.monitor.closeManually(position.id));
+      const label = `${position.underlying} ${position.expiry} ${position.lower_strike}/${position.upper_strike}`;
+      attempted += 1;
+      // EVERY per-position outcome is classified and published. It used to be pushed into an
+      // `unknown[]` that nothing inspected, under a hardcoded `ok: true`.
+      try {
+        const closed = await this.monitor.closeManually(position.id);
+        items.push(classifyPositionClose({ id: position.id, label, result: closed }));
+      } catch (error) {
+        // A throw establishes nothing about whether orders reached the broker, so this is UNRESOLVED
+        // with an unknown remaining quantity — never "not reduced", and never absent from the result.
+        items.push(classifyPositionClose({
+          id: position.id,
+          label,
+          result: null,
+          thrown: error instanceof Error ? error.message : String(error),
+        }));
+      }
     }
     // A crash can leave COMPLETE owned intents before their trade projection was
     // inserted. Reconciliation attributes those exact symbols/quantities; flatten
@@ -3173,7 +3244,26 @@ export class BoxEngine {
         at: new Date(),
       });
       if (!recovery) {
-        throw new Error("Cannot flatten crash-only attributed exposure without a durable recovery ledger row.");
+        // REPORTED, not thrown. Throwing here discarded every per-position outcome computed above —
+        // including successful closes and, worse, unresolved ones the operator most needs to see.
+        items.push({
+          kind: "residual",
+          id: recoveryId,
+          label: crashOnly.map((r) => r.tradingsymbol).join(", "),
+          disposition: "not_reduced",
+          reason:
+            "crash-only attributed exposure cannot be flattened without a durable recovery ledger row, " +
+            "so nothing was attempted for it. The exposure is unchanged and still owned. Restore " +
+            "persistence, or reduce it at the broker terminal.",
+          remaining_quantity: crashOnly.reduce((sum, r) => sum + (r.quantity ?? 0), 0),
+          remaining_by_role: null,
+        });
+        return buildAttributedFlattenResult({
+          requested: positions.length + crashOnly.length,
+          attempted,
+          items,
+          settlement,
+        });
       }
       const durableRecoveryId = recovery._id.toString();
       const durableResidual = (recovery.residual_exposure ?? []) as ResidualLegExposure[];
@@ -3192,55 +3282,87 @@ export class BoxEngine {
         onNewCharge: (charge, observation) =>
           this.noteFlattenCharges(durableRecoveryId, charge, observation),
       });
-      const bootFlatten = await runInitialRegisteredResidualPass({
-        // Set the guard before registration arms the timer, then keep the authoritative row in the
-        // watchdog even when this first pass has no book, is gate-refused, or broker-rejected.
-        markInFlight: () => this.residualFlattenInFlight.add(durableRecoveryId),
-        register: () => this.registerResidual(
-          durableRecoveryId,
-          durableResidual,
-          durableVersion,
-          durableIdentity,
-        ),
-        flatten: async () => {
-          const flattened = await this.execution.flattenResidual({
-            residual: durableResidual,
-            keyPrefix: durableRecoveryId,
-          });
-          const command = createResidualProjectionCommand({
-            attemptId: durableRecoveryId,
-            expectedVersion: durableVersion,
-            expectedResidual: durableResidual,
-            nextResidual: flattened.remaining,
-            flattenChargeDelta: flattened.flatten_charges,
-            flattenChargeDay: this.deps.istDayKey(),
-          });
-          if (residualProjectionChanges(command)) {
-            try {
-              const projection = await this.persistResidualProjection(durableRecoveryId, command);
-              if (projection.status === "not_found") {
+      const requestedResidualQuantity = durableResidual.reduce(
+        (sum, leg) => sum + (Number.isFinite(leg.quantity) ? leg.quantity : 0),
+        0,
+      );
+      attempted += 1;
+      let residualOutcome: FlattenItemOutcome;
+      const residualLabel = durableResidual.map((leg) => leg.tradingsymbol).join(", ");
+      try {
+        const bootFlatten = await runInitialRegisteredResidualPass({
+          // Set the guard before registration arms the timer, then keep the authoritative row in the
+          // watchdog even when this first pass has no book, is gate-refused, or broker-rejected.
+          markInFlight: () => this.residualFlattenInFlight.add(durableRecoveryId),
+          register: () => this.registerResidual(
+            durableRecoveryId,
+            durableResidual,
+            durableVersion,
+            durableIdentity,
+          ),
+          flatten: async () => {
+            const flattened = await this.execution.flattenResidual({
+              residual: durableResidual,
+              keyPrefix: durableRecoveryId,
+            });
+            const command = createResidualProjectionCommand({
+              attemptId: durableRecoveryId,
+              expectedVersion: durableVersion,
+              expectedResidual: durableResidual,
+              nextResidual: flattened.remaining,
+              flattenChargeDelta: flattened.flatten_charges,
+              flattenChargeDay: this.deps.istDayKey(),
+            });
+            if (residualProjectionChanges(command)) {
+              try {
+                const projection = await this.persistResidualProjection(durableRecoveryId, command);
+                if (projection.status === "not_found") {
+                  this.pendingResidualPersists.set(durableRecoveryId, command);
+                  this.execution.invariantViolation("crash-only flatten durable recovery row disappeared");
+                } else if (projection.status === "stale") {
+                  this.execution.invariantViolation(
+                    `crash-only flatten adopted newer durable projection version ${projection.projection_version}`,
+                  );
+                }
+              } catch {
                 this.pendingResidualPersists.set(durableRecoveryId, command);
-                this.execution.invariantViolation("crash-only flatten durable recovery row disappeared");
-              } else if (projection.status === "stale") {
-                this.execution.invariantViolation(
-                  `crash-only flatten adopted newer durable projection version ${projection.projection_version}`,
-                );
+                this.execution.invariantViolation("crash-only flatten awaits durable accounting acknowledgement");
               }
-            } catch {
-              this.pendingResidualPersists.set(durableRecoveryId, command);
-              this.execution.invariantViolation("crash-only flatten awaits durable accounting acknowledgement");
             }
-          }
-          return flattened;
-        },
-        clearInFlight: () => this.residualFlattenInFlight.delete(durableRecoveryId),
-      });
-      results.push(bootFlatten);
+            return flattened;
+          },
+          clearInFlight: () => this.residualFlattenInFlight.delete(durableRecoveryId),
+        });
+        residualOutcome = classifyResidualFlatten({
+          id: durableRecoveryId,
+          label: residualLabel,
+          result: bootFlatten,
+          requestedQuantity: requestedResidualQuantity,
+        });
+      } catch (error) {
+        residualOutcome = classifyResidualFlatten({
+          id: durableRecoveryId,
+          label: residualLabel,
+          result: null,
+          requestedQuantity: requestedResidualQuantity,
+          thrown: error instanceof Error ? error.message : String(error),
+        });
+      }
+      items.push(residualOutcome);
     }
     // `settlement` is published so the operator can see what the flatten did BEFORE it planned:
     // whether working orders were cancelled, whether any refused, and whether quantities were
     // re-established. A flatten that proceeded on an unreconciled snapshot must be visible as such.
-    return { attempted: positions.length + crashOnly.length, results, settlement };
+    //
+    // `ok` and the HTTP status are DERIVED from the per-item outcomes plus settlement, replacing the
+    // route's hardcoded `ok: true`. See `flattenOutcome.ts` for the aggregation rules — in particular
+    // that any unknown remaining quantity makes the whole result unresolved rather than flat.
+    return buildAttributedFlattenResult({
+      requested: positions.length + crashOnly.length,
+      attempted,
+      items,
+      settlement,
+    });
   }
 
   /**

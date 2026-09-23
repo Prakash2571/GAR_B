@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "box-flatten-item.schema.json",
+  "title": "One position or residual group in an emergency-flatten result",
+  "description": "Source: src/box/flattenOutcome.ts classifyPositionClose() / classifyResidualFlatten(). CLOSED so an added field is caught. `disposition` is ordered by strength of evidence: flat_on_fill_evidence is derived from the fills THIS PROCESS observed and applied, which is the strongest signal available at the end of a flatten but is NOT an independent re-read of broker positions — `settlement.reconciled` is what speaks to durable/broker agreement. `remaining_quantity` null means UNKNOWN, never zero; 0 is written only for flat_on_fill_evidence.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "kind",
+    "id",
+    "label",
+    "disposition",
+    "reason",
+    "remaining_quantity",
+    "remaining_by_role"
+  ],
+  "properties": {
+    "kind": {
+      "enum": [
+        "position",
+        "residual"
+      ]
+    },
+    "id": {
+      "description": "Position id, or the durable recovery-attempt id for a residual group.",
+      "type": "string"
+    },
+    "label": {
+      "description": "Operator-readable label (underlying/expiry/strikes, or the residual symbols). Null when not determinable.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "disposition": {
+      "enum": [
+        "flat_on_fill_evidence",
+        "partially_reduced",
+        "not_reduced",
+        "unresolved"
+      ]
+    },
+    "reason": {
+      "description": "Why, in operator-readable prose. Null only for flat_on_fill_evidence.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "remaining_quantity": {
+      "description": "Quantity still outstanding for this item. NULL MEANS UNKNOWN. 0 appears only for flat_on_fill_evidence.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "remaining_by_role": {
+      "description": "Per-leg breakdown where one exists, keyed by Box leg role. Null when unknown or not applicable.",
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "k1_ce": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "k2_ce": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "k2_pe": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "k1_pe": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}
