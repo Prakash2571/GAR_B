@@ -142,6 +142,13 @@ import {
 } from "./flattenOutcome.js";
 import { ExposureOperationRegistry } from "./exposureOperations.js";
 import {
+  degradedRecoveryStatus,
+  degradedRecoveryVerdict,
+  type DegradedRecoveryStatus,
+  type FeedCondition,
+  type RecoveryDepthCapability,
+} from "./degradedRecovery.js";
+import {
   BoxOrderManager,
   orderManagerLimitsFromConfig,
   type CancelWorkingBoxOrdersResult,
@@ -1849,6 +1856,10 @@ export class BoxEngine {
       istMinutesOfDay: () => istMinutesOfDay(),
       isMarketOpen: () => this.marketOpen,
       isFeedHealthy: () => this.isFeedHealthy(),
+      // WHY a reduction cannot be worked while the WS feed is unhealthy. The monitor used to return
+      // silently here; now the position carries the reason and the reason names the broker terminal when
+      // that is the only remaining route. See `degradedRecovery.ts`.
+      degradedReductionBlockReason: (pos) => this.degradedReductionBlockReason(pos),
     });
 
     // Read-path cache for today's closed trades (inert without Upstash).
@@ -3783,6 +3794,86 @@ export class BoxEngine {
       this.scanner.setFeedHealthy(true);
       this.orderManager?.setFeedHealthy(true);
     }
+  }
+
+  /**
+   * DEGRADED-RECOVERY CAPABILITY for the active broker.
+   *
+   * `supported` records whether the broker has a REST depth endpoint that does NOT substitute the last
+   * traded price for a missing touch:
+   *
+   *   · Zerodha — YES, via `KiteClient.getQuoteLadder()`, which returns real 5-level bids/asks filtered
+   *     to `price > 0`. NOT `getQuoteDepth()`, whose `?? last` fallback manufactures a two-sided price
+   *     for an unquoted instrument.
+   *   · Dhan — YES in principle, via `DhanClient.marketFeedQuote()`, which carries 5-level depth with
+   *     per-level order counts.
+   *
+   * `enabled` is separate and currently always FALSE, and that is deliberate rather than an oversight.
+   * The admission test and the policy are complete and tested, but admitting a REST-sourced reference
+   * price at the DISPATCH BOUNDARY is not wired: `executionGateway.precheckOne` is synchronous and
+   * demands a WS quote with a current feed generation, and `checkedFeedBlockReason` re-validates that
+   * same stamp at CHECKPOINT 3 and CHECKPOINT 5. A REST-priced order would therefore be refused at the
+   * last instant anyway, and half-wiring the most safety-critical code in the process to avoid that
+   * would be worse than reporting honestly.
+   *
+   * So the degraded path today makes the outage VISIBLE and EXACT — which position, why, and that the
+   * broker terminal is the remaining route — without claiming it can execute. See
+   * `docs/DEGRADED_RECOVERY.md`.
+   */
+  private degradedRecoveryCapability(): RecoveryDepthCapability {
+    const broker = String(this.deps.activeBroker());
+    const supported = broker === "zerodha" || broker === "dhan";
+    return {
+      supported,
+      enabled: false,
+      detail: supported
+        ? "REST depth exists for this broker, but admitting a REST-sourced reference price at the order " +
+          "dispatch boundary is not wired, so this process will not price a reduction from it. Reductions " +
+          "still require a healthy WebSocket book."
+        : `no REST depth source is known for broker ${broker}, so a reduction cannot be priced while the ` +
+          "WebSocket feed is unhealthy.",
+    };
+  }
+
+  /**
+   * WHY this position cannot be reduced right now, or null when it can.
+   *
+   * Consulted by the monitor in place of a bare `return` on an unhealthy feed. Never consulted for entry:
+   * a degraded feed can never justify creating a new four-leg box, and `streamHealthPolicy.ts` already
+   * records that asymmetry.
+   */
+  private degradedReductionBlockReason(pos: BoxOpenPosition): string | null {
+    const decision = degradedRecoveryVerdict({
+      marketOpen: this.marketOpen,
+      feed: this.isFeedHealthy() ? "healthy" : "unhealthy",
+      capability: this.degradedRecoveryCapability(),
+      // No REST observation is sought while the path is not enabled. When it is, this is where the
+      // per-instrument admission verdict arrives.
+      admission: null,
+      tradingsymbol: `${pos.underlying} ${pos.expiry} ${pos.lower_strike}/${pos.upper_strike}`,
+    });
+    if (decision.kind === "normal") return null;
+    if (decision.kind === "degraded") return null;
+    return decision.blocker;
+  }
+
+  /** The degraded-recovery projection, so the operator sees the state rather than inferring it. */
+  degradedRecoveryState(): DegradedRecoveryStatus {
+    const feed: FeedCondition = this.isFeedHealthy() ? "healthy" : "unhealthy";
+    // Bounded: only positions that actually carry a blocked reason, capped so a wide outage cannot
+    // produce an unbounded projection.
+    const blocked: { tradingsymbol: string; reason: string }[] = [];
+    for (const pos of this.positions.list()) {
+      if (blocked.length >= 20) break;
+      const reason = pos.exit_blocked_reason;
+      if (typeof reason === "string" && reason !== "") {
+        blocked.push({
+          tradingsymbol: `${pos.underlying} ${pos.expiry} ${pos.lower_strike}/${pos.upper_strike}`,
+          reason,
+        });
+      }
+    }
+    return degradedRecoveryStatus({ capability: this.degradedRecoveryCapability(), feed, blocked });
   }
 
   /** Whether the current socket has delivered any raw tick recently. */

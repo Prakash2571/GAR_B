@@ -247,9 +247,45 @@ test("a DEAD feed pauses exits without pretending it is a liquidity problem", as
 
   assert.equal(h.closes.length, 0, "no exit on books of unknown age");
   assert.equal(h.positions.size, 1);
-  assert.equal(h.events.length, 0, "and no EXIT_SKIPPED_LIQUIDITY noise");
-  assert.equal(h.position.exit_blocked_reason, null);
   assert.ok(h.position.metrics);
+
+  // THE ORIGINAL INTENT, UNCHANGED: a dead feed is not a thin book. Labelling it a liquidity skip
+  // would send the operator looking at depth that is simply unobserved.
+  assert.equal(
+    h.events.filter((e) => e.event === "EXIT_SKIPPED_LIQUIDITY").length, 0,
+    "a dead feed must NOT be reported as a liquidity problem",
+  );
+
+  /*
+   * THE ADDED REQUIREMENT: it must not be SILENT either.
+   *
+   * This previously asserted `events.length === 0` and `exit_blocked_reason === null`, which pinned the
+   * defect rather than the intent: the monitor returned above its liquidity gate, so a feed outage
+   * recorded nothing at all. An operator watching a position through an outage saw no reason, and on
+   * expiry day the EXPIRY_SAFETY alarm demanded an exit that was blocked with no explanation.
+   *
+   * Blocked-but-not-by-the-market goes on the ERROR channel, the same one the RECOVERY block uses.
+   */
+  assert.equal(
+    typeof h.position.exit_blocked_reason, "string",
+    "the position must carry WHY it is not being reduced",
+  );
+  assert.match(h.position.exit_blocked_reason, /feed/i);
+  assert.match(
+    h.position.exit_blocked_reason, /still owned|still monitored/i,
+    "and it must say the exposure is unchanged rather than implying anything was resolved",
+  );
+  const errors = h.events.filter((e) => e.event === "ERROR");
+  assert.equal(errors.length, 1, "exactly one ERROR event, not one per cycle");
+  assert.match(errors[0].detail, /feed/i);
+
+  // Deduplicated: a dead socket must not flood the event ledger.
+  await h.monitor.cycle();
+  await h.monitor.cycle();
+  assert.equal(
+    h.events.filter((e) => e.event === "ERROR").length, 1,
+    "repeated cycles under one unchanged outage must not repeat the event",
+  );
 
   const back = harness({ exitValuePerUnit: 198, feedHealthy: true });
   await back.monitor.cycle();
@@ -463,6 +499,23 @@ test("expiry safety is detected and ALERTED even when the feed is dead", async (
     "and the operator is woken up — they can still act manually",
   );
   assert.equal(h.closes.length, 0, "but nothing is executed against a book we cannot see");
+
+  /*
+   * AND THE BLOCKED REASON IS NOW THERE TOO, alongside the alarm.
+   *
+   * This is the pairing that used to be missing and that made the outage hardest to act on: the alarm
+   * said "settlement is approaching on this position" and the next four lines silently refused to do
+   * anything about it. Both must be present, and the reason must name the remaining route.
+   */
+  assert.ok(
+    h.events.some((e) => e.event === "EXPIRY_SAFETY"),
+    "the expiry alarm must survive the outage",
+  );
+  assert.equal(
+    typeof h.position.exit_blocked_reason, "string",
+    "and the position must also carry WHY the exit the alarm demands is not happening",
+  );
+  assert.match(h.position.exit_blocked_reason, /broker terminal/i);
 });
 
 test("expiry safety is detected even when the market is closed", async () => {
