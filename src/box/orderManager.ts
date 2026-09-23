@@ -789,6 +789,28 @@ export class BoxOrderManager {
        */
       entryAuthorizationBlockReason?: (request: BrokerOrderRequest) => string | null;
       /**
+       * EXCLUSIVE EXECUTION OWNERSHIP, asked SYNCHRONOUSLY in the last instant before the wire.
+       *
+       * Returns null when this process may send, or a reason when it may not. It exists because
+       * nothing else in this chain asks whether ANOTHER PROCESS might be trading the same broker
+       * account: every other guard here reads only this process's own state, and would happily
+       * authorise a second instance's POST.
+       *
+       * It must be synchronous. The whole value of CHECKPOINT 5 is that no `await` separates the last
+       * check from the POST, so an implementation that awaited the database would reintroduce the
+       * window it closes. `BoxExecutionLeaseManager.dispatchBlockReason()` therefore reads a cached
+       * observation a heartbeat maintains, and refuses once that observation is too old to prove
+       * ownership.
+       *
+       * `use` distinguishes new exposure from reduction: a takeover that has not yet reconciled its
+       * predecessor's pending broker operations may REDUCE and CANCEL but may not ENTER. Withholding
+       * reduction from the one process that owns the account would strand exposure, which is the
+       * opposite of safe.
+       *
+       * Fails CLOSED: a throwing implementation blocks the POST.
+       */
+      executionOwnershipBlockReason?: (use: "new_entry" | "exposure_reduction") => string | null;
+      /**
        * Which broker these samples belong to. Required for timing to be recorded at all,
        * because a sample that cannot be attributed to a broker must never be filed — pooling
        * Zerodha and Dhan latency would describe neither.
@@ -1102,6 +1124,19 @@ export class BoxOrderManager {
     if (!this.controls.entryEnabled) return "box_entry_enabled is off.";
     if (!this.controls.liveOrderEnabled) return "box_live_order_enabled is off.";
     /*
+     * EXCLUSIVE EXECUTION OWNERSHIP, asked HERE as well as at the dispatch boundary.
+     *
+     * The dispatch guard is the one that is load-bearing — it is what actually stops a POST. Asking
+     * again at the entry gate is not redundant: it closes entry at the point an operator can SEE it,
+     * so a lease held by another instance surfaces as an entry block reason in the status projection
+     * rather than as four orders that each fail at the last instant.
+     *
+     * Deliberately `new_entry` only. Reduction is not gated here, and must not be: the ownership guard
+     * refuses reduction only on positive proof of a second owner, and this method governs entry.
+     */
+    const ownership = this.executionOwnershipEntryBlockReason();
+    if (ownership !== null) return ownership;
+    /*
      * THE ACCOUNT MUST BE KNOWN BEFORE A LIVE ENTRY.
      *
      * Previously nothing on the live path could name the account: the engine's account provider
@@ -1119,6 +1154,25 @@ export class BoxOrderManager {
       }
     }
     return this.entryBlockReasonAfterControls(request);
+  }
+
+  /**
+   * EXCLUSIVE EXECUTION OWNERSHIP as an ENTRY precondition. Null ⇒ ownership does not block entry.
+   *
+   * Fails closed, for the same reason the dispatch wrapper does: an exception means ownership could not
+   * be established, and that is exactly the state in which a second instance might be trading.
+   */
+  private executionOwnershipEntryBlockReason(): string | null {
+    const ask = this.deps.executionOwnershipBlockReason;
+    if (ask === undefined) return null;
+    try {
+      return ask("new_entry");
+    } catch (error) {
+      return (
+        "Exclusive execution ownership could not be established " +
+        `(${error instanceof Error ? error.message : String(error)}), so live entry is refused.`
+      );
+    }
   }
 
   /** The remaining entry preconditions, unchanged in substance, now each with a named reason. */
@@ -1412,6 +1466,37 @@ export class BoxOrderManager {
    * an unnameable session are all "cannot tell" — and "cannot tell" must never strand exposure,
    * because a refused EXIT guarantees the position stays. Only a KNOWN-different account refuses.
    */
+  /**
+   * EXCLUSIVE EXECUTION OWNERSHIP at the dispatch boundary. Null ⇒ this process may send.
+   *
+   * Wrapped rather than called inline for two reasons:
+   *
+   *   1. FAIL CLOSED. A throwing or absent predicate must block, not pass. An exception here means we
+   *      cannot establish ownership, and "cannot establish" is exactly the state in which two
+   *      instances might both be trading — so it must refuse.
+   *   2. PURPOSE MAPPING in one place. ENTRY creates exposure and is held to the stricter standard;
+   *      EXIT, PROTECTIVE_CANCEL and EMERGENCY_RESIDUAL reduce or protect it and must stay available
+   *      to whichever single process owns the account, including one that has just taken over.
+   *
+   * When no predicate is injected this returns null. That is deliberate and is the paper/legacy path:
+   * a deployment with no lease wiring behaves exactly as it did before, and the readiness projection —
+   * not this method — is responsible for saying that the stronger guarantee is absent.
+   */
+  private executionOwnershipBlockReason(request: BrokerOrderRequest): string | null {
+    const ask = this.deps.executionOwnershipBlockReason;
+    if (ask === undefined) return null;
+    const use = request.purpose === "ENTRY" ? "new_entry" : "exposure_reduction";
+    try {
+      return ask(use);
+    } catch (error) {
+      return (
+        `exclusive execution ownership could not be established for ${request.client_order_id} ` +
+        `(${error instanceof Error ? error.message : String(error)}), so it was NOT transmitted. ` +
+        "Unknown ownership is not permission to send: another instance may be executing this account."
+      );
+    }
+  }
+
   private dispatchAccountBlockReason(
     intent: Pick<IBoxOrderIntent, "client_order_id" | "broker_account">,
   ): string | null {
@@ -2986,6 +3071,11 @@ export class BoxOrderManager {
           // Adapter pacing is done; the next instruction after this callback returns is the HTTP
           // POST. Throwing here PROVES no broker mutation was attempted.
           const reason = this.checkedFeedBlockReason(request, action.checkedFeed) ??
+            // EXCLUSIVE EXECUTION OWNERSHIP. Asked FIRST among the ownership questions, because it is
+            // the only one that can be wrong about ANOTHER PROCESS: every other guard below reads this
+            // process's own state and would authorise a second instance's POST just as readily.
+            // Synchronous by requirement — see the dep's docblock.
+            this.executionOwnershipBlockReason(request) ??
             // THE LAST POSSIBLE INSTANT to notice the account changed. Checked here — not merely at
             // dequeue and post-persist — because the hedge-first barrier immediately above can park
             // an uncovered SELL for an unbounded time, and the credential is resolved lazily AFTER

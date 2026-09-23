@@ -131,6 +131,8 @@ import {
   isDeploymentIdExplicit,
   type ReservationStack,
 } from "./reservations/index.js";
+import { mintOwnerId } from "./reservations/identity.js";
+import { BoxExecutionLeaseManager, executionLeaseStatus } from "./executionLease.js";
 import {
   BoxOrderManager,
   orderManagerLimitsFromConfig,
@@ -846,6 +848,20 @@ export class BoxEngine {
    */
   private readonly session: BoxTradingSessionManager;
   /**
+   * EXCLUSIVE, ACCOUNT-SCOPED EXECUTION OWNERSHIP.
+   *
+   * The one thing the deployment previously assumed rather than enforced. `backend_instance_epoch`
+   * orders a frontend's readiness decisions across a restart; it grants no exclusivity, and because
+   * its increment is atomic two live processes always get DIFFERENT ordinals, so the "two instances"
+   * branch of `orderReadinessDecision()` — which needs EQUAL ordinals — cannot fire for the topology
+   * it was meant to catch. UI restart ordering is not execution fencing.
+   *
+   * Its `dispatchBlockReason()` is consulted SYNCHRONOUSLY at CHECKPOINT 5 in the order manager. See
+   * `executionLease.ts` for exactly what a lease can and cannot guarantee — in particular that it
+   * cannot retract a request already on the wire, and that neither broker accepts a fencing token.
+   */
+  private readonly executionLease: BoxExecutionLeaseManager;
+  /**
    * The live broker adapter, when one was constructed.
    *
    * Null in every paper deployment — which is the structural guarantee that a paper process
@@ -1350,6 +1366,15 @@ export class BoxEngine {
           }
           return null;
         },
+        // EXCLUSIVE EXECUTION OWNERSHIP, asked synchronously in the last instant before the wire.
+        //
+        // Every other guard in CHECKPOINT 5 reads only THIS process's state and would authorise a
+        // second instance's POST just as readily. This is the only one that can answer "might another
+        // process be trading this account right now".
+        //
+        // Read through a closure rather than captured, because `this.executionLease` is constructed
+        // after the order manager — and because the lease state legitimately changes under it.
+        executionOwnershipBlockReason: (use) => this.executionLease.dispatchBlockReason(use),
       });
     }
     const centralGateway = this.centralGateway = new CentralBoxExecutionGateway({
@@ -1565,6 +1590,41 @@ export class BoxEngine {
       // leave the session layer inert; the second must fail entry closed.
       persistenceAvailable: () => isBoxDbEnabled(),
       log: (message) => console.warn(message),
+    });
+
+    // EXECUTION OWNERSHIP. Constructed here, beside the session manager, because the two answer
+    // adjacent questions: the session bounds HOW MANY attempts this deployment may make, and the lease
+    // bounds WHICH PROCESS may make them. A bounded budget spent by two processes is still two
+    // processes trading one account.
+    this.executionLease = new BoxExecutionLeaseManager({
+      deployment: this.reservations.identity.deployment,
+      instance: this.reservations.identity.instance,
+      // One owner id per process, minted from the same identity the instrument reservations use, so a
+      // restarted process with a recycled pid is correctly "not me".
+      owner: mintOwnerId(this.reservations.identity, "exec-lease", 0),
+      broker: () => String(this.deps.activeBroker()),
+      // Prefer the adapter's own account — resolved from the credential holder, so it cannot drift
+      // from the token in use — and fall back to the session account. Null when neither can prove it,
+      // which makes the lease inactive and (per `dispatchBlockReason`) refuses NEW ENTRY only.
+      account: () => this.liveAdapter?.dispatchAccount?.() ?? this.liveBrokerAccount(),
+      persistenceAvailable: () => isBoxDbEnabled(),
+      liveCapable: () => this.cfg.executionMode === "live",
+      log: (message) => console.warn(message),
+      // TAKEOVER RECONCILIATION. Before a successor may start NEW entry it must establish what the
+      // previous owner left behind at the broker. `reconcile()` is the existing pass that walks the
+      // durable order journal against broker state; requiring it to COMPLETE (not merely run) is what
+      // the reconciled stamp records.
+      reconcileAfterTakeover: async () => {
+        const manager = this.orderManager;
+        if (manager === null) return false;
+        try {
+          await manager.reconcile();
+          return manager.status().health.reconciliation_complete === true;
+        } catch (err) {
+          console.warn("[Box] takeover reconciliation pass failed:", err);
+          return false;
+        }
+      },
     });
 
     this.coordinator = new CoordinatedBoxExecutionGateway({
@@ -1853,6 +1913,22 @@ export class BoxEngine {
     // reports and fails closed on, not a reason to stop the engine from booting and
     // managing exposure that already exists.
     const durableReady = await this.reservations.initialise();
+    // EXECUTION OWNERSHIP, established as early as possible — right after the reservation identity is
+    // usable and before anything can reach a broker. Never throws: a failure leaves the manager
+    // refusing NEW ENTRY while leaving every reduction path open, which is the same trade-off the
+    // durable reservation boot check makes. Refusing to boot would also refuse to monitor, reconcile
+    // and flatten exposure that already exists.
+    await this.executionLease.initialise();
+    if (this.cfg.executionMode === "live") {
+      const lease = this.executionLease.snapshot();
+      console.log(
+        `[Box] execution ownership: ${lease.kind}` +
+          (lease.kind === "held"
+            ? ` (account=${lease.lease.account} fence=${lease.lease.fence}` +
+              `${lease.lease.reconciled ? "" : " takeover NOT yet reconciled"})`
+            : ` — ${lease.detail}`),
+      );
+    }
     if (this.cfg.durableReservationsEnabled) {
       console.log(
         `[Box] durable instrument reservations ${durableReady ? "READY" : "UNAVAILABLE"} ` +
@@ -3211,6 +3287,12 @@ export class BoxEngine {
     // unref'd, but stopping it explicitly keeps the "every timer the engine owns is
     // cleared" property this method exists to guarantee.
     this.coordinator.dispose();
+    // The execution-lease heartbeat. Stopped synchronously here so the "every timer the engine owns is
+    // cleared" property holds; the lease ROW is released by `releaseExecutionOwnership()`, which is a
+    // database write and therefore an awaited shutdown step of its own, ordered before `closePg()`.
+    // Stopping the heartbeat alone is already safe: the cached observation ages out and the dispatch
+    // guard then refuses.
+    this.executionLease.stopHeartbeat();
     // The balance poller. Unref'd, so it could not hold the process open, but stopping it keeps the
     // "every timer the engine owns is cleared" property this method exists to guarantee.
     this.stopAccountFundsTimer(false);
@@ -3226,6 +3308,31 @@ export class BoxEngine {
       this.releaseRetainer();
       this.releaseRetainer = null;
     }
+  }
+
+  /**
+   * RELEASE EXCLUSIVE EXECUTION OWNERSHIP. A separate, awaited shutdown step because it is a database
+   * write and must therefore be ordered before `closePg()`.
+   *
+   * SIGTERM is not an instruction to liquidate, and this does not liquidate: it hands the account back
+   * so a successor need not wait out the lease TTL before it can monitor and reduce the exposure this
+   * process leaves open. A failure here is not a safety problem — the TTL reaps the row — so it never
+   * throws and never blocks shutdown.
+   */
+  async releaseExecutionOwnership(): Promise<void> {
+    await this.executionLease.release().catch((err: unknown) => {
+      console.warn("[Box] failed to release execution ownership during shutdown:", err);
+    });
+  }
+
+  /** The execution-ownership projection, for status and readiness. Never a dispatch decision. */
+  executionOwnershipStatus(): ReturnType<typeof executionLeaseStatus> {
+    return executionLeaseStatus({
+      state: this.executionLease.snapshot(),
+      liveCapable: this.cfg.executionMode === "live",
+      entryBlockReason: this.executionLease.dispatchBlockReason("new_entry"),
+      reductionBlockReason: this.executionLease.dispatchBlockReason("exposure_reduction"),
+    });
   }
 
   /**

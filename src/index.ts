@@ -1572,6 +1572,21 @@ const shutdownCoordinator = new ShutdownCoordinator({
         }),
     },
     {
+      /**
+       * 9a. RELEASE EXCLUSIVE EXECUTION OWNERSHIP.
+       *
+       * Ordered here — after the engine has stopped and before PostgreSQL closes — because it is a
+       * database write and because it must not run while this process could still dispatch. Handing the
+       * account back lets a replacement instance monitor and reduce the exposure this process leaves
+       * open without waiting out the lease TTL.
+       *
+       * NOT a liquidation, and not required for safety: the TTL reaps the row if this never runs (a
+       * `kill -9` never reaches here). It only shortens the successor's wait.
+       */
+      name: "release execution ownership",
+      run: () => boxModule.engine.releaseExecutionOwnership(),
+    },
+    {
       // 9.
       name: "close MongoDB",
       run: () => mongoExport.close(),
