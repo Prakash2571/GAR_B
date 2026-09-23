@@ -278,7 +278,13 @@ test("ZERODHA: a transport error is NOT terminal — the lane reconnects and RES
 
     // THE REGRESSION: a reconnect must actually be scheduled.
     const timer = runNextTimer();
-    assert.equal(timer.ms, 500, "first retry uses the base backoff");
+    // Full jitter over [backoff/2, backoff) decorrelates the two Zerodha lanes, which share
+    // credentials and are therefore knocked over by the same events. The BAND is the contract, not
+    // an exact delay.
+    assert.ok(
+      timer.ms >= 250 && timer.ms <= 500,
+      `first retry must fall in the jittered base band [250,500], got ${timer.ms}`,
+    );
 
     const second = FakeWebSocket.last;
     assert.notEqual(second, first, "a NEW socket was created");
@@ -296,7 +302,7 @@ test("ZERODHA: a transport error is NOT terminal — the lane reconnects and RES
   });
 });
 
-test("ZERODHA: reconnect backoff is bounded and exponential", () => {
+test("ZERODHA: reconnect backoff is bounded, exponential and jittered", () => {
   withFakeSockets(({ runNextTimer }) => {
     const { feed } = makeZerodhaLane();
     feed.subscribeTokens([111]);
@@ -307,12 +313,28 @@ test("ZERODHA: reconnect backoff is bounded and exponential", () => {
       FakeWebSocket.last.closeWith(1006);
       delays.push(runNextTimer().ms);
     }
-    // 500, 1000, 2000, 4000, 8000, then capped at 15000.
-    assert.deepEqual(delays.slice(0, 5), [500, 1_000, 2_000, 4_000, 8_000]);
-    for (const d of delays) {
-      assert.ok(d <= 15_000, `backoff ${d}ms must stay capped — an unbounded retry storm is an outage`);
+    /*
+     * Uncapped growth is 500, 1000, 2000, 4000, 8000, then capped at 15000 — and each delay carries
+     * FULL JITTER over [backoff/2, backoff).
+     *
+     * The jitter is asserted as a band rather than pinned to an exact value because the point of it
+     * is that it is not predictable: both Zerodha lanes share one api_key and are knocked over by
+     * the same faults, so a deterministic backoff retries them in lockstep against an endpoint that
+     * is already refusing connections, and makes them exhaust their failed-reopen budgets on the
+     * same tick.
+     */
+    const uncapped = [500, 1_000, 2_000, 4_000, 8_000, 15_000, 15_000, 15_000];
+    for (const [i, delay] of delays.entries()) {
+      const ceiling = uncapped[i];
+      assert.ok(
+        delay >= ceiling / 2 && delay <= ceiling,
+        `retry ${i} must fall in the jittered band [${ceiling / 2},${ceiling}], got ${delay}`,
+      );
+      assert.ok(delay <= 15_000, `backoff ${delay}ms must stay capped — an unbounded retry storm is an outage`);
     }
-    assert.deepEqual(delays.slice(5), [15_000, 15_000, 15_000], "capped, and it keeps trying");
+    // Growth is still monotonic in expectation: the last (capped) delays cannot be smaller than the
+    // jitter floor of the first.
+    assert.ok(delays.slice(5).every((d) => d >= 7_500), "it keeps trying at the capped interval");
   });
 });
 
@@ -330,6 +352,56 @@ test("ZERODHA: a POLICY close code IS terminal, and schedules no reconnect", () 
       assert.equal(timers.length, 0, `close ${code} must NOT schedule a reconnect`);
     });
   }
+});
+
+test("ZERODHA: a token invalidated MID-SESSION eventually reports a lost session, not an endless retry loop", () => {
+  /*
+   * THE DEFAULT DAILY FAILURE PATH, and it used to be silent forever.
+   *
+   * Kite invalidates an access token every morning around 06:00 IST regardless of activity, and
+   * immediately whenever the account signs in anywhere else (one active token per api_key). A process
+   * that stays up across either event sees its socket close, and every reconnect is then refused at
+   * the HTTP upgrade — which surfaces as close code 1006, so the policy-code path (1008/4001/4401/
+   * 4403) never fires.
+   *
+   * The escalation used to be gated on the lane having NEVER opened in its lifetime, so once it had
+   * connected at 09:10 the check was permanently unreachable: the lane reconnect-looped forever while
+   * `index.ts`'s auth-death wiring never ran. The token stayed in memory, the encrypted session row
+   * stayed valid, the health machine never reached AUTH_EXPIRED, and the operator was shown
+   * `authenticated: true` with no problems against a dead session.
+   */
+  withFakeSockets(({ runNextTimer }) => {
+    const { feed, events } = makeZerodhaLane();
+    feed.subscribeTokens([111]);
+
+    // It worked first: this is what made the old guard unreachable for the rest of the process.
+    const live = FakeWebSocket.last;
+    live.open();
+    live.kiteDepthTick(111);
+    assert.equal(events.ticks.length, 1, "the lane was genuinely streaming before the token died");
+
+    // The token is now dead. Every reopen is refused at the upgrade — 1006, never a policy code.
+    live.closeWith(1006);
+    let attempts = 0;
+    while (events.dead.length === 0 && attempts < 40) {
+      attempts++;
+      runNextTimer();
+      FakeWebSocket.last.closeWith(1006);
+    }
+
+    assert.equal(
+      events.dead.length, 1,
+      `a mid-session token death must be reported, got ${attempts} attempts with no report`,
+    );
+    assert.match(events.dead[0], /RE-establish/, "the message must name this as a re-connect failure");
+    assert.match(events.dead[0], /06:00 IST|signs in elsewhere/, "and point at the real cause");
+    assert.ok(
+      attempts > 5,
+      "a lane that HAS worked gets more tolerance than a never-opened one: a genuine network " +
+        `outage must not clear the stored session on the fifth blip (took ${attempts})`,
+    );
+    assert.ok(attempts <= 20, `and it must not take forever to notice (took ${attempts})`);
+  });
 });
 
 test("ZERODHA: a socket that NEVER opens reports a lost session only after bounded retries", () => {

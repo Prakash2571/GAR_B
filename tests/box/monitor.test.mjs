@@ -405,6 +405,83 @@ test("a box expiring later is not in the expiry-safety window", async () => {
   assert.equal(h.closes.length, 0);
 });
 
+test("a position whose expiry has ALREADY PASSED is flagged and escalated, not forgotten", async () => {
+  /*
+   * THE PREDICATE WAS AN EQUALITY: `if (pos.expiry !== istDayKey()) return false;`.
+   *
+   * So the only day expiry safety could ever fire was the expiry date itself. A position that
+   * survived past it — the process was down across expiry, or the exit was refused for liquidity
+   * right to the bell (which the test above shows is a real and deliberate outcome) — fell
+   * PERMANENTLY out of the window on D+1. Never force-exited, never flagged, never escalated. It sat
+   * in the book indefinitely, marking against a contract that no longer existed.
+   *
+   * It is also the most expensive state the system can be in. The box has gone to settlement, and
+   * exercise STT of 0.15% of intrinsic value is payable on every in-the-money LONG leg — a box always
+   * has in-the-money legs, and the cost is unbounded in how far the underlying travelled. The one
+   * position nobody was told about is the one whose cost cannot be bounded.
+   */
+  const h = harness({
+    exitValuePerUnit: 180,
+    expiry: "2026-08-28",
+    istDay: "2026-08-29", // D+1: the contract expired YESTERDAY
+    istMinutes: 11 * 60, // and the time of day is irrelevant — it is already past settlement
+  });
+  await h.monitor.cycle();
+
+  assert.equal(h.position.expiry_safety, true, "an expired position must be in the safety state");
+  const event = h.events.find((e) => e.event === "EXPIRY_SAFETY");
+  assert.ok(event, "it must be escalated, not silently dropped");
+  assert.match(
+    event.detail, /STILL OPEN|settlement/i,
+    "the message must say the contract expired and the position went to settlement, rather than " +
+      "reusing the ordinary 'entered the window' wording",
+  );
+});
+
+test("expiry safety is detected and ALERTED even when the feed is dead", async () => {
+  /*
+   * Detection used to sit BELOW `if (!this.deps.isFeedHealthy()) return;`, so a feed outage at 14:45
+   * on expiry day skipped the deadline entirely: `expiry_safety` was never set and no EXPIRY_SAFETY
+   * event was ever emitted. The alarm was suppressed at exactly the moment it mattered most —
+   * settlement approaching on a position the engine cannot price.
+   *
+   * The window is pure clock arithmetic, so it can always be evaluated. Only the EXECUTION of the
+   * exit needs a live book, and that is still correctly withheld here.
+   */
+  const h = harness({
+    exitValuePerUnit: 180,
+    expiry: "2026-08-29",
+    istDay: "2026-08-29",
+    istMinutes: 15 * 60,
+    feedHealthy: false,
+  });
+  await h.monitor.cycle();
+
+  assert.equal(h.position.expiry_safety, true, "the deadline is detected without a feed");
+  assert.ok(
+    h.events.some((e) => e.event === "EXPIRY_SAFETY"),
+    "and the operator is woken up — they can still act manually",
+  );
+  assert.equal(h.closes.length, 0, "but nothing is executed against a book we cannot see");
+});
+
+test("expiry safety is detected even when the market is closed", async () => {
+  // Same reasoning as the feed case: if a box has survived to a closed market on its expiry day, the
+  // operator needs to know it has gone to settlement. Refreshing metrics silently is not enough.
+  const h = harness({
+    exitValuePerUnit: 180,
+    expiry: "2026-08-29",
+    istDay: "2026-08-29",
+    istMinutes: 15 * 60,
+    marketOpen: false,
+  });
+  await h.monitor.cycle();
+
+  assert.equal(h.position.expiry_safety, true);
+  assert.ok(h.events.some((e) => e.event === "EXPIRY_SAFETY"));
+  assert.equal(h.closes.length, 0, "a closed market is not a liquidity event");
+});
+
 /* ---------------------------- market closed ------------------------------- */
 
 test("market CLOSED: metrics keep refreshing but no exit is attempted", async () => {

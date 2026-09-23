@@ -22,6 +22,7 @@ import { normaliseAllowlist } from "./underlyingExclusions.js";
 import { SUPERVISED_TRIAL_ENV, supervisedTrialStartupRefusal } from "./supervisedTrial.js";
 import { DEFAULT_FUNDS_BASIS, isFundsBasis, type FundsBasis } from "./fundsSemantics.js";
 import { readZerodhaStaticIpPolicy, type ZerodhaStaticIpPolicy } from "./zerodhaStaticIp.js";
+import { DEFAULT_MAX_EXCHANGE_AHEAD_MS } from "./executionCoherence.js";
 import type { BoxQueueModel, BoxScannerConfigSnapshot, ExecutionMode } from "./types.js";
 
 function num(name: string, fallback: number): number {
@@ -661,7 +662,38 @@ export interface BoxConfig {
    */
   liveOrderMutationDeadlineMs: number;
   liveMaxModifications: number;
+  /**
+   * Hard ceiling on the chase band for LIVE ENTRY, in ticks.
+   *
+   * ENTRY ONLY. This deliberately does NOT cap reductions — see
+   * {@link liveMaxReductionChaseTicks} for why that distinction is load-bearing.
+   */
   liveMaxChaseTicks: number;
+  /**
+   * Hard ceiling on the chase band for LIVE REDUCTIONS (exit, unwind, emergency residual flatten).
+   *
+   * WHY THIS IS A SEPARATE KNOB.
+   *
+   * The chase band used to be `min(liveMaxChaseTicks, phase === "unwind" ? unwindMaxChaseTicks :
+   * legMaxChaseTicks)`. With the shipped defaults that is `min(2, 5) = 2`, so the documented unwind
+   * escalation ("defaults higher than legMaxChaseTicks", and it does) was silently clamped away and
+   * entry, exit AND emergency residual flatten all priced at exactly ±2 ticks — ₹0.10 on a 0.05-tick
+   * option. There is no market-order fallback anywhere in this system by design, so ±2 ticks was the
+   * most aggressive price the engine could ever produce for ANY purpose.
+   *
+   * That is the wrong risk posture for a reduction. Entry is optional: if the band is too narrow the
+   * box simply is not entered, and nothing is lost. A reduction is not optional — the exposure
+   * already exists, so failing to fill means carrying a naked option leg, and the cost of paying a
+   * few extra ticks is trivially smaller than the cost of holding it. Any wide-spread moment (the
+   * 09:15 open, a volatility spike, an illiquid single-stock strike) left the unwind resting 2 ticks
+   * inside a much wider spread, cancelled at 0, and re-POSTed at the same 2 ticks every 2 seconds —
+   * indefinitely, while the leg stayed naked and the daily order budget drained.
+   *
+   * Defaults to 10 (₹0.50 on a 0.05 tick): enough to cross a genuinely wide options spread, still a
+   * bounded marketable limit rather than a market order, so the book can never be walked further
+   * than this.
+   */
+  liveMaxReductionChaseTicks: number;
   /**
    * Minimum interval between GENERAL broker transport calls: order-status polls, order
    * lists, positions, margins and health.
@@ -895,6 +927,23 @@ export interface BoxConfig {
    */
   maxReceiveToExchangeDelayMs: number;
   /**
+   * How far an exchange timestamp may sit AHEAD of local receive time before it is treated as a
+   * HOST CLOCK fault rather than ordinary timestamp granularity (ms).
+   *
+   * ONE KNOB, TWO LAYERS. Both `executionCoherence` (the four-leg gate) and `candidateMarketData`
+   * (per-leg admission) read this. They previously disagreed: coherence tolerated a hardcoded 1500ms
+   * and documented why, while per-leg admission rejected ANY negative source age. Under a host clock
+   * a second or two behind NSE's, the zero-tolerance test failed all four legs simultaneously, every
+   * candidate was refused and entries stopped completely — reported as "fresh locally but stale at
+   * the exchange", which names the opposite of the real cause.
+   *
+   * Tolerance is needed because Kite's `exchange_timestamp` is epoch SECONDS and the parser floors
+   * it, so a healthy tick legitimately carries a stamp up to 999ms off its true publish instant, and
+   * the exchange and host clocks are never perfectly synchronised. Beyond this bound it is a real
+   * clock anomaly and is refused as one, so an operator is pointed at NTP rather than at the feed.
+   */
+  maxExchangeAheadOfReceiveMs: number;
+  /**
    * How LIVE reads a cross-leg dispersion limit of 0.
    *
    * false (default): in LIVE a 0 receive-dispersion limit is IMPOSSIBLE-TO-SATISFY,
@@ -1028,6 +1077,89 @@ export interface BoxConfig {
   windowMinIntervalMs: number;
   /** Evaluate SHORT boxes as well as LONG boxes. */
   enableShortBox: boolean;
+
+  // ---- Session entry window (ENTRY ONLY — never gates an exit) ----
+  /**
+   * Refuse a NEW box once fewer than this many minutes of the session remain.
+   *
+   * WHY A CUTOFF IS NEEDED AT ALL. A box is four orders, not one, and the worst-case wall clock
+   * from the first POST to the end of a failed entry's unwind is roughly three and a half minutes
+   * with the shipped timeouts (BUY wave 30s working + 5s cancel confirm, SELL wave the same, then a
+   * SEQUENTIAL four-leg unwind at 35s each) — and nothing in that chain consults the clock. Before
+   * this knob existed there was no entry cutoff anywhere in the system: entry was permitted until
+   * `isMarketOpen()` went false, which was 15:40, ten minutes AFTER the exchange shut. An entry
+   * admitted at 15:28 has its unwind orders rejected by a closed exchange, and that is the exact
+   * sequence that leaves a naked delta-1 ITM option on the book overnight.
+   *
+   * 15 minutes is roughly four times the worst-case chain, which is the right margin for something
+   * whose failure mode is overnight naked exposure rather than a missed trade.
+   */
+  entryCutoffMinutesBeforeClose: number;
+  /**
+   * Refuse a NEW box for this many minutes after the session opens.
+   *
+   * NFO's first packets routinely carry previous-close values with absent or absurdly wide books,
+   * and EVERY staleness gate in this system measures time since a packet ARRIVED rather than whether
+   * its price is a genuine post-open trade. A snapshot that lands at 09:15:01 carrying yesterday's
+   * closes is therefore "fresh" by every existing check — which on a four-leg box is exactly the
+   * shape of a fake free-money signal, since four stale legs can produce an arbitrary edge.
+   *
+   * Entry only. The position monitor and the residual-flatten loop run from the opening bell,
+   * because reducing exposure at a bad price is better than holding it.
+   */
+  sessionWarmupMinutesAfterOpen: number;
+
+  // ---- Expiry / settlement distance (ENTRY ONLY — never gates an exit) ----
+  /**
+   * Minimum TRADING days from today to expiry for a series to accept NEW boxes.
+   *
+   * WHY THIS EXISTS. There used to be no days-to-expiry rule anywhere in the system, and the universe
+   * always selected the nearest non-expired series INCLUDING today's. A box could therefore be opened
+   * at 14:00 on expiry day, in the expiring contract, with nothing between it and settlement but the
+   * 45-minute expiry-safety window — which by design refuses to fill against an untradeable book, so
+   * an illiquid wing at 15:15 sent the box to settlement anyway.
+   *
+   * Settlement is not a neutral alternative to closing:
+   *   - EXERCISE STT is 0.15% of INTRINSIC value on ITM long options (raised from 0.125% effective
+   *     1 April 2026), payable by the buyer. A box ALWAYS has ITM legs at expiry, and the cost is
+   *     unbounded in how far the underlying has travelled — easily multiples of the whole edge.
+   *   - SPREAD MARGIN BENEFIT is progressively withdrawn near expiry, so the margin actually held
+   *     against an open box rises with nothing in the engine observing it.
+   *   - STOCK options are PHYSICALLY settled (see {@link allowStockUnderlyings}).
+   *
+   * TRADING days, not calendar days: the question is how many SESSIONS remain to unwind four legs,
+   * and a Friday-to-Monday expiry is three calendar days but one session.
+   *
+   * Default 2 = at least one full session of slack beyond today. 0 restores the old behaviour.
+   */
+  minTradingDaysToExpiry: number;
+  /**
+   * Whether STOCK (non-index) F&O underlyings may be scanned for new boxes.
+   *
+   * DEFAULT FALSE, because of PHYSICAL SETTLEMENT. Stock options in India are physically settled while
+   * index options are cash settled, and the difference is not a detail: a stock box carried into
+   * expiry week becomes a delivery obligation on the ITM legs, and NSE ramps physical-delivery margin
+   * on ITM long options from roughly four days before expiry. On a RELIANCE 20-wide box the maximum
+   * payoff is ₹10,000 while the delivery leg is several lakh rupees of notional — the margin ramp
+   * dwarfs the entire trade, and an RMS auto-square-off at the desk's price is the likely outcome.
+   *
+   * Nothing in `boxCapital` or `fundingReadiness` models a delivery-margin ramp, so the honest
+   * position is to keep stocks out until it does. `is_index` was already carried on the board, the
+   * chain, candidates and trades — it simply never gated anything.
+   *
+   * Stock F&O also carries the daily NSE ban list (no fresh positions once open interest crosses 95%
+   * of market-wide limits), which is likewise not modelled.
+   */
+  allowStockUnderlyings: boolean;
+  /**
+   * Minimum trading days to expiry for STOCK underlyings, when they are allowed at all.
+   *
+   * Deliberately larger than {@link minTradingDaysToExpiry}: the physical-delivery margin ramp begins
+   * several days before expiry, so the distance that keeps an index box safe does not keep a stock box
+   * safe. Applied as a maximum with the index rule, never a replacement, so raising the index minimum
+   * also raises the stock one.
+   */
+  stockMinTradingDaysToExpiry: number;
 
   // ---- Exit rules ----
   /** Floor of the convergence threshold (₹). */
@@ -1619,6 +1751,15 @@ export function loadBoxConfig(): BoxConfig {
     liveOrderMutationDeadlineMs: clampInt("BOX_LIVE_ORDER_MUTATION_DEADLINE_MS", 4_000, 250, 30_000),
     liveMaxModifications: clampInt("BOX_LIVE_MAX_MODIFICATIONS", 2, 0, 10),
     liveMaxChaseTicks: clampInt("BOX_LIVE_MAX_CHASE_TICKS", 2, 0, 20),
+    /*
+     * Reductions get their OWN ceiling, and it is deliberately wider than entry's.
+     *
+     * The floor is 1, not 0: a reduction ceiling of zero would price every exit and every residual
+     * flatten exactly AT the touch with no room to cross, which for a leg we are trying to get rid
+     * of is indistinguishable from refusing to reduce. Entry may legitimately be configured to 0
+     * (never pay up); a reduction may not.
+     */
+    liveMaxReductionChaseTicks: clampInt("BOX_LIVE_MAX_REDUCTION_CHASE_TICKS", 10, 1, 50),
     liveBrokerMinIntervalMs: clampInt("BOX_LIVE_BROKER_MIN_INTERVAL_MS", 250, 50, 5_000),
     // 0 = derive from the broker's published order-placement limit. A positive value is an
     // operator override, clamped UP to the broker floor by resolveBrokerPacing().
@@ -1751,6 +1892,18 @@ export function loadBoxConfig(): BoxConfig {
     // A book cannot be received before the exchange published it; 5s tolerates
     // coarse (1s) exchange stamps and normal feed latency without flagging a fault.
     maxReceiveToExchangeDelayMs: clampInt("BOX_MAX_RECEIVE_TO_EXCHANGE_DELAY_MS", 5_000, 0, 120_000),
+    /*
+     * Floor of 1000ms is deliberate and is NOT merely a sanity clamp: Kite's exchange timestamp is
+     * 1-second granular, so any tolerance below one full second re-creates the defect this knob
+     * exists to fix — healthy ticks intermittently reading as "ahead of receive time" and refusing
+     * all four legs at once. An operator can widen it, but cannot configure it into being wrong.
+     */
+    maxExchangeAheadOfReceiveMs: clampInt(
+      "BOX_MAX_EXCHANGE_AHEAD_OF_RECEIVE_MS",
+      DEFAULT_MAX_EXCHANGE_AHEAD_MS,
+      1_000,
+      60_000,
+    ),
     // In LIVE, a 0 cross-leg dispersion limit is impossible-to-satisfy (safe) unless
     // the operator explicitly opts out here. Paper always reads 0 as "disabled".
     coherenceZeroDispersionDisablesInLive: bool("BOX_COHERENCE_ZERO_DISPERSION_DISABLES_IN_LIVE", false),
@@ -1795,6 +1948,32 @@ export function loadBoxConfig(): BoxConfig {
     atmHysteresis: num("BOX_ATM_HYSTERESIS", 0.15),
     windowMinIntervalMs: num("BOX_WINDOW_MIN_INTERVAL_MS", 15_000),
     enableShortBox: strictBool("BOX_ENABLE_SHORT_BOX", true),
+
+    /*
+     * Session entry window. Both are ENTRY-ONLY and both are clamped, not free-form:
+     *
+     *  - The cutoff floor is 5 minutes, because a value below the worst-case entry-plus-unwind chain
+     *    (~3.5 min) is not a cutoff at all — it would admit a box that provably cannot finish. The
+     *    ceiling of 120 lets an operator be as conservative as they like.
+     *  - The warm-up MAY be 0: an operator running a supervised trial on a liquid index may
+     *    legitimately want the open. It is not free-form above 60 minutes because a warm-up longer
+     *    than that is really a decision not to trade the morning, which belongs in the arming
+     *    controls rather than hidden in a timing knob.
+     */
+    entryCutoffMinutesBeforeClose: clampInt("BOX_ENTRY_CUTOFF_MINUTES_BEFORE_CLOSE", 15, 5, 120),
+    sessionWarmupMinutesAfterOpen: clampInt("BOX_SESSION_WARMUP_MINUTES_AFTER_OPEN", 3, 0, 60),
+
+    /*
+     * Expiry distance. `strictLimitInt` is not used for the minimum because 0 is a MEANINGFUL value
+     * here (it restores the pre-existing "nearest live expiry" behaviour) rather than a disabled
+     * sentinel, and an operator running index-only cash-settled boxes may legitimately choose it.
+     * The ceiling of 30 stops a typo from selecting a series so far out that no box ever qualifies.
+     */
+    minTradingDaysToExpiry: clampInt("BOX_MIN_TRADING_DAYS_TO_EXPIRY", 2, 0, 30),
+    // Default FALSE: physical settlement and the delivery-margin ramp are not modelled anywhere in
+    // the capital layer, so stock underlyings are opt-in rather than opt-out.
+    allowStockUnderlyings: strictBool("BOX_ALLOW_STOCK_UNDERLYINGS", false),
+    stockMinTradingDaysToExpiry: clampInt("BOX_STOCK_MIN_TRADING_DAYS_TO_EXPIRY", 5, 0, 30),
 
     convergenceFloor: nonNegativeNum("BOX_CONVERGENCE_FLOOR", 200),
     convergencePct: num("BOX_CONVERGENCE_PCT", 0.2),

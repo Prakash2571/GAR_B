@@ -643,17 +643,46 @@ export function isBrokerOrderTerminal(state: BrokerOrderState): boolean {
   return state === "COMPLETE" || state === "CANCELLED" || state === "REJECTED";
 }
 
-export function assertBoundedLimit(req: BrokerOrderRequest, configuredMaxChaseTicks?: number): void {
+/**
+ * The per-phase chase ceiling a request must respect.
+ *
+ * Entry and reduction have different ceilings because they have opposite failure costs: a chase band
+ * too narrow on entry means no box (harmless), while too narrow on a reduction means exposure that
+ * cannot be closed. The validator must therefore know which it is looking at, or the tight entry
+ * ceiling silently rejects every wider reduction the gateway deliberately priced.
+ */
+export interface BoundedLimitCeilings {
+  /** Ceiling for `phase === "entry"`. */
+  readonly entry: number;
+  /** Ceiling for `phase === "exit" | "unwind"` — reductions. */
+  readonly reduction: number;
+}
+
+/** The ceiling in force for one request's phase. */
+export function chaseCeilingFor(
+  phase: BoxOrderPhase,
+  ceilings: BoundedLimitCeilings | number | undefined,
+): number | undefined {
+  if (ceilings === undefined) return undefined;
+  if (typeof ceilings === "number") return ceilings;
+  return phase === "entry" ? ceilings.entry : ceilings.reduction;
+}
+
+export function assertBoundedLimit(
+  req: BrokerOrderRequest,
+  configuredMaxChaseTicks?: BoundedLimitCeilings | number,
+): void {
   if (!Number.isInteger(req.quantity) || req.quantity <= 0) {
     throw new Error(`Invalid order quantity ${req.quantity}.`);
   }
+  const ceiling = chaseCeilingFor(req.phase, configuredMaxChaseTicks);
   const pricing = req.pricing;
   if (
     pricing.order_type !== "LIMIT" ||
     !Number.isFinite(pricing.reference_price) || pricing.reference_price <= 0 ||
     !Number.isFinite(pricing.tick_size) || pricing.tick_size <= 0 ||
     !Number.isInteger(pricing.max_chase_ticks) || pricing.max_chase_ticks < 0 ||
-    (configuredMaxChaseTicks !== undefined && pricing.max_chase_ticks > configuredMaxChaseTicks) ||
+    (ceiling !== undefined && pricing.max_chase_ticks > ceiling) ||
     !Number.isFinite(pricing.limit_price) || pricing.limit_price <= 0 || pricing.limit_price > 10_000_000
   ) {
     throw new Error("Invalid bounded LIMIT pricing envelope.");

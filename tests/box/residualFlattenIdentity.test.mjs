@@ -36,6 +36,7 @@ import { CentralBoxExecutionGateway } from "../../dist/box/executionGateway.js";
 import { BrokerAmbiguousSubmitError } from "../../dist/box/brokerAdapter.js";
 import { BoxQuoteStore } from "../../dist/box/quotes.js";
 import { loadBoxConfig } from "../../dist/box/config.js";
+import { MAX_RESIDUAL_BROKER_REJECTIONS } from "../../dist/box/residualFlatten.js";
 import { quote } from "./helpers.mjs";
 
 const clone = (v) => structuredClone(v);
@@ -654,23 +655,98 @@ test("R17b: restart repairs a crash-stranded persisted generation after durable 
   assert.equal(repaired.flattened_by_role.k1_ce, 75);
 });
 
-test("R17c: broker-origin REJECTED never advances to a fresh residual identity", async () => {
+test("R17c: a broker rejection is RETRIED under a fresh identity, but only a bounded number of times", async () => {
+  /*
+   * THIS TEST INVERTED. It used to assert "broker-origin REJECTED never advances to a fresh residual
+   * identity" — which pinned a defect as a requirement.
+   *
+   * `adopt_attempt` does not advance `flatten_attempt`, so every later pass regenerated the same
+   * `client_order_id`, the durable journal adopted the REJECTED intent instead of submitting, and NO
+   * FURTHER ORDER WAS EVER SENT. A single transient refusal — a momentary margin shortfall while
+   * another box was legging, a `market_closed` race on the 15:30 boundary, a freeze-quantity or
+   * price-band refusal — left a naked option leg on the book permanently. New entry stayed blocked
+   * (correctly), so the strategy was dead as well, until a human noticed.
+   *
+   * Retiring is safe because the gateway only classifies `broker_rejected` after zero exposure is
+   * PROVEN, so the broker holds no quantity under the retired identity and a fresh one cannot
+   * duplicate a fill. What must be bounded is the RETRY: a structurally impossible reduction (F&O
+   * ban period, expired contract, standing RMS block) would otherwise re-POST every two seconds
+   * forever and drain the daily order budget that protective work for other positions needs.
+   */
   const b = await build({
     script: () => ({ state: "REJECTED", filled: 0 }),
     held: [{ exchange: "NFO", tradingsymbol: "SYM-k1_ce", net_quantity: 75 }],
   });
-  const persisted = residual("k1_ce", { flatten_attempt: 1 });
-  const first = await b.gateway.flattenResidual({ residual: [persisted], keyPrefix: "att-broker-reject" });
-  const second = await b.gateway.flattenResidual({ residual: first.remaining, keyPrefix: "att-broker-reject" });
 
-  assert.equal(b.adapter.submits.length, 1, "a broker rejection is not retried under a new identity");
-  assert.equal(first.remaining[0].flatten_attempt, 1);
-  assert.equal(second.remaining[0].flatten_attempt, 1);
-  const intent = [...b.journal.rows.values()].find((row) => row.state === "REJECTED");
-  assert.ok(intent.broker_order_id, "broker-origin rejection retains broker identity");
+  let carried = [residual("k1_ce", { flatten_attempt: 1 })];
+  for (let pass = 1; pass <= MAX_RESIDUAL_BROKER_REJECTIONS; pass++) {
+    const result = await b.gateway.flattenResidual({ residual: carried, keyPrefix: "att-broker-reject" });
+    assert.equal(
+      b.adapter.submits.length, pass,
+      `pass ${pass} must reach the broker under its own identity — a rejection is retryable`,
+    );
+    assert.match(b.adapter.submits[pass - 1].id, new RegExp(`attempt-${pass}$`));
+    assert.equal(result.remaining.length, 1, "the exposure is retained; it was never filled");
+    assert.equal(result.remaining[0].quantity, 75);
+    assert.equal(
+      result.remaining[0].flatten_attempt, pass + 1,
+      "a proven zero-fill rejection retires its identity so the next pass can retry",
+    );
+    assert.equal(result.remaining[0].flatten_broker_rejections, pass, "consecutive rejections are counted");
+    carried = result.remaining;
+  }
+
+  // BUDGET SPENT. Nothing further may be POSTed, the exposure is still held, and the condition is
+  // escalated as an invariant rather than counted as a routine market outcome.
+  const before = b.adapter.submits.length;
+  const exhausted = await b.gateway.flattenResidual({ residual: carried, keyPrefix: "att-broker-reject" });
+  assert.equal(b.adapter.submits.length, before, "past the bound, no further order is sent");
+  assert.equal(exhausted.remaining.length, 1, "the exposure is retained, never abandoned");
+  assert.equal(exhausted.remaining[0].quantity, 75);
   assert.equal(
-    intent.audit.some((event) => event.payload?.origin === "local_pre_submit_refusal"),
-    false,
+    exhausted.remaining[0].flatten_attempt, carried[0].flatten_attempt,
+    "an exhausted budget holds its identity rather than burning generations",
+  );
+  assert.ok(
+    b.invariants.some((v) => /budget_exhausted/.test(v)),
+    `the stalled exposure is escalated to an operator, got ${JSON.stringify(b.invariants)}`,
+  );
+});
+
+test("R17c: a durable REJECTED intent that contradicts a recorded fill is NEVER retired past", async () => {
+  /*
+   * The safety counterpart to the test above. Retirement is only sound when the rejected identity
+   * provably holds no quantity. A durable REJECTED intent carrying a fill is contradictory evidence,
+   * and retiring past it would mint a second reduction order while the broker still holds quantity
+   * under the first — a duplicate reduction, which on a short leg means selling the same exposure
+   * twice and opening a naked position in the opposite direction.
+   */
+  const keyPrefix = "att-reject-with-fill";
+  const journal = await terminalIntentJournal({ filled: 20, keyPrefix });
+  const contradicted = new Journal([...journal.rows.values()].map((row) => ({
+    ...row,
+    state: "REJECTED",
+    filled_quantity: 20,
+    average_price: 99.9,
+    reject_reason: "broker rejected the balance",
+  })));
+  const b = await build({
+    journal: contradicted,
+    script: ({ req }) => ({ state: "COMPLETE", filled: req.quantity }),
+    held: [{ exchange: "NFO", tradingsymbol: "SYM-k1_ce", net_quantity: 55 }],
+  });
+  const carried = residual("k1_ce", { quantity: 55, flatten_attempt: 1 });
+
+  const result = await b.gateway.flattenResidual({ residual: [carried], keyPrefix });
+  assert.equal(b.adapter.submits.length, 0, "an unprovable rejection never manufactures a new POST");
+  assert.equal(result.remaining[0].flatten_attempt, 1, "the contradicted identity is retained, not retired");
+  assert.equal(
+    result.remaining[0].flatten_broker_rejections, undefined,
+    "an unprovable rejection does not spend the retry budget — it is not a clean refusal",
+  );
+  assert.ok(
+    b.invariants.some((v) => /broker_state_unknown/.test(v)),
+    `it is quarantined for reconciliation, got ${JSON.stringify(b.invariants)}`,
   );
 });
 
@@ -998,11 +1074,20 @@ test("a lower re-estimated cumulative charge still retires and flattens the resi
 test("the charge watermark stays monotonic across a cheaper then recovered rate card", async () => {
   // A cheaper estimate must not LOWER the watermark either: the next pass would then bill the same
   // turnover again once the estimate recovers.
+  //
+  // THE VEHICLE CHANGED, THE PROPERTY DID NOT. This used to keep the watermarks across passes with a
+  // broker-origin REJECTED intent, which retained its identity by policy. A proven zero-fill
+  // rejection now RETIRES (so a transient refusal cannot strand exposure forever), and a retired
+  // identity correctly starts a fresh cumulative stream at zero — so it is no longer a case in which
+  // a falling estimate could lower the bar.
+  //
+  // A REJECTED intent that CONTRADICTS a recorded fill still retains its identity, and must: the
+  // broker may hold quantity under it, so it is quarantined rather than retired. That is now the
+  // case where watermarks genuinely carry across passes, and therefore the case this property has to
+  // hold for.
   const keyPrefix = "att-charge-monotonic";
   const rate = { perUnit: 0.25 };
   const journal = await terminalIntentJournal({ filled: 20, keyPrefix });
-  // Broker-origin rejection RETAINS its identity by policy, so the watermarks are carried across
-  // passes rather than reset — the case in which a falling estimate could actually lower the bar.
   const retained = new Journal([...journal.rows.values()].map((row) => ({
     ...row,
     state: "REJECTED",
@@ -1026,7 +1111,7 @@ test("the charge watermark stays monotonic across a cheaper then recovered rate 
   const cheaper = await b.gateway.flattenResidual({ residual: [carried], keyPrefix });
   assert.equal(b.adapter.submits.length, 0, "a retained broker rejection never manufactures a new POST");
   assert.equal(cheaper.flatten_charges, 0);
-  assert.equal(cheaper.remaining[0].flatten_attempt, 1, "broker-origin rejection keeps the identity");
+  assert.equal(cheaper.remaining[0].flatten_attempt, 1, "an unprovable rejection keeps the identity");
   assert.equal(cheaper.remaining[0].flatten_accounted_charges, 10,
     "the watermark never falls to the cheaper estimate");
 
@@ -1035,5 +1120,4 @@ test("the charge watermark stays monotonic across a cheaper then recovered rate 
   const recovered = await b.gateway.flattenResidual({ residual: cheaper.remaining, keyPrefix });
   assert.equal(recovered.flatten_charges, 0, "already-billed turnover is never billed again");
   assert.equal(recovered.remaining[0].flatten_accounted_charges, 10);
-  assert.equal(b.invariants.length, 0);
 });

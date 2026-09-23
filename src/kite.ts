@@ -405,6 +405,14 @@ export class KiteClient {
    * {@link installProvidedToken}.
    */
   private accountId: string | null = null;
+  /**
+   * Notified when the broker rejects this session on an authenticated REST call.
+   *
+   * Optional so a test or a standalone script can construct a client with no wiring. In the running
+   * backend `index.ts` installs it; see {@link setAuthFailureHandler} for what it must do and why
+   * clearing the in-memory token alone is not enough.
+   */
+  private onAuthFailure: ((info: { status: number; endpoint: string }) => void) | null = null;
 
   constructor(config: KiteConfig) {
     // NO OAUTH IN STRIKEEDGE. The api key and access token are installed by the
@@ -561,6 +569,61 @@ export class KiteClient {
     this.accountId = null;
   }
 
+  /**
+   * Install the callback fired when the broker REJECTS this session on an authenticated REST call.
+   *
+   * WHY THIS EXISTS — the REST path used to do a quarter of the job.
+   *
+   * Every authenticated read in this class ends with `if (status === 401 || status === 403)
+   * this.clearSession()`. That clears IN-PROCESS state and nothing else. The WebSocket death path in
+   * `index.ts` does four things for the same event: clears the in-memory token, forgets the session
+   * METADATA on the broker manager, invalidates the ENCRYPTED ROW in `broker_sessions`, and tells the
+   * engine to drop its cached books. The REST path did one of the four.
+   *
+   * The consequence is a dead token that survives a restart. The operator signs in to kite.zerodha.com
+   * or the Kite mobile app at 12:30 — Kite permits ONE active access_token per api_key, so the API
+   * token dies immediately. The next REST call 403s and clears memory, but the encrypted row still
+   * carries TODAY's `login_date` and the matching api key. Any restart (a deploy, an OOM kill, a
+   * systemd restart) then runs `restore()` → `adoptStoredKiteSession()`, which validated exactly two
+   * things — same IST day, same api key — and installed the corpse. `sessionFor` reported
+   * `authenticated: true`, `healthFor` reported `data_ready: true` and `trading_ready: true`, and the
+   * dashboard showed a healthy session with no problems.
+   *
+   * Then the Box engine arms against it. Every leg POST 403s. On a four-leg box that is a partially
+   * filled spread you can neither complete nor cancel, with the status surface claiming health
+   * throughout.
+   *
+   * FIRE-AND-FORGET BY CONTRACT. The handler must never throw into the calling REST path and must
+   * never be awaited there: a durable-store failure while invalidating a session cannot be allowed to
+   * mask or replace the broker error the caller is already handling.
+   */
+  setAuthFailureHandler(handler: (info: { status: number; endpoint: string }) => void): void {
+    this.onAuthFailure = handler;
+  }
+
+  /**
+   * The broker rejected this session on an authenticated call. Drop it, and tell everyone who holds
+   * state derived from it.
+   *
+   * Called INSTEAD OF a bare `clearSession()` at every 401/403 site, so there is one place that
+   * decides what session death means and it cannot be partially implemented at one call site.
+   */
+  private noteAuthFailure(status: number, endpoint: string): void {
+    if (status !== 401 && status !== 403) return;
+    const had = this.accessToken !== null;
+    this.clearSession();
+    // Only escalate when there WAS a session to lose. A 401 raised because no token is installed yet
+    // (`authHeader()` throws exactly that) is not session death and must not invalidate a stored row
+    // that a concurrent login may be in the middle of writing.
+    if (!had) return;
+    try {
+      this.onAuthFailure?.({ status, endpoint });
+    } catch {
+      // A handler fault must not become the error the caller sees. The token is already cleared, which
+      // is the part that stops this process hammering Kite with a dead credential.
+    }
+  }
+
   private authHeader(): Record<string, string> {
     if (!this.accessToken) {
       throw new KiteError(
@@ -587,7 +650,7 @@ export class KiteClient {
     });
     if (!ok || json.status !== "success" || !json.data) {
       // A rejected/expired token means the session is dead — drop it.
-      if (status === 401 || status === 403) this.clearSession();
+      if (status === 401 || status === 403) this.noteAuthFailure(status, "/user/profile");
       throw new KiteError(
         json.message ?? `Failed to fetch profile (HTTP ${status}).`,
         status || 500,
@@ -636,7 +699,7 @@ export class KiteClient {
       message?: string;
     }>(`${KITE_API_ROOT}/user/margins/equity`);
     if (!ok || json.status !== "success" || !json.data) {
-      if (status === 401 || status === 403) this.clearSession();
+      if (status === 401 || status === 403) this.noteAuthFailure(status, "/user/margins/equity");
       throw new KiteError(json.message ?? `Failed to fetch funds (HTTP ${status}).`, status || 500);
     }
     const num = (v: unknown): number | null =>
@@ -691,7 +754,7 @@ export class KiteClient {
         message?: string;
       }>(`${KITE_API_ROOT}/quote/ohlc?${qs}`);
       if (!ok || json.status !== "success" || !json.data) {
-        if (status === 401 || status === 403) this.clearSession();
+        if (status === 401 || status === 403) this.noteAuthFailure(status, "/quote/ohlc");
         throw new KiteError(
           json.message ?? `Failed to fetch quotes (HTTP ${status}).`,
           status || 500,
@@ -719,7 +782,7 @@ export class KiteClient {
         message?: string;
       }>(`${KITE_API_ROOT}/quote?${qs}`);
       if (!ok || json.status !== "success" || !json.data) {
-        if (status === 401 || status === 403) this.clearSession();
+        if (status === 401 || status === 403) this.noteAuthFailure(status, "/quote");
         throw new KiteError(
           json.message ?? `Failed to fetch quotes (HTTP ${status}).`,
           status || 500,
@@ -758,7 +821,7 @@ export class KiteClient {
         message?: string;
       }>(`${KITE_API_ROOT}/quote?${qs}`);
       if (!ok || json.status !== "success" || !json.data) {
-        if (status === 401 || status === 403) this.clearSession();
+        if (status === 401 || status === 403) this.noteAuthFailure(status, "/quote");
         throw new KiteError(
           json.message ?? `Failed to fetch quotes (HTTP ${status}).`,
           status || 500,
@@ -796,7 +859,7 @@ export class KiteClient {
         message?: string;
       }>(`${KITE_API_ROOT}/quote?${qs}`);
       if (!ok || json.status !== "success" || !json.data) {
-        if (status === 401 || status === 403) this.clearSession();
+        if (status === 401 || status === 403) this.noteAuthFailure(status, "/quote");
         throw new KiteError(
           json.message ?? `Failed to fetch quotes (HTTP ${status}).`,
           status || 500,
@@ -830,7 +893,7 @@ export class KiteClient {
         message?: string;
       }>(`${KITE_API_ROOT}/quote?${qs}`);
       if (!ok || json.status !== "success" || !json.data) {
-        if (status === 401 || status === 403) this.clearSession();
+        if (status === 401 || status === 403) this.noteAuthFailure(status, "/quote");
         throw new KiteError(
           json.message ?? `Failed to fetch quotes (HTTP ${status}).`,
           status || 500,
@@ -897,7 +960,7 @@ export class KiteClient {
       message?: string;
     }>(`${KITE_API_ROOT}/margins/basket?consider_positions=true`, orders);
     if (!ok || json.status !== "success" || !json.data) {
-      if (status === 401 || status === 403) this.clearSession();
+      if (status === 401 || status === 403) this.noteAuthFailure(status, "/margins/basket");
       throw new KiteError(
         json.message ?? `Failed to fetch basket margin (HTTP ${status}).`,
         status || 500,
@@ -944,7 +1007,7 @@ export class KiteClient {
     }>(`${KITE_API_ROOT}/charges/orders`, orders);
 
     if (!ok || json.status !== "success" || !Array.isArray(json.data)) {
-      if (status === 401 || status === 403) this.clearSession();
+      if (status === 401 || status === 403) this.noteAuthFailure(status, "/charges/orders");
       throw new KiteError(
         json.message ?? `Failed to fetch order charges (HTTP ${status}).`,
         status || 500,
@@ -998,7 +1061,7 @@ export class KiteClient {
         message?: string;
       }>(url);
       if (!ok || json.status !== "success" || !json.data?.candles) {
-        if (status === 401 || status === 403) this.clearSession();
+        if (status === 401 || status === 403) this.noteAuthFailure(status, "/historicalCandles");
         throw new KiteError(
           json.message ?? `Failed to fetch historical data (HTTP ${status}).`,
           status || 500,

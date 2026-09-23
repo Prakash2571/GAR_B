@@ -37,6 +37,7 @@
  */
 
 import { createLatencySource, type LatencyMode, type LatencySource } from "./latencySource.js";
+import { NSE_SESSION_CLOSE_MINUTES, NSE_SESSION_OPEN_MINUTES } from "../marketCalendar.js";
 
 /** The brokers whose latency is measured and calibrated independently — never mixed. */
 export type BrokerId = "zerodha" | "dhan";
@@ -107,9 +108,14 @@ export const LATENCY_PROFILES: readonly LatencyProfile[] = ["MARKETABLE_LIMIT", 
 export type TimeOfDayBucket = "OPEN" | "NORMAL" | "CLOSE";
 export const TIME_OF_DAY_BUCKETS: readonly TimeOfDayBucket[] = ["OPEN", "NORMAL", "CLOSE"] as const;
 
-/** NSE equity-derivatives session, in minutes past IST midnight. */
-export const IST_MARKET_OPEN_MINUTES = 9 * 60 + 15;
-export const IST_MARKET_CLOSE_MINUTES = 15 * 60 + 30;
+/**
+ * NSE equity-derivatives session, in minutes past IST midnight.
+ *
+ * Re-exported from the calendar rather than redeclared, so the session boundaries have exactly one
+ * definition across the codebase.
+ */
+export const IST_MARKET_OPEN_MINUTES = NSE_SESSION_OPEN_MINUTES;
+export const IST_MARKET_CLOSE_MINUTES = NSE_SESSION_CLOSE_MINUTES;
 
 export interface TimeBucketBoundaries {
   /** Minutes from the open that count as OPEN. Default 15 (09:15–09:30). */

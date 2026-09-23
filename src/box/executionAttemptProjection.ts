@@ -72,6 +72,11 @@ function canonicalResidual(residual: readonly ResidualLegExposure[]): Record<str
       source: leg.source,
       created_at: leg.created_at,
       flatten_attempt: leg.flatten_attempt ?? 1,
+      // The consecutive-broker-rejection count is part of the durable identity so the bounded
+      // retry budget survives a restart. Without it, a pass that only changed the count would
+      // compare equal, `residualProjectionChanges` would return false, the write would be skipped,
+      // and every restart would hand a structurally-impossible reduction a fresh budget to burn.
+      flatten_broker_rejections: leg.flatten_broker_rejections ?? 0,
     }))
     .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
 }

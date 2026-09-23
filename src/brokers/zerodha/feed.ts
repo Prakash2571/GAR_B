@@ -101,7 +101,11 @@ export class ZerodhaFeed {
   private socketGeneration: number;
   /** Whether this lane has EVER completed a handshake (across reconnects). */
   private everOpened = false;
-  /** Consecutive attempts that closed without ever opening. Reset by any successful open. */
+  /**
+   * Consecutive attempts that closed without opening, SINCE THE LAST SUCCESSFUL OPEN.
+   *
+   * Per-streak, not per-lifetime. Reset only by `onOpen`.
+   */
   private consecutiveFailedOpens = 0;
   /** The most recent transport error message, for a reported diagnosis. */
   private lastFault: string | null = null;
@@ -113,6 +117,35 @@ export class ZerodhaFeed {
    * attempts distinguishes them: a valid token connects on the first try.
    */
   private static readonly MAX_FAILED_OPENS = 5;
+  /**
+   * How many consecutive REOPEN failures a lane that HAS worked may suffer before its token is
+   * declared dead.
+   *
+   * THE DEFECT THIS CLOSES. The escalation used to be gated on `!everOpened && !this.everOpened` —
+   * i.e. the lane had to have never opened in its entire lifetime. `everOpened` is set once at the
+   * first handshake and never reset, so after the lane connected at 09:10 the whole escalation block
+   * became unreachable: `consecutiveFailedOpens` stopped incrementing and `onDead` could never fire
+   * again.
+   *
+   * That is exactly the DEFAULT daily path. Kite invalidates an access token every morning around
+   * 06:00 IST regardless of activity, and also the instant the operator signs in anywhere else (one
+   * active token per api_key). A process that stays up across either event sees its socket close and
+   * every reconnect refused at the HTTP upgrade — which surfaces as 1006, so `isAuthClose` (1008 /
+   * 4001 / 4401 / 4403) does not fire either. The lane then reconnect-looped forever at the 15s cap
+   * while `index.ts`'s auth-death wiring never ran: the token was never cleared from memory, the
+   * encrypted session row was never invalidated, the health machine never reached AUTH_EXPIRED, and
+   * the engine's books were never dropped. The operator was shown `authenticated: true` with
+   * `problems: []` against a corpse.
+   *
+   * A SEPARATE, HIGHER THRESHOLD rather than reusing MAX_FAILED_OPENS, because the two situations
+   * carry different evidence. A lane that never opened has probably never had a valid token. A lane
+   * that HAS opened has proven the token worked, so a burst of failures is more likely a genuine
+   * network outage — and declaring the token dead is destructive (it clears the stored session and
+   * requires a manual sign-in). 12 attempts against the capped backoff is roughly two and a half
+   * minutes of continuous upgrade refusal, which no transient blip survives and which is still
+   * fast enough that an operator learns the truth while the session still matters.
+   */
+  private static readonly MAX_FAILED_REOPENS = 12;
 
   constructor(private readonly opts: ZerodhaFeedOptions) {
     this.lane = opts.lane;
@@ -217,22 +250,45 @@ export class ZerodhaFeed {
         }
 
         /*
-         * A socket that has NEVER completed a handshake is the ambiguous case, because Kite rejects
-         * a bad access token by refusing the HTTP upgrade, which surfaces as an ordinary abnormal
-         * close (1006) rather than a policy code. Retrying forever against a dead token would spin
+         * A socket that closed WITHOUT completing a handshake is the ambiguous case, because Kite
+         * refuses a bad access token at the HTTP upgrade and that arrives as an ordinary abnormal
+         * close (1006) rather than a policy code. Retrying forever against a dead token spins
          * silently; declaring the token dead on the first 1006 would kill the lane over a transient
-         * DNS failure. So we retry a BOUNDED number of times and only then report a lost session —
-         * a valid token normally connects on the first attempt, so repeated failure to ever open is
+         * DNS failure. So we retry a BOUNDED number of times and only then report a lost session — a
+         * valid token normally connects on the first attempt, so repeated failure to ever open is
          * genuine evidence, whereas a single failure is not.
+         *
+         * THE BOUND APPLIES TO REOPENS TOO, and that is the important part. This condition used to
+         * be `!everOpened && !this.everOpened`, which required the lane to have never opened in its
+         * whole lifetime — so once it had connected, the escalation was permanently unreachable and a
+         * token invalidated mid-session (the daily ~06:00 IST expiry, or a concurrent sign-in
+         * elsewhere) reconnect-looped forever while every health signal still read "authenticated".
+         *
+         * The threshold differs by evidence: a lane that never opened probably never had a valid
+         * token, while a lane that HAS opened proved the token worked, so it is given a longer run
+         * before something as destructive as clearing the stored session is done to it.
          */
-        if (!everOpened && !this.everOpened) {
+        if (!everOpened) {
           this.consecutiveFailedOpens++;
-          if (this.consecutiveFailedOpens >= ZerodhaFeed.MAX_FAILED_OPENS) {
+          const limit = this.everOpened
+            ? ZerodhaFeed.MAX_FAILED_REOPENS
+            : ZerodhaFeed.MAX_FAILED_OPENS;
+          if (this.consecutiveFailedOpens >= limit) {
+            const fault = this.lastFault ? `, last error: ${this.lastFault}` : "";
             this.opts.onDead?.(
-              `Kite feed could not establish a session in ${this.consecutiveFailedOpens} attempts ` +
-                `(last close code ${code}${this.lastFault ? `, last error: ${this.lastFault}` : ""}). ` +
-                `The access token is most likely invalid or expired; sign in again to replace it.`,
+              this.everOpened
+                ? `Kite feed could not RE-establish a session in ${this.consecutiveFailedOpens} ` +
+                  `consecutive attempts since it was last connected (last close code ${code}${fault}). ` +
+                  `This lane was working earlier, so the access token has most likely been ` +
+                  `invalidated — Kite expires it daily around 06:00 IST and immediately if the ` +
+                  `account signs in elsewhere. Sign in again to replace it.`
+                : `Kite feed could not establish a session in ${this.consecutiveFailedOpens} attempts ` +
+                  `(last close code ${code}${fault}). ` +
+                  `The access token is most likely invalid or expired; sign in again to replace it.`,
             );
+            // Reset the streak so a later out-of-band `onSessionRestored` + re-login starts from a
+            // clean budget instead of inheriting a spent one and dying on its first hiccup.
+            this.consecutiveFailedOpens = 0;
             return;
           }
         }
@@ -363,7 +419,21 @@ export class ZerodhaFeed {
   private scheduleReconnect(): void {
     if (this.disposed || this.reconnectTimer !== null) return;
     if (this.wanted.size === 0) return; // nothing to stream: do not hold a socket open
-    const delay = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** this.reconnectAttempts);
+    /*
+     * Capped exponential backoff WITH JITTER.
+     *
+     * The jitter is not cosmetic. Both Zerodha lanes (the futures/hub lane and the Box option lane)
+     * are driven by the same credentials and are knocked over by the same events — a token expiry, a
+     * network partition, a Kite-side restart. Without jitter they retry in lockstep for as long as
+     * the fault lasts, so every attempt arrives as a simultaneous pair against the same api_key and
+     * the same endpoint, which is the worst possible shape for a server that is already refusing
+     * connections. It also means the two lanes exhaust their failed-reopen budgets at the same
+     * instant and declare the token dead twice.
+     *
+     * Full jitter over [delay/2, delay) keeps the growth curve while decorrelating the lanes.
+     */
+    const backoff = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** this.reconnectAttempts);
+    const delay = Math.round(backoff / 2 + Math.random() * (backoff / 2));
     this.reconnectAttempts++;
     this.reconnects++;
     this.reconnectTimer = setTimeout(() => {

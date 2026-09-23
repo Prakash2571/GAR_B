@@ -102,6 +102,12 @@ import {
   type BoxExecutionGateway,
 } from "./executionGateway.js";
 import {
+  residualBrokerRejections,
+  residualRejectionBudgetExhausted,
+} from "./residualFlatten.js";
+import { evaluateSessionEntryWindow } from "../marketCalendar.js";
+import { tradingDaysUntil } from "../marketCalendar.js";
+import {
   adoptObservedFlattenCharges,
   compactObservedFlattenChargeWatermarks,
   compactResidualProjectionBookkeeping,
@@ -917,6 +923,23 @@ export class BoxEngine {
   /** Attempt ids whose residual is being flattened right now (concurrency guard). */
   private residualFlattenInFlight = new Set<string>();
   /**
+   * Attempt ids whose residual exhausted its broker-rejection retry budget and has already been
+   * escalated to the operator.
+   *
+   * Once a reduction has been terminally refused `MAX_RESIDUAL_BROKER_REJECTIONS` times with zero
+   * fill each time, retrying is pointless (an F&O ban period, an expired contract and a standing
+   * RMS block do not clear on the next two-second tick) and each attempt spends an order request
+   * from the daily budget that protective work for other positions depends on. So the loop stops
+   * submitting — but it must say so exactly ONCE, not raise the same invariant every two seconds
+   * for the rest of the session.
+   *
+   * The exposure is NEVER removed from `residualByAttempt`: it keeps counting toward
+   * `residualLegCount()`, so new entry stays blocked and the readiness surface keeps naming it.
+   * Deliberately in-memory only — a restart re-escalates, which is correct, because a restart is
+   * also the moment the condition may genuinely have cleared.
+   */
+  private residualRejectionEscalated = new Set<string>();
+  /**
    * The armed session id that authorised the most recent admitted entry attempt, re-checked at the
    * POST boundary. Null when no attempt has been admitted, or when sessions are not enforcing.
    */
@@ -1407,6 +1430,9 @@ export class BoxEngine {
                 // Only bound the SOURCE timestamp when the feed actually supplies one; the helper
                 // skips the check for a book with no exchange timestamp rather than faking freshness.
                 sourceMaxAgeMs: this.cfg.quoteMaxAgeMs,
+          // The SAME tolerance the four-leg coherence gate uses, so the two admission layers cannot
+          // disagree about whether a 1-second-granular exchange stamp is a clock fault.
+          maxExchangeAheadOfReceiveMs: this.cfg.maxExchangeAheadOfReceiveMs,
                 // ONE LOT PER LEG — the same quantity executionGateway.request() actually sends
                 // (`quantity: args.candidate.lot_size`), so the depth requirement checked here is the
                 // depth the order will really need rather than a guess.
@@ -1562,6 +1588,23 @@ export class BoxEngine {
       // The session cycle budget, INTERSECTED with "is the residual picture known?". ENTRY only;
       // every reduction path bypasses it.
       sessionEntryGate: () => this.entryGateVerdict(),
+      /*
+       * The SESSION TIMING window for a new box. Pure clock + calendar arithmetic, evaluated fresh
+       * on every decision rather than cached off the 15-second market poll — a cutoff that is
+       * re-read every 15 seconds would admit an entry up to 15 seconds past its own deadline, and
+       * near the bell that is precisely the margin being protected.
+       *
+       * ENTRY ONLY. Deliberately NOT wired into `coordinateExit`, `acquireForExit` or
+       * `flattenResidual`.
+       */
+      sessionEntryWindow: () => {
+        const verdict = evaluateSessionEntryWindow({
+          at: this.executionClock.wall(),
+          cutoffMinutesBeforeClose: this.cfg.entryCutoffMinutesBeforeClose,
+          warmupMinutesAfterOpen: this.cfg.sessionWarmupMinutesAfterOpen,
+        });
+        return { allowed: verdict.allowed, refusal: verdict.refusal, detail: verdict.detail };
+      },
       // CONSUME AN ATTEMPT AT ADMISSION. Called by the coordinator after every cheap gate has
       // passed and BEFORE any reservation or broker POST, so an attempt that then fails has still
       // spent its budget — which is the entire point of bounding attempts rather than completions.
@@ -3633,7 +3676,52 @@ export class BoxEngine {
     this.instrumentCount = all.length;
     if (all.length > 0) this.instrumentsLoadedAt = now;
 
-    this.chains = indexOptionChains(all, today);
+    /*
+     * PER-UNDERLYING EXPIRY DISTANCE, because index and stock underlyings settle differently.
+     *
+     * Index options are CASH settled; stock options are PHYSICALLY settled, and NSE ramps
+     * physical-delivery margin on ITM long options from several days before expiry. So a stock chain
+     * needs to be further from settlement than an index chain to be safe to open, and the stock rule
+     * is applied as a MAXIMUM with the index rule rather than a replacement — raising the index
+     * minimum therefore also raises the stock one, which is the only composition that cannot be
+     * configured into being looser than intended.
+     */
+    const isIndexUnderlying = new Map(board.map((b) => [b.symbol, b.is_index === true]));
+    const indexMinDays = this.cfg.minTradingDaysToExpiry;
+    const stockMinDays = Math.max(indexMinDays, this.cfg.stockMinTradingDaysToExpiry);
+    this.chains = indexOptionChains(all, today, {
+      minTradingDays: indexMinDays,
+      // Resolved per underlying inside the selection walk, so a stock and an index can land on
+      // different series in one pass.
+      tradingDaysUntil: (from, to) => tradingDaysUntil(from, to),
+    });
+    /*
+     * Re-select for stock underlyings that need a longer runway, and DROP stock underlyings entirely
+     * unless the operator has opted in.
+     *
+     * Done as a second pass rather than threaded through `indexOptionChains` because that function is
+     * pure over the dump and has no notion of the board — `is_index` lives on the board row, which is
+     * the only place the index/stock distinction is known.
+     */
+    for (const [symbol, chain] of [...this.chains]) {
+      const isIndex = isIndexUnderlying.get(symbol) === true;
+      if (isIndex) continue;
+      if (!this.cfg.allowStockUnderlyings) {
+        this.chains.delete(symbol);
+        continue;
+      }
+      const days = chain.trading_days_to_expiry;
+      if (stockMinDays > 0 && (days === null || days < stockMinDays)) {
+        // Rebuild this one underlying against the stricter rule rather than guessing a replacement
+        // series, so the recorded `skipped_near_expiries` stays truthful.
+        const restricted = indexOptionChains(all.filter((i) => i.name === symbol), today, {
+          minTradingDays: stockMinDays,
+          tradingDaysUntil: (from, to) => tradingDaysUntil(from, to),
+        }).get(symbol);
+        if (restricted) this.chains.set(symbol, restricted);
+        else this.chains.delete(symbol);
+      }
+    }
     this.board = prioritiseUniverse(board.filter((b) => this.chains.has(b.symbol)));
     // Recorded BEFORE and AFTER the join, because "no board rows" and "the board and the chains do
     // not intersect" have completely different causes and identical symptoms.
@@ -6535,6 +6623,34 @@ export class BoxEngine {
        */
       const foreign = this.residualOwnershipMismatch(attemptId);
       if (foreign !== null) continue;
+      /*
+       * STOP RETRYING A REDUCTION THE BROKER KEEPS REFUSING — but keep holding and reporting it.
+       *
+       * A broker rejection retires the flatten generation so the exposure can genuinely be retried
+       * (retaining the identity used to strand it permanently). The bound is the other half of that
+       * change: a reduction refused MAX_RESIDUAL_BROKER_REJECTIONS times running, with zero fill
+       * every time, is structurally impossible rather than unlucky. Escalated once, then skipped —
+       * the exposure stays in `residualByAttempt`, so it keeps blocking new entry and keeps
+       * appearing on the readiness surface. A human has to clear it.
+       */
+      if (residual.some(residualRejectionBudgetExhausted)) {
+        if (!this.residualRejectionEscalated.has(attemptId)) {
+          this.residualRejectionEscalated.add(attemptId);
+          const stuck = residual
+            .filter(residualRejectionBudgetExhausted)
+            .map((r) => `${r.role} ${r.side} ${r.quantity} ${r.tradingsymbol} ` +
+              `(${residualBrokerRejections(r)} broker rejections)`)
+            .join(", ");
+          this.execution.invariantViolation(
+            `residual ${attemptId} has STOPPED automatic flattening: [${stuck}]. Every reduction was ` +
+              `terminally rejected by the broker with zero fill. The exposure is STILL HELD. Check for ` +
+              `an F&O ban period, an expired contract, an RMS block or a margin shortfall, then flatten ` +
+              `manually.`,
+          );
+          this.metrics.recordResidualFlattenFailure();
+        }
+        continue;
+      }
       this.residualFlattenInFlight.add(attemptId);
       this.metrics.recordResidualFlattenAttempt();
       try {
@@ -7883,6 +7999,33 @@ export class BoxEngine {
         scope: "entry",
         detail: "The exchange is closed: prices shown are last-close and nothing can be entered.",
       });
+    } else {
+      /*
+       * THE SESSION IS OPEN BUT THE ENTRY WINDOW MAY NOT BE.
+       *
+       * Reported separately from `market_closed` because the operator's question is different: an
+       * open market that refuses new boxes is either warming up, past the cutoff, or running on a
+       * calendar year this build has no holiday data for. Reporting all three as "market closed"
+       * would be a lie that hides a configuration problem.
+       *
+       * Scope is ENTRY in every case. Exits, protective cancels and residual flattening are
+       * deliberately unaffected — the cutoff exists so exposure stays reducible for longer than it
+       * is creatable, so turning it into a `both`-scoped blocker would invert its purpose.
+       */
+      const entryWindow = evaluateSessionEntryWindow({
+        at: this.executionClock.wall(),
+        cutoffMinutesBeforeClose: this.cfg.entryCutoffMinutesBeforeClose,
+        warmupMinutesAfterOpen: this.cfg.sessionWarmupMinutesAfterOpen,
+      });
+      if (!entryWindow.allowed && entryWindow.refusal !== null) {
+        engineBlockers.push({
+          code: entryWindow.refusal,
+          scope: "entry",
+          detail:
+            `${entryWindow.detail ?? "new entry is outside the session entry window"}. ` +
+            `Existing positions are still monitored, exitable and protectively cancellable.`,
+        });
+      }
     }
     /*
      * THE BLOCKLIST IS UNREADABLE. Scoped `entry`, never `both`: not knowing which names are

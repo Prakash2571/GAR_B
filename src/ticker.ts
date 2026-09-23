@@ -346,14 +346,53 @@ export function parseBinary(buf: ArrayBuffer): Tick[] {
 }
 
 /**
+ * Kite's exchange-segment constants, which live in the LOW 8 BITS of an instrument token.
+ *
+ * Verbatim from the official client (`pykiteconnect/kiteconnect/ticker.py` `EXCHANGE_MAP`), because
+ * this is exactly the kind of table that is easy to get subtly wrong from memory — and did get
+ * wrong here (see {@link priceDivisor}).
+ */
+const KITE_SEGMENT = {
+  NSE: 1,
+  NFO: 2,
+  CDS: 3,
+  BSE: 4,
+  BFO: 5,
+  BCD: 6,
+  MCX: 7,
+  MCXSX: 8,
+  INDICES: 9,
+  NCO: 12,
+} as const;
+
+/**
  * Price divisor by segment, derived from the instrument token's low 8 bits.
- * NSE/NFO (and most segments) use 100. Currency segments differ; we only
- * stream NSE equities + NFO futures here, so 100 is correct.
+ *
+ * Kite transmits prices as integers scaled by a per-segment factor. The official client applies:
+ *
+ *   CDS (3)            → 10^7   (currency derivatives quote to 4 decimals on a paise-scaled base)
+ *   BCD (6), NCO (12)  → 10^4
+ *   everything else    → 100
+ *
+ * THIS WAS TRANSPOSED. The previous implementation read:
+ *
+ *     if (segment === 3) return 10000000;
+ *     if (segment === 7) return 10000;   // comment claimed "7 = BCD"
+ *
+ * Segment 7 is MCX, not BCD — BCD is 6. So every MCX price would have been divided by 10,000 instead
+ * of 100 (reported 100x too SMALL), every BCD price fell through to 100 (reported 100x too LARGE),
+ * and NCO (12) was unknown entirely. There is no 100x sanity check anywhere downstream, so those
+ * prices would have flowed silently into the quote store.
+ *
+ * Latent rather than live today: the box lane streams only NSE (1), NFO (2) and INDICES (9), all of
+ * which correctly fall through to 100. It mattered because the COMMENT asserted a mapping that was
+ * factually wrong, so the next person to widen the universe to currency or commodity instruments
+ * inherited a silent pricing bug — and a box priced off a 100x-wrong leg is an "arbitrage" that
+ * looks enormous and is entirely fictional.
  */
 function priceDivisor(token: number): number {
   const segment = token & 0xff;
-  // 3 = CDS (currency) → 10^7 ; 7 = BCD → 10^4 ; everything else → 100.
-  if (segment === 3) return 10000000;
-  if (segment === 7) return 10000;
+  if (segment === KITE_SEGMENT.CDS) return 10_000_000;
+  if (segment === KITE_SEGMENT.BCD || segment === KITE_SEGMENT.NCO) return 10_000;
   return 100;
 }

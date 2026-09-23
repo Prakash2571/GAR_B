@@ -49,6 +49,45 @@ import type { ResidualLegExposure } from "./types.js";
 export const FIRST_RESIDUAL_FLATTEN_ATTEMPT = 1;
 
 /**
+ * How many PROVEN-ZERO-EXPOSURE broker rejections a residual may retry through before the
+ * flatten loop stops POSTing and escalates to the operator.
+ *
+ * Sized for the failure it exists to survive: a transient refusal (a momentary margin shortfall
+ * while another box is legging, a `market_closed` race on the 15:30 boundary, a one-off RMS
+ * hiccup) clears within a pass or two. A structural refusal — F&O ban period, expired contract,
+ * a standing RMS block on the symbol — never clears, and each retry costs an order request from
+ * the daily budget that protective work for OTHER positions depends on. Five attempts at the
+ * 2-second flatten cadence spends ~10 seconds and 5 order requests before handing over to a
+ * human, which is the right trade against leaving a naked option leg unmanaged.
+ */
+export const MAX_RESIDUAL_BROKER_REJECTIONS = 5;
+
+/**
+ * CONSECUTIVE broker rejections already suffered by this residual, read defensively.
+ *
+ * Reset by any pass that reduces the outstanding quantity — a fill proves the reduction is
+ * possible, so a later unrelated refusal starts from a full budget. Legacy rows and corrupt values
+ * read as zero: the safe reading, because zero means the retry budget is intact and the exposure
+ * will still be worked rather than abandoned.
+ */
+export function residualBrokerRejections(residual: ResidualLegExposure): number {
+  const raw = residual.flatten_broker_rejections;
+  if (typeof raw !== "number" || !Number.isFinite(raw) || raw <= 0) return 0;
+  return Math.floor(raw);
+}
+
+/**
+ * Whether this residual has any rejection-retry budget left.
+ *
+ * At the bound the flatten loop must STOP submitting: a reduction the broker refuses five times
+ * running is not going to succeed on the sixth, and each attempt consumes the account's order
+ * budget. The exposure is retained, reported, and escalated rather than silently re-POSTed.
+ */
+export function residualRejectionBudgetExhausted(residual: ResidualLegExposure): boolean {
+  return residualBrokerRejections(residual) >= MAX_RESIDUAL_BROKER_REJECTIONS;
+}
+
+/**
  * Upper bound on how far the durable journal is probed when a residual arrives with no
  * generation of its own (crash-recovery exposure derived from the intent journal rather than
  * read from a persisted residual). Bounded so a pathological journal cannot spin.
@@ -67,8 +106,10 @@ export type ResidualFlattenDisposition =
   | "flattened"
   /**
    * This identity reached an outcome that permits a NEW generation: COMPLETE/CANCELLED broker
-   * truth left quantity, or a local pre-POST refusal proves no broker mutation occurred. A
-   * broker-origin REJECTED does not enter this state; its identity is retained deliberately.
+   * truth left quantity, a local pre-POST refusal proves no broker mutation occurred, or the
+   * broker terminally REJECTED it with zero exposure proven (a rejected order holds no quantity,
+   * so a fresh identity cannot duplicate a fill). Rejection-driven retirement is bounded by
+   * {@link MAX_RESIDUAL_BROKER_REJECTIONS}.
    */
   | "retire_attempt"
   /**
@@ -97,6 +138,16 @@ export type ResidualFlattenFailureKind =
   | "local_pre_submit_refused"
   /** The broker refused the order and said so. A known outcome. */
   | "broker_rejected"
+  /**
+   * The broker has now refused this reduction {@link MAX_RESIDUAL_BROKER_REJECTIONS} times with
+   * zero exposure proven each time. The retry budget is spent, so the loop stops POSTing and the
+   * exposure is escalated to the operator instead of being re-sent every two seconds forever.
+   *
+   * This is the terminal state of a STRUCTURALLY impossible reduction — an F&O ban period, an
+   * expired contract, a standing RMS block. The exposure is still held and still reported; what
+   * stops is the automatic retry.
+   */
+  | "broker_rejection_budget_exhausted"
   /** The broker filled it but the durable snapshot failed. Broker truth wins. */
   | "persistence_after_fill"
   /** Ambiguous/timed-out submission, or an intent needing reconciliation. Quarantine. */
@@ -179,6 +230,12 @@ export function carryResidualForward(
   attempt: number,
   disposition: ResidualFlattenDisposition,
   accounting?: ResidualFlattenAccounting,
+  /**
+   * The failure this pass ended in, when there was one. Only used to count broker rejections, so
+   * the bounded retry budget survives a restart — it is persisted by the same atomic `$set` as the
+   * quantity and the generation, exactly like the accounting watermarks.
+   */
+  failure?: ResidualFlattenFailureKind | null,
 ): ResidualLegExposure {
   const retires = disposition === "retire_attempt";
   const nextAttempt = retires ? attempt + 1 : attempt;
@@ -191,11 +248,22 @@ export function carryResidualForward(
   // quantity on its durable intent), and the next terminal pass would re-credit and re-bill it.
   const accountedFilled = retires ? 0 : accounting?.cumulativeFilled ?? residual.flatten_accounted_filled;
   const accountedCharges = retires ? 0 : accounting?.cumulativeCharges ?? residual.flatten_accounted_charges;
+  // CONSECUTIVE rejections, not lifetime ones. The count is deliberately NOT reset when the
+  // generation retires — retirement is exactly what a rejection now causes, so resetting there
+  // would make the budget infinite and reinstate the unbounded-retry hazard the bound exists to
+  // prevent. It IS reset by evidence that the reduction is genuinely possible: any positive fill on
+  // this pass (the outstanding quantity shrank) proves the broker will accept this order, so a
+  // later unrelated refusal starts from a full budget rather than inheriting old failures.
+  const filled = quantity < residual.quantity;
+  const priorRejections = filled ? 0 : residualBrokerRejections(residual);
+  const rejections = priorRejections + (failure === "broker_rejected" ? 1 : 0);
   const next: ResidualLegExposure = { ...residual, quantity, flatten_attempt: nextAttempt };
   if (accountedFilled === undefined) delete next.flatten_accounted_filled;
   else next.flatten_accounted_filled = accountedFilled;
   if (accountedCharges === undefined) delete next.flatten_accounted_charges;
   else next.flatten_accounted_charges = accountedCharges;
+  if (rejections > 0) next.flatten_broker_rejections = rejections;
+  else delete next.flatten_broker_rejections;
   return next;
 }
 
@@ -203,16 +271,22 @@ export function carryResidualForward(
  * Classify a broker order returned by a residual submission.
  *
  * Terminal COMPLETE/CANCELLED is the only broker truth that retires an identity when quantity
- * remains. REJECTED is terminal at the broker but intentionally retained until an explicit
- * operator/reconciliation policy authorises a new order. Working/unknown outcomes likewise keep
- * their identity so a second reduction cannot race a fill.
+ * remains. REJECTED also retires — a rejected order holds no quantity, so a fresh identity cannot
+ * duplicate a fill, and retaining it stranded the exposure permanently (see
+ * {@link dispositionForFailure}). The caller bounds how many rejections are retried.
+ * Working/unknown outcomes keep their identity so a second reduction cannot race a fill.
  */
 export function classifyResidualOrder(
   order: BrokerOrder,
   requested: number,
 ): ResidualFlattenDisposition {
   if (!isBrokerOrderTerminal(order.state)) return "adopt_attempt";
-  if (order.state === "REJECTED") return "adopt_attempt";
+  if (order.state === "REJECTED") {
+    // A rejection that contradicts an observed fill is NOT zero-exposure truth. The gateway
+    // re-verifies this with `verifyZeroBrokerExposure` on the error path; here the snapshot itself
+    // is the only evidence, so a non-zero fill keeps the identity for reconciliation.
+    return order.filled_quantity > 0 ? "adopt_attempt" : "retire_attempt";
+  }
   return order.filled_quantity >= requested ? "flattened" : "retire_attempt";
 }
 
@@ -237,7 +311,12 @@ export function classifyResidualFlattenErrorMessage(message: string): ResidualFl
   return "unexpected";
 }
 
-/** The disposition implied by a failure kind. Only `identity_conflict` may advance. */
+/**
+ * The disposition implied by a failure kind.
+ *
+ * `identity_conflict`, `local_pre_submit_refused` and `broker_rejected` may advance the
+ * generation; nothing else may.
+ */
 export function dispositionForFailure(kind: ResidualFlattenFailureKind): ResidualFlattenDisposition {
   switch (kind) {
     case "no_executable_book":
@@ -250,8 +329,29 @@ export function dispositionForFailure(kind: ResidualFlattenFailureKind): Residua
       // The applied structured audit proves the broker was never called, so a new identity is safe.
       return "retire_attempt";
     case "broker_rejected":
-      // Broker-origin rejection is terminal but not permission to manufacture another order.
-      // Retain the durable identity until an operator/reconciliation policy says otherwise.
+      // RETIRE, BOUNDED — this used to be `adopt_attempt`, and that was the single worst defect in
+      // the residual path.
+      //
+      // `adopt_attempt` does not advance `flatten_attempt`, so the next pass regenerated the same
+      // `client_order_id`, the durable journal adopted the REJECTED intent rather than submitting,
+      // and NO FURTHER ORDER WAS EVER SENT. One transient refusal — a momentary margin shortfall
+      // while another box was legging, a `market_closed` race on the 15:30 boundary, a freeze-
+      // quantity or price-band refusal — permanently stranded a naked option leg. New entry stayed
+      // blocked (correctly), so the strategy was dead too, until a human noticed.
+      //
+      // Retiring is safe here, and provably so rather than by assumption: the gateway only reaches
+      // this kind after `verifyZeroBrokerExposure(order).proven`. A rejection that contradicts an
+      // observed fill is classified `broker_state_unknown` instead and still retains its identity.
+      // So at this point the broker holds NO quantity under this identity and a fresh one cannot
+      // duplicate a fill.
+      //
+      // The bound lives in the caller, which counts rejections on the residual and switches to
+      // `broker_rejection_budget_exhausted` once the budget is spent — because the thing that must
+      // not happen is an UNBOUNDED retry against a structurally impossible reduction.
+      return "retire_attempt";
+    case "broker_rejection_budget_exhausted":
+      // The retry budget is spent. Hold the identity so nothing is re-POSTed, and let the invariant
+      // violation carry the exposure to an operator.
       return "adopt_attempt";
     case "identity_conflict":
       // A stale immutable snapshot must never be able to strand exposure. Retire past it.
@@ -280,6 +380,11 @@ export function residualFailurePhrase(kind: ResidualFlattenFailureKind): string 
     case "already_in_flight": return "the same attempt is already queued or in flight";
     case "local_pre_submit_refused": return "current executable-feed authority refused before broker POST";
     case "broker_rejected": return "the broker terminally rejected the reduction";
+    case "broker_rejection_budget_exhausted":
+      return `the broker rejected this reduction ${MAX_RESIDUAL_BROKER_REJECTIONS} times running ` +
+        `with zero fill each time; automatic retry has STOPPED and the exposure is still held — ` +
+        `check for an F&O ban period, an expired contract, an RMS block or a margin shortfall, ` +
+        `then flatten manually`;
     case "persistence_after_fill": return "filled but its durable snapshot failed";
     case "broker_state_unknown": return "uncertain broker terminal quantity; quarantined for reconciliation";
     case "identity_conflict": return "a stale durable intent blocked this attempt; the generation was retired past it";
@@ -292,10 +397,15 @@ export function residualFailurePhrase(kind: ResidualFlattenFailureKind): string 
 /**
  * True when a failure kind must be raised as an invariant violation rather than counted as a
  * routine market outcome. A technical fault is not a market outcome.
+ *
+ * `broker_rejection_budget_exhausted` is included because held exposure the engine has STOPPED
+ * trying to reduce is not a market outcome either — it is the one residual state that requires a
+ * human, so it must reach the operator surface rather than being counted quietly.
  */
 export function residualFailureIsInvariant(kind: ResidualFlattenFailureKind): boolean {
   return kind === "persistence_after_fill" ||
     kind === "broker_state_unknown" ||
     kind === "identity_conflict" ||
+    kind === "broker_rejection_budget_exhausted" ||
     kind === "unexpected";
 }

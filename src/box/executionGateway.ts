@@ -63,10 +63,12 @@ import {
   classifyResidualFlattenErrorMessage,
   classifyResidualOrder,
   dispositionForFailure,
+  residualBrokerRejections,
   residualFailureIsInvariant,
   residualFailurePhrase,
   residualFlattenAttempt,
   residualFlattenAttemptId,
+  residualRejectionBudgetExhausted,
   FIRST_RESIDUAL_FLATTEN_ATTEMPT,
   MAX_RESIDUAL_FLATTEN_ATTEMPT_PROBE,
   type ResidualFlattenFailureKind,
@@ -1729,6 +1731,7 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
           pass.attempt,
           disposition,
           { cumulativeFilled, cumulativeCharges },
+          pass.failure,
         ));
       }
     }
@@ -1792,10 +1795,55 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
       return { residual, attempt, order, disposition: dispositionForFailure(kind), failure: kind, detail };
     };
 
+    /*
+     * BOUNDED RETRY AGAINST A BROKER THAT KEEPS REFUSING.
+     *
+     * A broker rejection now retires the generation so the exposure can actually be retried — the
+     * old `adopt_attempt` policy regenerated the same client_order_id forever and stranded the leg
+     * permanently. The counterpart to that is this bound: a reduction the broker has refused
+     * MAX_RESIDUAL_BROKER_REJECTIONS times running is structurally impossible, not unlucky (F&O ban
+     * period, expired contract, standing RMS block), and every further attempt spends an order
+     * request from the daily budget that protective work for OTHER positions depends on.
+     *
+     * Checked BEFORE the book is read and before any request is built, so an exhausted residual
+     * cannot reach the broker at all. The exposure is retained and reported — only the automatic
+     * retry stops.
+     */
+    if (residualRejectionBudgetExhausted(residual)) {
+      return fail(
+        "broker_rejection_budget_exhausted",
+        `${residual.quantity} ${residual.tradingsymbol} still held (${residual.side} side); ` +
+          `${residualBrokerRejections(residual)} consecutive broker rejections with zero fill`,
+      );
+    }
+
     if (selected.terminalIntent) {
       const order = brokerOrderFromDurableIntent(selected.terminalIntent);
       if (order.state === "REJECTED") {
-        return fail("broker_rejected", order.reject_reason ?? "durable broker rejection", order);
+        /*
+         * VERIFIED, NOT ASSUMED — the same discipline the live error path below applies.
+         *
+         * `broker_rejected` now RETIRES the identity so a transient refusal cannot strand the
+         * exposure forever. That retirement is only safe because a rejected order holds no
+         * quantity. A durable REJECTED intent carrying a non-zero fill is contradictory evidence:
+         * the broker said "refused" about an order it also recorded a fill for. Retiring past that
+         * would mint a fresh identity while the broker still holds quantity under the old one —
+         * i.e. manufacture a duplicate reduction, which is the one outcome this module exists to
+         * prevent.
+         *
+         * So the fill is checked here rather than trusted. Zero-fill replays retire and retry;
+         * anything else is quarantined for reconciliation with its identity intact.
+         */
+        const proven = verifyZeroBrokerExposure(order);
+        return proven.proven
+          ? fail("broker_rejected", order.reject_reason ?? "durable broker rejection", order)
+          : fail(
+              "broker_state_unknown",
+              `durable REJECTED intent does not prove zero exposure ` +
+                `(${proven.disproof ?? "unknown"}: ${proven.detail ?? "no detail"}); ` +
+                `recorded fill ${order.filled_quantity}`,
+              order,
+            );
       }
       const disposition = classifyResidualOrder(order, residual.quantity);
       return { residual, attempt, order, disposition, failure: null, detail: null };
@@ -1846,6 +1894,32 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
       if (disposition === "adopt_attempt") {
         // A working or unknown order still owns this identity. Keep it and reconcile.
         return fail("broker_state_unknown", `order state ${order.state} is not terminal`, order);
+      }
+      /*
+       * A REJECTION THAT ARRIVES AS A RETURN VALUE, NOT AS A THROW.
+       *
+       * `manager.submit` can either throw `BrokerOrderRejectedError` or hand back a terminal REJECTED
+       * snapshot, depending on where the refusal was observed. Both are the same market event and both
+       * must spend the bounded retry budget — routing only the throwing path through `fail()` left the
+       * returned path with `failure: null`, so `carryResidualForward` never incremented the counter and
+       * the bound was unreachable on the more common of the two paths. That is an unbounded re-POST
+       * loop against a structurally impossible reduction, which is the failure the bound exists for.
+       *
+       * Zero exposure is re-verified rather than inferred from the REJECTED label, for the same reason
+       * as the durable-replay path above: retiring past an identity the broker still holds quantity
+       * under would manufacture a duplicate reduction.
+       */
+      if (order.state === "REJECTED") {
+        const proven = verifyZeroBrokerExposure(order);
+        return proven.proven
+          ? fail("broker_rejected", order.reject_reason ?? "broker rejected the reduction", order)
+          : fail(
+              "broker_state_unknown",
+              `REJECTED snapshot does not prove zero exposure ` +
+                `(${proven.disproof ?? "unknown"}: ${proven.detail ?? "no detail"}); ` +
+                `recorded fill ${order.filled_quantity}`,
+              order,
+            );
       }
       return { residual, attempt, order, disposition, failure: null, detail: null };
     } catch (error) {
@@ -1934,6 +2008,41 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     this.deps.manager?.invariantViolation(reason);
   }
 
+  /**
+   * The chase band for one execution phase, in ticks.
+   *
+   * THE ASYMMETRY IS THE POINT. Entry and reduction are priced against DIFFERENT ceilings because
+   * they have opposite failure costs:
+   *
+   *   entry      — optional. A band too narrow means the box is not entered. Nothing is lost, so the
+   *                ceiling is tight (`liveMaxChaseTicks`, default 2) and an operator may set it to 0.
+   *   exit       — not optional. The position already exists; a band too narrow means it stays open.
+   *   unwind     — not optional, and worse: the exposure is a PARTIAL box, so the un-reduced legs are
+   *                directional. This is the most urgent order the system ever sends.
+   *
+   * This used to be `min(liveMaxChaseTicks, phase === "unwind" ? unwindMaxChaseTicks :
+   * legMaxChaseTicks)`, i.e. `min(2, 5) = 2` on the shipped defaults — so the documented unwind
+   * escalation was clamped away and every order the engine could ever produce, for any purpose, was
+   * priced at ±2 ticks. Since there is no market-order fallback anywhere in this system (by design),
+   * that made ±2 ticks the global maximum aggression, and a residual leg in a spread wider than
+   * ₹0.10 could not be flattened at all: it rested, cancelled at 0, and re-POSTed at the same price
+   * every 2 seconds while staying naked.
+   *
+   * Reductions are still BOUNDED — `liveMaxReductionChaseTicks` is a real ceiling and the order is
+   * still a marketable limit, so the book can never be walked past it. What changed is that the
+   * bound is now wide enough to actually cross a wide options spread.
+   */
+  private maxChaseTicksFor(phase: "entry" | "exit" | "unwind"): number {
+    const cfg = this.deps.cfg;
+    if (phase === "entry") return Math.min(cfg.liveMaxChaseTicks, cfg.legMaxChaseTicks);
+    // EXIT and UNWIND are both reductions and share one ceiling. `legMaxChaseTicks` is documented as
+    // the ENTRY band and is deliberately no longer consulted here: reusing the entry band for exits
+    // is what made a tightly-tuned entry configuration also trap the exposure it created. The paper
+    // simulator keeps using `unwindMaxChaseTicks` so recorded paper fixtures are unaffected; this
+    // knob governs the live wire only.
+    return cfg.liveMaxReductionChaseTicks;
+  }
+
   private request(args: {
     role: BoxLegRole;
     inst: BoxOptionInstrument;
@@ -1950,7 +2059,7 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
       quantity: args.quantity,
       referencePrice: args.referencePrice,
       tickSize: args.inst.tick_size ?? this.deps.cfg.defaultTickSize,
-      maxChaseTicks: Math.min(this.deps.cfg.liveMaxChaseTicks, args.phase === "unwind" ? this.deps.cfg.unwindMaxChaseTicks : this.deps.cfg.legMaxChaseTicks),
+      maxChaseTicks: this.maxChaseTicksFor(args.phase),
     });
     return {
       client_order_id: boxClientOrderId({ tradeId: args.tradeId, purpose: args.purpose, role: args.role, attempt: args.attemptId }),

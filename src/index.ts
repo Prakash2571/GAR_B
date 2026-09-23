@@ -478,6 +478,40 @@ onFeedSessionLost = () => boxModule.engine.onSessionLost();
 forgetZerodhaSessionOnFeedDeath = () =>
   brokerManager.forgetZerodhaSession("Zerodha rejected the session — sign in to Zerodha again");
 
+/*
+ * THE REST PATH NOW ESCALATES SESSION DEATH THE SAME WAY THE WEBSOCKET PATH DOES.
+ *
+ * `KiteClient` used to end every authenticated read with a bare `clearSession()`, which clears
+ * IN-PROCESS state only. The ticker-hub callback above does four things for the same event: clears
+ * the in-memory token, forgets the session METADATA, invalidates the ENCRYPTED ROW in
+ * `broker_sessions`, and tells the engine to drop its cached books. The REST path did one of the four.
+ *
+ * What that cost: the operator signs in to kite.zerodha.com or the Kite mobile app mid-session — Kite
+ * permits one active access_token per api_key, so the API token dies immediately. The next REST call
+ * 403s and clears memory, but the stored row still carries TODAY's `login_date` and the matching api
+ * key. Any restart — a deploy, an OOM kill, systemd — re-adopts that corpse and reports
+ * `authenticated: true` / `data_ready: true` / `trading_ready: true`. The Box engine then arms
+ * against it and every leg POST 403s, which on a four-leg box is a partially filled spread that can
+ * neither be completed nor cancelled, with the dashboard claiming health the whole time.
+ *
+ * Deliberately NOT awaited and individually guarded: this runs inside a REST error path that is
+ * already handling a broker failure, and a PostgreSQL hiccup while invalidating a session must not
+ * replace or mask the error the caller is about to see. The in-memory token is cleared by
+ * `noteAuthFailure` before this is reached, which is the part that stops the process hammering Kite
+ * with a credential it now knows is dead.
+ */
+kite.setAuthFailureHandler(({ status, endpoint }) => {
+  console.warn(
+    `[Zerodha] HTTP ${status} on ${endpoint} — the broker rejected this session. ` +
+      `Clearing it and invalidating the stored copy so a restart cannot re-adopt a dead token.`,
+  );
+  forgetZerodhaSessionOnFeedDeath?.();
+  void brokerSessionInternals
+    .invalidateSession("zerodha", "rest_auth_failure")
+    .catch(() => undefined);
+  onFeedSessionLost?.();
+});
+
 /**
  * Give the broker manager its view of live exposure and the teardown hooks a switch
  * needs. Done here rather than in the constructor because the engine must exist

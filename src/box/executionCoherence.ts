@@ -237,6 +237,22 @@ export interface CoherencePolicy {
   maxExchangeAheadOfReceiveMs: number;
 }
 
+/**
+ * The shared "ahead of receive time" tolerance, in ms.
+ *
+ * EXPORTED so `candidateMarketData` uses the SAME number. Two admission layers read the same
+ * exchange-timestamp input, and they used to disagree completely: this layer tolerated 1500ms and
+ * documented exactly why, while `candidateMarketData` rejected ANY negative source age. Under a host
+ * clock a second or two behind NSE's, that zero-tolerance test failed all four legs at once and
+ * silently stopped every entry — reported as "stale at the exchange", which is the opposite of the
+ * truth. A shared constant is what stops the two drifting apart again.
+ *
+ * The 1.5s figure covers the two real causes: Kite's exchange timestamp is 1-second granular (the
+ * parser floors it, so a book can carry a stamp up to 999ms off its true publish instant), and the
+ * exchange clock and the host clock are never perfectly synchronised.
+ */
+export const DEFAULT_MAX_EXCHANGE_AHEAD_MS = 1_500;
+
 /** Why a coherence decision failed — a small, stable, low-cardinality vocabulary. */
 export type CoherenceRejectReason =
   | "missing_book"
@@ -303,7 +319,8 @@ export function livePolicyFromConfig(cfg: {
     maxReceiveToExchangeDelayMs: cfg.maxReceiveToExchangeDelayMs ?? 5_000,
     // Kite's exchange stamp is 1s-granular and clocks differ, so tolerate up to
     // ~1.5s of "ahead" skew before calling it a future-clock fault.
-    maxExchangeAheadOfReceiveMs: cfg.maxExchangeAheadOfReceiveMs ?? 1_500,
+    maxExchangeAheadOfReceiveMs:
+      cfg.maxExchangeAheadOfReceiveMs ?? DEFAULT_MAX_EXCHANGE_AHEAD_MS,
   };
 }
 

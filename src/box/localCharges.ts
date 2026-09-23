@@ -86,6 +86,14 @@ export interface BoxChargeRates {
   /** STT on option SALES, percent of premium. */
   sttSellPct: number;
   /**
+   * STT on option EXERCISE, percent of INTRINSIC value, charged to the option BUYER.
+   *
+   * A different tax on a different base from {@link sttSellPct}, and kept as its own rate for that
+   * reason even when the two happen to be numerically equal: premium STT is paid by the writer at the
+   * moment of sale, exercise STT by the holder at settlement. They have moved independently before.
+   */
+  sttExercisePct: number;
+  /**
    * How STT is rounded. Zerodha's contract note rounds the STT head to the
    * NEAREST RUPEE, not to paise — so ₹33.75 of computed STT is billed as ₹34.
    * Modelled explicitly here (via `roundStt`) rather than assuming every head
@@ -142,6 +150,21 @@ export function loadBoxChargeRates(): BoxChargeRates {
      * if it has moved again.
      */
     sttSellPct: num("BOX_STT_SELL_PCT", 0.15),
+    /**
+     * STT on option EXERCISE, percent of INTRINSIC value, charged to the BUYER.
+     *
+     * 0.15% since 1 April 2026, raised from 0.125% in the same Budget 2026 revision that took
+     * sell-side premium STT from 0.10% to 0.15%. Verify against zerodha.com/charges and override if
+     * it moves again.
+     *
+     * A SEPARATE RATE FROM {@link BoxChargeRates.sttSellPct}, even though the two are numerically
+     * equal today, because they are different taxes on different bases: sell-side STT is a percentage
+     * of PREMIUM paid by the writer at the time of sale, exercise STT is a percentage of INTRINSIC
+     * VALUE paid by the holder at settlement. They have moved independently before (0.0625→0.10 on
+     * premium in Oct 2024 left exercise at 0.125) and will again, so collapsing them into one knob
+     * would guarantee a wrong number the next time only one changes.
+     */
+    sttExercisePct: num("BOX_STT_EXERCISE_PCT", 0.15),
     sttRoundNearestRupee: bool("BOX_STT_ROUND_NEAREST_RUPEE", true),
     exchangeTxnPct: num("BOX_EXCHANGE_TXN_PCT", 0.03503),
     /**
@@ -311,6 +334,117 @@ export function reverseOrders(orders: BoxChargeOrder[]): BoxChargeOrder[] {
     ...o,
     side: o.side === "BUY" ? ("SELL" as const) : ("BUY" as const),
   }));
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Settlement (hold-to-expiry) charges                                       */
+/* -------------------------------------------------------------------------- */
+
+/** One leg of a box as it stands at expiry, for settlement pricing. */
+export interface BoxSettlementLeg {
+  /** The side we HOLD: BUY = long the option, SELL = short it (we wrote it). */
+  side: OrderSide;
+  tradingsymbol: string;
+  instrument_type: "CE" | "PE";
+  strike: number;
+  quantity: number;
+}
+
+/** What holding a box to settlement costs, per head. */
+export interface BoxSettlementCharges {
+  /**
+   * STT on EXERCISE: 0.15% of intrinsic value, charged to the BUYER of an ITM option.
+   *
+   * Rounded by the same statutory nearest-rupee rule as sell-side STT.
+   */
+  stt_exercise: number;
+  /** Total settlement cost (currently exercise STT alone — see the note in the function). */
+  total: number;
+  /** Per-leg intrinsic value at the settlement price, for audit. */
+  legs: {
+    tradingsymbol: string;
+    side: OrderSide;
+    instrument_type: "CE" | "PE";
+    strike: number;
+    quantity: number;
+    /** max(0, S − K) for a call, max(0, K − S) for a put. */
+    intrinsic_per_unit: number;
+    /** Whether this leg is exercised against us paying exercise STT (long AND in the money). */
+    exercised_long: boolean;
+    stt_exercise: number;
+  }[];
+  /** The settlement price the intrinsics were computed against. */
+  settlement_price: number;
+  rate_version: string;
+}
+
+/**
+ * What it costs to let a box go to SETTLEMENT instead of closing it.
+ *
+ * THE GAP THIS FILLS. There was no expiry branch in the economics at all. `BoxChargeOrder` carries
+ * only side/symbol/quantity/price — no strike and no instrument type — so exercise STT was not merely
+ * missing, it was structurally impossible to compute. The consequence was not a small error: the
+ * engine could not compare holding against unwinding, and when a box DID reach settlement (an
+ * illiquid wing inside the expiry-safety window is refused a fill by design, because that window
+ * never invents a price) the realised cost was simply never booked. The position stayed "open" and
+ * contributed stale marks to the day's P&L indefinitely.
+ *
+ * THE ARITHMETIC. Exercise STT is 0.15% of INTRINSIC value (raised from 0.125% effective 1 April
+ * 2026), payable by the BUYER of an option that is exercised. So:
+ *
+ *   - It applies ONLY to legs we are LONG (`side === "BUY"`) and only when they are in the money. A
+ *     short leg is ASSIGNED, and the writer pays no exercise STT — which is why the side test is not
+ *     symmetric and must not be "simplified".
+ *   - A box always has ITM legs. For K1 < S < K2 the two long legs' intrinsics sum to exactly the
+ *     width, so the floor is 0.15% × width × lot — about ₹22 on a 200-wide NIFTY box. Outside the
+ *     strikes it is unbounded in |S − K1|: a box whose lower strike finishes 4,100 points ITM pays
+ *     roughly ₹461 on one 75-lot, several times any edge such a box could show.
+ *
+ * WHAT IS DELIBERATELY NOT MODELLED HERE. Physical settlement of STOCK options produces a delivery
+ * obligation, delivery brokerage, DP charges and a very different STT treatment. Rather than
+ * approximate that, stock underlyings are kept out of the universe by default
+ * (`BOX_ALLOW_STOCK_UNDERLYINGS`); this function is correct for CASH-settled index options and should
+ * not be extended to stocks without modelling delivery properly.
+ *
+ * PURE: no clock, no I/O.
+ */
+export function calculateSettlementCharges(
+  legs: BoxSettlementLeg[],
+  settlementPrice: number,
+  rates: BoxChargeRates,
+): BoxSettlementCharges {
+  const priced = legs.map((leg) => {
+    const intrinsicPerUnit = leg.instrument_type === "CE"
+      ? Math.max(0, settlementPrice - leg.strike)
+      : Math.max(0, leg.strike - settlementPrice);
+    // LONG and in the money. A short ITM leg is assigned; the writer pays no exercise STT.
+    const exercisedLong = leg.side === "BUY" && intrinsicPerUnit > 0;
+    const notional = round2(intrinsicPerUnit * leg.quantity);
+    const stt = exercisedLong
+      ? roundStt(pct(notional, rates.sttExercisePct), rates)
+      : 0;
+    return {
+      tradingsymbol: leg.tradingsymbol,
+      side: leg.side,
+      instrument_type: leg.instrument_type,
+      strike: leg.strike,
+      quantity: leg.quantity,
+      intrinsic_per_unit: round2(intrinsicPerUnit),
+      exercised_long: exercisedLong,
+      stt_exercise: stt,
+    };
+  });
+  const sttExercise = round2(priced.reduce((sum, l) => sum + l.stt_exercise, 0));
+  return {
+    stt_exercise: sttExercise,
+    // Sum of the heads, so the total always equals what is itemised — the same invariant
+    // `calculateLegCharges` maintains. Currently one head; kept as a total so adding another
+    // (e.g. a delivery head if stocks are ever modelled) cannot silently bypass callers.
+    total: sttExercise,
+    legs: priced,
+    settlement_price: round2(settlementPrice),
+    rate_version: rates.rateVersion,
+  };
 }
 
 /**

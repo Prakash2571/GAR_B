@@ -50,6 +50,21 @@ import { fileURLToPath } from "node:url";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DIST = resolve(HERE, "..", "..", "dist");
 
+/*
+ * STOCK UNDERLYINGS ARE ENABLED FOR THIS SUITE.
+ *
+ * This suite exists to prove the universe PLUMBING — instruments → board → chains → windows →
+ * candidates → subscriptions → socket → ticks — and its fixture deliberately carries one index
+ * (NIFTY) and one stock (RELIANCE) so the board/chain join is exercised on both shapes.
+ *
+ * Stocks are excluded from the universe by DEFAULT in production (`BOX_ALLOW_STOCK_UNDERLYINGS=false`)
+ * because stock options are PHYSICALLY settled and neither the delivery obligation nor NSE's
+ * physical-delivery margin ramp is modelled in the capital layer. That policy is asserted separately,
+ * in the "stock underlyings" tests at the bottom of this file. Opting in here keeps the plumbing
+ * coverage on two underlyings instead of silently narrowing it to one.
+ */
+process.env.BOX_ALLOW_STOCK_UNDERLYINGS = "1";
+
 /* ───────────────────────── realistic instrument fixtures ───────────────────────── */
 
 /**

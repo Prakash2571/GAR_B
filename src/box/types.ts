@@ -1073,6 +1073,28 @@ export interface ResidualLegExposure {
    * incremental cumulative charge.
    */
   flatten_accounted_charges?: number;
+  /**
+   * How many times the BROKER has terminally rejected a reduction of this residual, with zero
+   * exposure PROVEN each time.
+   *
+   * WHY THIS COUNTER EXISTS. A broker rejection used to map to `adopt_attempt`, which never
+   * advances `flatten_attempt` — so the next pass regenerated the identical `client_order_id`,
+   * the durable journal adopted the REJECTED intent instead of submitting, and the naked leg was
+   * stranded permanently. One transient refusal (a momentary margin shortfall, a `market_closed`
+   * race at 15:30, a freeze-quantity or price-band refusal) was enough to leave real exposure
+   * unmanaged until a human noticed.
+   *
+   * Retiring past a rejection is SAFE because the gateway only classifies `broker_rejected` after
+   * `verifyZeroBrokerExposure(...).proven` — a rejected order holds no quantity, so a fresh
+   * identity cannot duplicate a fill. What retirement must not be is UNBOUNDED: a structurally
+   * impossible reduction (instrument in an F&O ban period, contract expired, RMS block) would
+   * otherwise POST every `RESIDUAL_FLATTEN_MS` forever and burn the account's daily order budget
+   * that protective work for other positions depends on.
+   *
+   * So the policy is: retry a bounded number of times, then stop POSTing and escalate to the
+   * operator. Persisted by the same atomic `$set` as the quantity and the generation.
+   */
+  flatten_broker_rejections?: number;
 }
 
 /**

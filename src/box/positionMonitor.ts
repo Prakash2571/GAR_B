@@ -23,6 +23,7 @@
  */
 
 import type { BoxConfig } from "./config.js";
+import { NSE_SESSION_CLOSE_MINUTES } from "../marketCalendar.js";
 import type { BoxExecutionGateway } from "./executionGateway.js";
 import type { BoxMetrics } from "./metrics.js";
 import { ordersFromLegs } from "./localCharges.js";
@@ -117,8 +118,15 @@ export interface BoxMonitorDeps {
   isFeedHealthy: () => boolean;
 }
 
-/** Market close in IST minutes-of-day (15:30). */
-const IST_CLOSE_MINUTES = 15 * 60 + 30;
+/**
+ * Market close in IST minutes-of-day (15:30).
+ *
+ * Re-exported from the calendar rather than redeclared, so there is exactly ONE definition of when
+ * the exchange shuts. These two numbers previously disagreed: this file and `latencyModel` used the
+ * correct 15:30 while `boxSupport.isMarketOpen` used 15:40, which is how the engine came to believe
+ * it could trade for ten minutes after the bell.
+ */
+const IST_CLOSE_MINUTES = NSE_SESSION_CLOSE_MINUTES;
 
 export class BoxPositionMonitor {
   private timer: NodeJS.Timeout | null = null;
@@ -434,21 +442,38 @@ export class BoxPositionMonitor {
     if (pos.closing || this.closingIds.has(pos.id)) return;
     if (this.pendingFinalPersists.has(pos.id) || this.pendingPartialPersists.has(pos.id)) return;
 
-    // Outside market hours / dead feed: refresh metrics, attempt nothing. Neither
-    // is a liquidity event.
-    if (!this.deps.isMarketOpen()) return;
-    if (!this.deps.isFeedHealthy()) return;
-
-    const expirySafety = this.isInExpirySafetyWindow(pos);
+    /*
+     * EXPIRY-SAFETY DETECTION IS UNCONDITIONAL, AND DELIBERATELY ABOVE THE MARKET/FEED RETURNS.
+     *
+     * It used to sit BELOW `if (!this.deps.isFeedHealthy()) return;`, which meant a feed outage at
+     * 14:45 on expiry day skipped the deadline entirely: `pos.expiry_safety` was never set and the
+     * EXPIRY_SAFETY event was never emitted. The one moment an operator most needs to be woken up —
+     * settlement approaching on a position the engine cannot see prices for — was the exact moment
+     * the alarm was suppressed.
+     *
+     * The window is pure clock-and-calendar arithmetic, so it can always be evaluated. Only the
+     * EXECUTION of the exit needs a live book, and that is still gated below.
+     */
+    const expirySafetyState = this.expirySafetyState(pos);
+    const expirySafety = expirySafetyState !== "none";
     if (expirySafety && !pos.expiry_safety) {
       pos.expiry_safety = true;
       this.deps.onEvent(
         "EXPIRY_SAFETY",
         pos,
         metrics,
-        "entered the expiry-safety window — attempting an executable close",
+        expirySafetyState === "expired"
+          ? `contract expired on ${pos.expiry} and this position is STILL OPEN — it has gone to ` +
+            `settlement. Exercise STT of 0.15% of intrinsic value is payable on every in-the-money ` +
+            `LONG leg, and a box always has in-the-money legs. Reconcile against the broker.`
+          : "entered the expiry-safety window — attempting an executable close",
       );
     }
+
+    // Outside market hours / dead feed: refresh metrics, attempt nothing. Neither
+    // is a liquidity event. Detection above has already run and alerted.
+    if (!this.deps.isMarketOpen()) return;
+    if (!this.deps.isFeedHealthy()) return;
 
     // RECOVERY means broker attribution/quantity is not yet trusted. Never feed it
     // into ordinary box convergence or automatic flattening; OrderManager
@@ -1388,10 +1413,42 @@ export class BoxPositionMonitor {
     return exitLiquidityOk(metrics.legs);
   }
 
-  private isInExpirySafetyWindow(pos: BoxOpenPosition): boolean {
-    if (pos.expiry !== this.deps.istDayKey()) return false;
+  /**
+   * Where this position stands relative to settlement.
+   *
+   *   "none"     — not on expiry day, or on expiry day but before the safety window opens.
+   *   "window"   — expiry day, inside the last `expirySafetyMinutesBeforeClose` minutes.
+   *   "expired"  — the contract's expiry date has ALREADY PASSED and the position is still open.
+   *
+   * THE "expired" STATE IS THE BUG FIX. The predicate was `if (pos.expiry !== this.deps.istDayKey())
+   * return false;` — an EQUALITY. So the only day on which expiry safety could ever fire was the
+   * expiry date itself, and a position that survived past it (the process was down across expiry, or
+   * the exit was refused for liquidity right to the bell) fell permanently out of the window: never
+   * force-exited, never flagged, never escalated. It sat in the book indefinitely, contributing stale
+   * marks to the day's P&L while the contract no longer existed.
+   *
+   * That is also the single most expensive state in the system. Settlement is not free: exercise STT
+   * is 0.15% of INTRINSIC value on every in-the-money LONG leg (raised from 0.125% effective
+   * 1 April 2026), a box ALWAYS has in-the-money legs, and the cost is unbounded in how far the
+   * underlying travelled — so the position an operator was never told about is precisely the one
+   * whose cost cannot be bounded.
+   *
+   * Pure clock-and-calendar arithmetic: no feed, no book, no broker. That is what allows detection to
+   * run unconditionally, above the market-hours and feed-health guards.
+   */
+  private expirySafetyState(pos: BoxOpenPosition): "none" | "window" | "expired" {
+    const today = this.deps.istDayKey();
+    // ISO dates compare lexicographically in chronological order.
+    if (pos.expiry < today) return "expired";
+    if (pos.expiry !== today) return "none";
     const minutes = this.deps.istMinutesOfDay();
-    return minutes >= IST_CLOSE_MINUTES - this.deps.cfg.expirySafetyMinutesBeforeClose;
+    return minutes >= IST_CLOSE_MINUTES - this.deps.cfg.expirySafetyMinutesBeforeClose
+      ? "window"
+      : "none";
+  }
+
+  private isInExpirySafetyWindow(pos: BoxOpenPosition): boolean {
+    return this.expirySafetyState(pos) !== "none";
   }
 }
 

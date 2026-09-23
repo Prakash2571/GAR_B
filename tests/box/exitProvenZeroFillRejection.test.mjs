@@ -55,7 +55,14 @@ import { brokerOrderFor, liveStack, NOW, runEntry } from "./liveEntryHarness.mjs
 const adapterCfg = {
   executionMode: "live", enabled: true, ackTimeoutMs: 40, workingTimeoutMs: 60,
   partialTimeoutMs: 40, cancelTimeoutMs: 40, brokerMinIntervalMs: 0,
-  maxModifications: 2, maxChaseTicks: 2,
+  maxModifications: 2,
+  // A PAIR, mirroring `kiteAdapterConfigFromBoxConfig`. Entry and reduction have different
+  // ceilings: an exit/unwind is priced from `liveMaxReductionChaseTicks` (default 10) so it can
+  // actually cross a wide options spread, and a fixture adapter that only permitted the tight
+  // ENTRY ceiling would refuse the very exit requests these tests exist to drive — surfacing as an
+  // "Invalid bounded LIMIT pricing envelope" that the gateway then classifies as broker
+  // uncertainty, hiding the proven-rejection behaviour under test.
+  maxChaseTicks: { entry: 2, reduction: 10 },
 };
 const fakeClock = () => { let n = 1_000; return { now: () => n, wait: async (ms) => { n += Math.max(0, ms); } }; };
 

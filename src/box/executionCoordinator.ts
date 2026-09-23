@@ -270,6 +270,23 @@ export interface CoordinatorDeps {
    */
   sessionEntryGate?: () => { allowed: boolean; reason: string | null; detail: string | null };
   /**
+   * The SESSION TIMING verdict for a NEW box: is the exchange open, is the calendar known, are we
+   * past the opening warm-up, and is there enough of the session left to finish a four-leg entry
+   * and, if it fails, its unwind?
+   *
+   * SYNCHRONOUS BY CONTRACT, like every other prologue dependency — it is pure clock-and-calendar
+   * arithmetic with no I/O, so this costs nothing to satisfy.
+   *
+   * ENTRY ONLY, and that asymmetry is the whole design: the cutoff exists so that exposure stays
+   * REDUCIBLE for longer than it is CREATABLE. Wiring this into any reduction path would invert its
+   * purpose and trap the exposure it was added to prevent.
+   */
+  sessionEntryWindow?: () => {
+    allowed: boolean;
+    refusal: string | null;
+    detail: string | null;
+  };
+  /**
    * The OPERATOR BLOCKLIST verdict for an underlying (`box_excluded_underlyings`).
    *
    * SYNCHRONOUS BY CONTRACT, for exactly the same reason as `activeUnderlyings` and
@@ -449,6 +466,8 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
     uncertainHoldsAbandoned: 0,
     underlyingAlreadyActive: 0,
     sessionLimitRefusals: 0,
+    /** New boxes refused because the session timing window (warm-up / cutoff / calendar) was shut. */
+    sessionWindowRefusals: 0,
     underlyingExcluded: 0,
     quantityCapRefusals: 0,
     inventoryLimitRefusals: 0,
@@ -880,6 +899,49 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
           `${orphaned.detail} This candidate (${candidate.underlying}) is refused before it can ` +
           `consume a session attempt, take a reservation or send any order, on EVERY underlying — ` +
           `not just the affected contracts.`,
+      };
+    }
+
+    /*
+     * ── SESSION ENTRY WINDOW — THE CHEAPEST REFUSAL OF ALL ─────────────────────────────
+     *
+     * Placed FIRST in the no-await prologue, above the session budget, because the whole point is
+     * that an out-of-window candidate costs NOTHING: no attempt spent, no reservation, no claim, no
+     * durable write. Refusing at 15:29 must not burn a one-shot supervised-trial attempt.
+     *
+     * WHAT IT PREVENTS. Before this existed there was no time-of-day entry gate anywhere in the
+     * system — entry was permitted until `isMarketOpen()` went false, and that predicate returned
+     * true until 15:40, ten minutes AFTER NFO shuts. A box is four orders, and the worst-case chain
+     * from the first POST to the end of a failed entry's unwind is ~3.5 minutes with the shipped
+     * timeouts, with nothing in it consulting the clock. So an entry admitted near the bell had its
+     * unwind orders rejected by a closed exchange — the exact sequence that leaves a naked delta-1
+     * ITM option on the book overnight.
+     *
+     * The mirror case at the open is the warm-up: NFO's first packets carry previous-close values
+     * and enormous spreads, and every freshness gate here measures ARRIVAL time, so four legs of
+     * yesterday's closes read as perfectly fresh and can manufacture an arbitrary edge.
+     *
+     * ENTRY ONLY, like every gate in this prologue. `coordinateExit`, `acquireForExit` and
+     * `flattenResidual` have no counterpart and must not grow one: a cutoff whose purpose is to stop
+     * you STARTING something you cannot finish would be self-defeating if it also stopped you
+     * finishing what you already started.
+     */
+    const entryWindow = this.deps.sessionEntryWindow?.();
+    if (entryWindow && !entryWindow.allowed) {
+      this.stats.sessionWindowRefusals++;
+      this.log({
+        execution: executionId,
+        broker,
+        underlying: candidate.underlying,
+        status: "suppressed_session_window",
+        reason: entryWindow.refusal ?? "outside_entry_window",
+      });
+      return {
+        ok: false,
+        reason: "market_closed",
+        detail:
+          entryWindow.detail ??
+          `${entryWindow.refusal ?? "outside_entry_window"}: new entry is outside the session entry window`,
       };
     }
 

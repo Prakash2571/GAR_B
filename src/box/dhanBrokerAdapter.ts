@@ -46,6 +46,7 @@ import {
   isBrokerOrderTerminal,
   type BrokerAdapter,
   type BeforeBrokerPost,
+  type BoundedLimitCeilings,
   type BrokerHealth,
   type BrokerMargin,
   type BrokerModifyRequest,
@@ -128,7 +129,8 @@ export interface DhanAdapterConfig {
    */
   rateBudget?: RateBudgetLedger;
   maxModifications: number;
-  maxChaseTicks: number;
+  /** Per-phase chase ceilings — see the Kite adapter for why this is a pair, not a scalar. */
+  maxChaseTicks: BoundedLimitCeilings;
   dhanClientId: () => string;
   /** Internal token → Dhan (segment, securityId). */
   identify: (token: number) => { segment: DhanExchangeSegment; securityId: number } | null;
@@ -187,7 +189,10 @@ export function dhanAdapterConfigFromBoxConfig(
     brokerMinIntervalMs: cfg.liveBrokerMinIntervalMs,
     pacing: resolveBrokerPacing("dhan", cfg.liveBrokerMinIntervalMs, cfg.liveBrokerOrderMinIntervalMs),
     maxModifications: cfg.liveMaxModifications,
-    maxChaseTicks: cfg.liveMaxChaseTicks,
+    maxChaseTicks: {
+      entry: cfg.liveMaxChaseTicks,
+      reduction: cfg.liveMaxReductionChaseTicks,
+    },
     ...deps,
   };
 }

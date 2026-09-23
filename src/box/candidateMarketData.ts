@@ -63,6 +63,7 @@
 import { BOX_LEG_ROLES, type BoxCandidate, type BoxLegRole, type BoxQuote } from "./types.js";
 import type { MarketDataState } from "./streamHealthPolicy.js";
 import { marketDataPermissions } from "./streamHealthPolicy.js";
+import { DEFAULT_MAX_EXCHANGE_AHEAD_MS } from "./executionCoherence.js";
 
 /** Why a specific candidate is not admissible on market-data evidence. Operator-readable. */
 export interface CandidateMarketDataBlocker {
@@ -76,6 +77,15 @@ export interface CandidateMarketDataBlocker {
     | "leg_no_book"
     | "leg_book_stale"
     | "leg_source_stale"
+    /**
+     * The exchange timestamp is further AHEAD of local receive time than granularity explains.
+     *
+     * Distinct from `leg_source_stale` because it points somewhere completely different: this is the
+     * HOST clock being wrong (NTP), not the book being old. Reporting it as staleness — which is
+     * what the zero-tolerance `sourceAgeMs < 0` test used to do — told the operator "fresh locally
+     * but stale at the exchange" while a modest clock skew silently refused every candidate.
+     */
+    | "leg_source_clock_anomaly"
     | "leg_no_executable_price"
     | "leg_no_executable_quantity"
     | "leg_incoherent_book"
@@ -128,6 +138,27 @@ export interface CandidateMarketDataDeps {
    * rather than faked — absence is not freshness.
    */
   readonly sourceMaxAgeMs?: number;
+  /**
+   * How far the exchange timestamp may sit AHEAD of local receive time before it is a clock fault
+   * rather than ordinary granularity.
+   *
+   * WHY A TOLERANCE IS REQUIRED HERE AND NOT OPTIONAL. Kite's `exchange_timestamp` is epoch
+   * SECONDS, and `ticker.ts` converts it as `exSec * 1000` — the FLOOR of the exchange second. So a
+   * perfectly healthy tick can legitimately carry a stamp up to 999ms behind its true publish
+   * instant, and any host clock that runs even slightly behind NSE's makes `now - exchange_at`
+   * NEGATIVE for every leg at once.
+   *
+   * THE DEFECT THIS REPLACES. The source-age test used to reject `sourceAgeMs < 0` with ZERO
+   * tolerance. Under a host clock a second or two behind the exchange, all four legs failed
+   * simultaneously, every candidate was refused, and entries stopped completely — while the
+   * operator-facing reason said "fresh locally but stale at the exchange", which names the exact
+   * OPPOSITE of the actual cause. Nothing distinguished it from a genuinely dead feed.
+   *
+   * `executionCoherence.livePolicyFromConfig` already tolerated this same physical fact at 1500ms
+   * and documented why. Two admission layers reading the same input with opposite tolerances is the
+   * real bug; this field is what makes them agree.
+   */
+  readonly maxExchangeAheadOfReceiveMs?: number;
   /** Quantity required per leg (one lot × lots). Used for the depth requirement. */
   readonly requiredQuantity: number;
   /** Which side each role executes on, so the EXECUTABLE side of the book is the one checked. */
@@ -267,8 +298,32 @@ export function evaluateCandidateMarketData(
     }
     // SOURCE FRESHNESS, kept meaningful and separate. Skipped — not faked — when the feed carries
     // no exchange timestamp.
+    //
+    // The "ahead of local time" case is tolerated rather than rejected outright: Kite's exchange
+    // stamp is 1-second granular (floored to the second by the parser), so a healthy tick is
+    // routinely up to 999ms "in the future" relative to a host clock that runs marginally behind
+    // NSE's. Rejecting any negative age made a modest clock skew look like four simultaneously
+    // stale legs and silently halted all entries, with a reason that named the opposite cause.
+    // Beyond the tolerance it IS a fault, and it is reported as a clock fault rather than staleness
+    // so an operator is pointed at NTP instead of at the feed.
     if (deps.sourceMaxAgeMs !== undefined && sourceAgeMs !== null) {
-      if (!Number.isFinite(sourceAgeMs) || sourceAgeMs < 0 || sourceAgeMs > deps.sourceMaxAgeMs) {
+      const aheadTolerance = deps.maxExchangeAheadOfReceiveMs ?? DEFAULT_MAX_EXCHANGE_AHEAD_MS;
+      if (!Number.isFinite(sourceAgeMs)) {
+        blockers.push({
+          code: "leg_source_stale",
+          role,
+          detail: `${instrument.tradingsymbol} exchange timestamp is not a finite age`,
+        });
+      } else if (sourceAgeMs < -aheadTolerance) {
+        blockers.push({
+          code: "leg_source_clock_anomaly",
+          role,
+          detail:
+            `${instrument.tradingsymbol} exchange timestamp is ${Math.round(-sourceAgeMs)}ms AHEAD of ` +
+            `local receive time, over the ${aheadTolerance}ms tolerance — this is a HOST CLOCK fault ` +
+            `(check NTP), not a stale book`,
+        });
+      } else if (sourceAgeMs > deps.sourceMaxAgeMs) {
         blockers.push({
           code: "leg_source_stale",
           role,
@@ -307,19 +362,44 @@ export function evaluateCandidateMarketData(
       blockers.push({
         code: "leg_no_executable_quantity",
         role,
-        detail: `${instrument.tradingsymbol} has no positive quantity on the ${side} side`,
+        detail: `${instrument.tradingsymbol} has no quantity resting at the ${side} touch`,
       });
     }
 
-    // REQUIRED DEPTH for the quantity we actually intend to send.
+    /*
+     * REQUIRED DEPTH AT THE PRICE WE WILL ACTUALLY TRADE.
+     *
+     * THE TOUCH LEVEL MUST COVER THE WHOLE QUANTITY. This used to sum the quantity across all five
+     * displayed levels, which is not the test the order needs: the order is priced AT the touch (the
+     * limit is `touch ± chaseTicks`), so only liquidity reachable within that band can fill it.
+     *
+     * The old sum admitted a leg showing 25 at the touch and 50 spread across levels 2-5 against a
+     * lot of 75. The order then filled 25 and the remainder either rested — destroying the four-leg
+     * simultaneity the coherence gate spends so much effort establishing — or swept deeper levels at
+     * materially worse prices. On a box whose entire edge is a few paise per leg, that is the
+     * difference between a positive and a negative net credit, and it happened INSIDE every safety
+     * rail, so nothing reported a problem.
+     *
+     * `touchQty` comes from `BoxQuoteStore`, which already sums only the levels resting at exactly
+     * the touch price (an exchange can report the same price twice in a padded depth payload), so it
+     * is the correct quantity to compare against.
+     *
+     * The all-levels total is still computed, purely so the refusal can say whether the liquidity
+     * exists deeper — "25 at the touch, 75 needed (75 across all levels)" tells an operator the book
+     * is thin at the top rather than empty, which is a different market and a different decision.
+     */
     const availableDepth = levels.reduce((sum, level) => sum + (Number.isFinite(level.qty) ? level.qty : 0), 0);
-    if (availableDepth < deps.requiredQuantity) {
+    const touchDepth = Number.isFinite(touchQty) && touchQty > 0 ? touchQty : 0;
+    // Skipped when the touch is already reported as empty above, so a book with nothing at the touch
+    // raises one blocker naming that fact rather than two saying it twice.
+    if (touchDepth > 0 && touchDepth < deps.requiredQuantity) {
       blockers.push({
         code: "leg_no_executable_quantity",
         role,
         detail:
-          `${instrument.tradingsymbol} shows ${availableDepth} on the ${side} side; ` +
-          `${deps.requiredQuantity} is required`,
+          `${instrument.tradingsymbol} shows ${touchDepth} at the executable ${side} touch ` +
+          `(${availableDepth} across all levels); ${deps.requiredQuantity} is required at the touch ` +
+          `because the order is priced there`,
       });
     }
 

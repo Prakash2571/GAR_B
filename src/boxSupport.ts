@@ -27,6 +27,7 @@ import type { BoxChargeLeg, PricedChargeGroup } from "./box/charges.js";
 import type { BoxBoardItem } from "./box/instruments.js";
 import type { Instrument, KiteClient, OrderCharges } from "./kite.js";
 import { resolveIndexSpotSymbol } from "./indexSpot.js";
+import { isMarketOpenAt } from "./marketCalendar.js";
 import type { ILegCharges, ITradeCharges } from "./types/charges.js";
 
 /* -------------------------------------------------------------------------- */
@@ -46,13 +47,18 @@ export function istDayKey(at: number = Date.now()): string {
   return ist.toISOString().slice(0, 10);
 }
 
-/** True during NSE equity-derivatives hours: Mon-Fri, 09:15-15:40 IST. */
+/** True during NSE equity-derivatives hours, honouring holidays and special sessions.
+ *
+ * DELEGATES to `src/marketCalendar.ts`. This used to be a self-contained day-of-week plus
+ * `09:15-15:40` window, which was wrong three ways: NFO closes at 15:30 not 15:40 (so the engine
+ * believed it could trade for ten minutes after the bell, against a frozen closing book that every
+ * coherence check still admits), there was no holiday calendar at all (so Republic Day reported
+ * `market_open: true` all day and the safe last-close view was suppressed), and a real Muhurat
+ * session reported CLOSED — which also disables the position monitor and the residual-flatten loop,
+ * leaving open exposure unmanaged through a live session.
+ */
 export function isMarketOpen(at: number = Date.now()): boolean {
-  const ist = new Date(at + 5.5 * 60 * 60 * 1000);
-  const day = ist.getUTCDay(); // 0 Sun ... 6 Sat (on the IST-shifted date)
-  if (day === 0 || day === 6) return false;
-  const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
-  return mins >= 9 * 60 + 15 && mins <= 15 * 60 + 40;
+  return isMarketOpenAt(at);
 }
 
 /* -------------------------------------------------------------------------- */

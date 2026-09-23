@@ -8,6 +8,7 @@ import {
   isBrokerOrderTerminal,
   type BrokerAdapter,
   type BeforeBrokerPost,
+  type BoundedLimitCeilings,
   type BrokerHealth,
   type BrokerMargin,
   type BrokerModifyRequest,
@@ -458,7 +459,15 @@ export interface KiteBrokerAdapterConfig {
    */
   rateBudget?: RateBudgetLedger;
   maxModifications: number;
-  maxChaseTicks: number;
+  /**
+   * Per-phase chase ceilings enforced at the wire by `assertBoundedLimit`.
+   *
+   * A PAIR, not a scalar, because entry and reduction are priced against different ceilings. When
+   * this was a single `liveMaxChaseTicks` the validator rejected every reduction the gateway had
+   * deliberately priced wider, turning "pay up to get out of this leg" into an opaque local
+   * "Invalid bounded LIMIT pricing envelope".
+   */
+  maxChaseTicks: BoundedLimitCeilings;
 }
 
 export function kiteAdapterConfigFromBoxConfig(cfg: BoxConfig): KiteBrokerAdapterConfig {
@@ -472,7 +481,10 @@ export function kiteAdapterConfigFromBoxConfig(cfg: BoxConfig): KiteBrokerAdapte
     brokerMinIntervalMs: cfg.liveBrokerMinIntervalMs,
     pacing: resolveBrokerPacing("zerodha", cfg.liveBrokerMinIntervalMs, cfg.liveBrokerOrderMinIntervalMs),
     maxModifications: cfg.liveMaxModifications,
-    maxChaseTicks: cfg.liveMaxChaseTicks,
+    maxChaseTicks: {
+      entry: cfg.liveMaxChaseTicks,
+      reduction: cfg.liveMaxReductionChaseTicks,
+    },
   };
 }
 
@@ -1909,14 +1921,33 @@ export function stableKiteTag(clientOrderId: string, requested?: string): string
 
 export function classifyKiteReject(error: unknown): BrokerRejectFamily {
   const message = errorMessage(error).toLowerCase();
+  /*
+   * ORDER IS SIGNIFICANT — these patterns overlap, and the first match wins.
+   *
+   * AUTH MUST BE TESTED BEFORE INSTRUMENT. Kite's TokenException body is literally
+   * "Invalid `api_key` or `access_token`." — which contains the word "token", so it used to match
+   * the instrument pattern (`/instrument|contract|token|scrip.*not/`) and return
+   * `instrument_unavailable`, never reaching the auth branch at all. A static-IP 403 classified the
+   * same way.
+   *
+   * That mattered more than a mislabelled counter. A dead or unregistered session presents as a wall
+   * of "instrument unavailable" rejections in the execution statistics — the one remaining signal an
+   * operator had that the session, rather than the market, was the problem.
+   *
+   * `\btoken\b` is also narrowed to the auth branch and REMOVED from the instrument branch: an
+   * instrument problem is reported by Kite as an invalid tradingsymbol, contract or scrip, never as a
+   * bare "token", so the alternative bought nothing and cost the classification.
+   */
+  if (/\bauth|access.?token|api.?key|permission|unauthori[sz]ed|forbidden|\b401\b|\b403\b/.test(message)) {
+    return "auth";
+  }
   if (/margin|funds|cash/.test(message)) return "margin";
   if (/price.*band|circuit|range/.test(message)) return "price_band";
-  if (/instrument|contract|token|scrip.*not/.test(message)) return "instrument_unavailable";
+  if (/instrument|contract|scrip|tradingsymbol/.test(message)) return "instrument_unavailable";
   if (/market.*clos|exchange.*clos|outside.*hour/.test(message)) return "market_closed";
   if (/rate.*limit|too many|429/.test(message)) return "rate_limit";
-  if (/\brms\b|risk management/.test(message)) return "rms";
+  if (/\brms\b|risk management|ban period|banned/.test(message)) return "rms";
   if (/quantity|freeze|lot size/.test(message)) return "quantity_freeze";
-  if (/auth|token|permission|401|403/.test(message)) return "auth";
   return "generic";
 }
 

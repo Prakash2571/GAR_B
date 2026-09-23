@@ -48,7 +48,21 @@ function round2(v: number): number {
   return Math.round(v * 100) / 100;
 }
 
-/** Snap a price to the nearest tick multiple, then to paise. */
+/**
+ * Snap a price to the nearest tick multiple, then to paise.
+ *
+ * NEAREST, not side-directional, and that is deliberate. Rounding a BUY up / a SELL down looks
+ * safer in isolation, but with `maxChaseTicks: 0` it pushes the limit OUTSIDE the zero-width chase
+ * band, and `assertBoundedLimit` then refuses the envelope outright. Nearest-rounding keeps the
+ * limit inside the band for every band width.
+ *
+ * This only matters at all when the reference price is off our tick grid, which in live trading means
+ * the instrument master's `tick_size` disagrees with the exchange's real tick (NSE lot/tick revisions
+ * are routine). That case is caught loudly rather than mispriced: `candidateMarketData` raises
+ * `leg_tick_size_invalid` when a touch price is not a multiple of the instrument's tick, and
+ * `assertBoundedLimit` re-checks alignment and direction before anything reaches the wire. So a tick
+ * mismatch produces a local refusal, never a silently wrong order.
+ */
 export function roundToTick(price: number, tick: number): number {
   if (!(tick > 0)) return round2(price);
   return round2(Math.round(price / tick) * tick);
@@ -57,8 +71,27 @@ export function roundToTick(price: number, tick: number): number {
 /**
  * The worst price a marketable-limit order will accept.
  *
- * The chase band widens the limit AWAY from us: dearer for a BUY, cheaper for a
- * SELL. Snapped to the tick grid so the limit is itself a tradable price.
+ * The chase band widens the limit AWAY from us: dearer for a BUY, cheaper for a SELL. Snapped to
+ * the tick grid so the limit is itself a tradable price.
+ *
+ * FLOORED AT ONE TICK — the defect this floor exists to prevent.
+ *
+ * Without it a SELL whose reference touch sits at or below the chase band produces a limit of zero
+ * or less: with the live default of 2 chase ticks at ₹0.05, a bid of ₹0.10 yields ₹0.00 and a bid of
+ * ₹0.05 yields ₹-0.05. `assertBoundedLimit` then hard-refuses `limit_price <= 0`, and on the
+ * residual-flatten path that throw is swallowed into a failed pass whose disposition reuses the
+ * same identity — so the pass deterministically fails again, every two seconds, forever.
+ *
+ * The legs this bites are exactly the ones a box leaves behind: a far-OTM wing trading at ₹0.05–0.10
+ * is completely normal on NSE, and it is the leg an unwind or EMERGENCY_RESIDUAL most often has to
+ * sell. The old behaviour meant that leg could never be flattened AT ALL — a naked option carried
+ * overnight while the operator was told only "no executable book".
+ *
+ * ₹0.05 is the lowest tradable price on NSE, not an arbitrary clamp: an order there sells to whatever
+ * bid exists and cannot be refused for being off-grid or non-positive. It is also still INSIDE the
+ * chase band whenever the reference is a real NSE price (the floor can only raise a SELL limit that
+ * the band drove below one tick, and one tick is the lowest price the reference itself can be), so
+ * flooring cannot push the envelope past `assertBoundedLimit`'s directional check.
  */
 export function computeLimitPrice(args: {
   side: OrderSide;
@@ -67,9 +100,15 @@ export function computeLimitPrice(args: {
   maxChaseTicks: number;
 }): number {
   const { side, referencePrice, tickSize, maxChaseTicks } = args;
-  const chase = Math.max(0, Math.round(maxChaseTicks)) * (tickSize > 0 ? tickSize : 0);
+  const tick = tickSize > 0 ? tickSize : 0;
+  const chase = Math.max(0, Math.round(maxChaseTicks)) * tick;
   const raw = side === "BUY" ? referencePrice + chase : referencePrice - chase;
-  return roundToTick(raw, tickSize);
+  const snapped = roundToTick(raw, tickSize);
+  // A BUY limit is only ever pushed UP by the chase, so it cannot be driven non-positive by this
+  // arithmetic; flooring it too costs nothing and means a corrupt reference cannot produce an
+  // unsendable envelope on either side.
+  if (tick > 0) return Math.max(tick, snapped);
+  return snapped;
 }
 
 /**

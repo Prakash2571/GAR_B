@@ -28,7 +28,7 @@
  * system guessing.
  */
 
-import type { Instrument, KiteClient } from "../kite.js";
+import { KiteError, type Instrument, type KiteClient } from "../kite.js";
 import type { TickerHub } from "../hub.js";
 import type { BrokerAdapter } from "../box/brokerAdapter.js";
 import type {
@@ -988,6 +988,55 @@ export class ActiveBrokerManager {
       loginDay: session.login_date,
       loginAt: session.updated_at instanceof Date ? session.updated_at.getTime() : Date.now(),
     };
+
+    /*
+     * PROVE THE TOKEN IS ALIVE BEFORE REPORTING A SESSION. SAME IST DAY IS NOT EVIDENCE.
+     *
+     * This method used to validate exactly two things — same IST day, same api key — and then install
+     * the token unconditionally. Neither of those is a liveness check, and Kite retires an
+     * access_token the instant the account signs in anywhere else (one active token per api_key), not
+     * only at the day boundary. So a token killed at 12:30 by a Kite web login left a stored row still
+     * carrying TODAY's `login_date` and the matching api key, and any restart re-adopted it: `sessionFor`
+     * reported `authenticated: true`, `healthFor` reported `data_ready`/`trading_ready` true, and the
+     * Box engine armed against a corpse. Every leg POST 403s, which on a four-leg box is a partial
+     * spread that can neither be completed nor cancelled — with the dashboard claiming health.
+     *
+     * `/user/profile` is the cheapest authenticated call Kite offers and this runs once per boot, so
+     * the cost is a single round trip on the one path where being wrong is most expensive.
+     *
+     * A DEFINITIVE REJECTION AND A NETWORK FAILURE ARE DIFFERENT ANSWERS, and conflating them would
+     * trade one bug for another:
+     *   - 401/403 ⇒ the token IS dead. `KiteClient.noteAuthFailure` has already cleared it in memory
+     *     and fired the durable-invalidation handler, so here we only have to refuse the adoption.
+     *   - anything else (DNS, TLS, a 5xx, a timeout) proves NOTHING about the credential. Deleting a
+     *     good session because Kite was briefly unreachable at boot would force a needless manual
+     *     sign-in — and would do it at the worst moment, since a boot with unresolved overnight
+     *     exposure is exactly when the session is needed to reconcile. The token stays installed and
+     *     the failure is surfaced as a problem instead.
+     */
+    const probe = await this.deps.kite
+      .getProfile()
+      .then(() => ({ ok: true as const }))
+      .catch((err: unknown) => ({ ok: false as const, err }));
+    if (!probe.ok) {
+      const status = probe.err instanceof KiteError ? probe.err.status : 0;
+      if (status === 401 || status === 403) {
+        await clearKiteSession(
+          `stored token was rejected by Kite with HTTP ${status} on /user/profile`,
+        ).catch(() => undefined);
+        this.zerodhaSessionMeta = null;
+        this.deps.kite.clearSession();
+        this.loginErrors.zerodha =
+          "The saved Zerodha session was rejected by the broker — sign in to Zerodha again. " +
+          "This usually means the account signed in elsewhere, which retires the API token.";
+        return false;
+      }
+      // Unproven, not disproven. Keep the session and say so.
+      this.loginErrors.zerodha =
+        "The saved Zerodha session could not be verified against the broker at startup " +
+        `(${probe.err instanceof Error ? probe.err.message : "unknown error"}). ` +
+        "It is being used as-is; if orders are rejected, sign in to Zerodha again.";
+    }
     return true;
   }
 

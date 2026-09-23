@@ -8,6 +8,7 @@
  */
 
 import type { Instrument } from "../kite.js";
+import { tradingDaysUntil } from "../marketCalendar.js";
 import { selectStrikeWindow, shouldRecentreWindow, strikeStepOf } from "./math.js";
 import type { BoxOptionInstrument, BoxUnderlyingState } from "./types.js";
 
@@ -29,7 +30,49 @@ export interface BoxChainIndex {
   strikes: number[];
   ce: Map<number, BoxOptionInstrument>;
   pe: Map<number, BoxOptionInstrument>;
+  /**
+   * Trading days from today to this chain's expiry, or null when it could not be computed.
+   *
+   * Carried on the chain so downstream gates (and the operator surface) can see the distance that
+   * was actually used, rather than each layer re-deriving it from a different calendar.
+   */
+  trading_days_to_expiry: number | null;
+  /**
+   * Expiries that were SKIPPED because they were too close to settlement, nearest first.
+   *
+   * Recorded rather than silently dropped: "NIFTY is trading the 2026-10-06 series, not the
+   * 2026-09-29 one, because 29 Sep is 1 trading day out and the minimum is 2" is a materially
+   * different situation from "NIFTY has no chain", and an operator who cannot tell them apart will
+   * go looking for a feed problem that does not exist.
+   */
+  skipped_near_expiries: string[];
 }
+
+/**
+ * Why an expiry is not eligible to have NEW boxes opened in it.
+ *
+ * SETTLEMENT IS THE RISK THIS GUARDS, and it is a cost the engine cannot otherwise see. Holding a box
+ * to expiry is not a neutral alternative to closing it:
+ *
+ *   EXERCISE STT. A box ALWAYS has in-the-money legs at expiry — for K1 < S < K2 the two long legs'
+ *   intrinsic values sum to exactly the box width. STT on exercise is 0.15% of INTRINSIC value
+ *   (raised from 0.125% effective 1 April 2026) and is payable by the BUYER of the option. It is
+ *   unbounded in |S − K1|: a NIFTY box whose lower strike ends 4,100 points ITM pays roughly ₹384 of
+ *   exercise STT on one 75-lot, which is well over the entire gross edge such a box would ever show.
+ *
+ *   PHYSICAL SETTLEMENT. Stock options in India are physically settled; index options are cash
+ *   settled. A stock box carried into expiry week becomes a delivery obligation — and NSE ramps
+ *   physical-delivery margin on ITM long options from around four days before expiry, reaching a
+ *   large fraction of the full delivery value. On a RELIANCE box with a ₹10,000 maximum payoff, the
+ *   delivery leg is several lakh rupees of notional and the margin ramp dwarfs the trade.
+ *
+ *   SPREAD MARGIN BENEFIT IS WITHDRAWN near expiry, so the margin actually held against an open box
+ *   rises while nothing in the engine observes it.
+ *
+ * The cheapest defence against all three is to never be in that series: refuse to OPEN a box that
+ * cannot comfortably be closed before settlement.
+ */
+export type ExpiryIneligibility = "too_close_to_expiry" | "unparseable_expiry";
 
 function toBoxInstrument(i: Instrument): BoxOptionInstrument {
   const inst: BoxOptionInstrument = {
@@ -56,10 +99,45 @@ function toBoxInstrument(i: Instrument): BoxOptionInstrument {
  * "Non-expired" is evaluated against the IST trading day, so an expiry dated
  * today is still live (it trades until the close).
  */
+/**
+ * Index the NFO option chains by underlying, keeping the nearest expiry that is far enough from
+ * settlement to be worth opening a box in.
+ *
+ * WHAT CHANGED, AND WHY. This used to take `expiries[0]` — the nearest non-expired series, INCLUDING
+ * today's. Combined with the absence of any days-to-expiry rule anywhere in the system, that meant a
+ * box could be opened at 14:00 on expiry day, in the expiring series, with nothing between it and
+ * settlement but the 45-minute expiry-safety window. And that window deliberately refuses to fill
+ * against an untradeable book (it never invents a price), so an illiquid wing at 15:15 sent the box
+ * to settlement with no accounting path at all — the charge model has no exercise-STT head, so the
+ * realised cost was simply never computed. See {@link ExpiryIneligibility} for what settlement
+ * actually costs.
+ *
+ * The rule is expressed in TRADING days, not calendar days, because the question is "how many
+ * sessions do I have to get out of four legs", and a Friday-to-Monday expiry is three calendar days
+ * but one session. `minTradingDays` of 1 means "not the expiring series"; 2 means "at least one full
+ * session of slack after today".
+ *
+ * A skipped series is RECORDED on the chain, not silently dropped.
+ *
+ * Note this only governs which chain NEW candidates are built from. Positions already open in a
+ * nearer series keep their own instruments and stay subscribed, so rolling the discovery chain
+ * forward never orphans live exposure.
+ */
 export function indexOptionChains(
   all: Instrument[],
   today: string,
+  opts: {
+    /**
+     * Minimum trading days from today to expiry for a series to accept NEW boxes.
+     * 0 preserves the historical behaviour (nearest live expiry, including today's).
+     */
+    minTradingDays?: number;
+    /** Trading days from `today` to a given expiry, or null when uncomputable. Injected for tests. */
+    tradingDaysUntil?: (from: string, to: string) => number | null;
+  } = {},
 ): Map<string, BoxChainIndex> {
+  const minTradingDays = Math.max(0, Math.floor(opts.minTradingDays ?? 0));
+  const daysUntil = opts.tradingDaysUntil ?? ((from, to) => tradingDaysUntil(from, to));
   // underlying -> expiry -> strike -> { ce, pe }
   const byUnderlying = new Map<string, Map<string, Instrument[]>>();
 
@@ -82,7 +160,32 @@ export function indexOptionChains(
   for (const [underlying, byExpiry] of byUnderlying) {
     // ISO dates sort chronologically, so the first is the nearest live expiry.
     const expiries = [...byExpiry.keys()].sort();
-    const expiry = expiries[0];
+
+    /*
+     * Walk OUTWARD to the first series far enough from settlement, recording what was passed over.
+     *
+     * A series whose distance cannot be computed (an expiry the calendar cannot parse, or one beyond
+     * the scan bound) is SKIPPED rather than admitted: an unknown distance to settlement is not
+     * evidence of a safe distance, and this is the one decision where guessing has an unbounded
+     * downside.
+     */
+    const skipped: string[] = [];
+    let expiry: string | undefined;
+    let daysToExpiry: number | null = null;
+    for (const candidate of expiries) {
+      if (minTradingDays <= 0) {
+        expiry = candidate;
+        daysToExpiry = daysUntil(today, candidate);
+        break;
+      }
+      const days = daysUntil(today, candidate);
+      if (days !== null && days >= minTradingDays) {
+        expiry = candidate;
+        daysToExpiry = days;
+        break;
+      }
+      skipped.push(candidate);
+    }
     if (!expiry) continue;
     const contracts = byExpiry.get(expiry)!;
 
@@ -108,6 +211,8 @@ export function indexOptionChains(
       strikes,
       ce,
       pe,
+      trading_days_to_expiry: daysToExpiry,
+      skipped_near_expiries: skipped,
     });
   }
   return out;
