@@ -41,12 +41,43 @@ import {
   type BoxSessionRecord,
 } from "./tradingSession.js";
 
+/** The outcome of an atomic durable attempt consumption. Mirrors the repository's shape. */
+export type ConsumeEntryAttemptOutcome =
+  | { readonly ok: true; readonly entry_attempts: number; readonly max_entry_attempts: number }
+  | {
+      readonly ok: false;
+      readonly reason: "budget_exhausted" | "session_changed" | "no_session" | "error";
+      readonly detail: string;
+      readonly entry_attempts: number | null;
+      readonly max_entry_attempts: number | null;
+    };
+
 /** The durable surface this manager needs. Injected so tests need no database. */
 export interface TradingSessionPersistence {
   load(): Promise<{ ok: true; record: BoxSessionRecord | null } | { ok: false; error: string }>;
-  save(record: BoxSessionRecord): Promise<void>;
+  /**
+   * Persist the whole record.
+   *
+   * `claimsAttemptBudget` marks the writes that ESTABLISH a budget (arm / disarm) rather than spend
+   * one. Only those may set `entry_attempts`/`max_entry_attempts`; every other save must leave the
+   * durable counter alone, because it is owned by `consumeEntryAttempt` and a full-row overwrite from
+   * a stale snapshot would hand spent attempts back. See `saveBoxTradingSession`.
+   */
+  save(record: BoxSessionRecord, options?: { readonly claimsAttemptBudget?: boolean }): Promise<void>;
   /** Which of these trade ids are durably FLAT. Used for boot reconciliation. */
   flatTradeIds(tradeIds: readonly string[]): Promise<string[]>;
+  /**
+   * SPEND ONE ATTEMPT ATOMICALLY, inside the database, fenced to `sessionId`.
+   *
+   * Optional so a caller (or a test) that does not supply it still works: without it the manager
+   * falls back to the in-memory read-modify-write, which bounds a genuinely single-manager deployment
+   * and is the only behaviour that existed before. `usesAtomicAttemptConsumption()` reports which
+   * path is live so the status projection never overstates the guarantee.
+   */
+  consumeEntryAttempt?(args: {
+    readonly sessionId: string;
+    readonly now: number;
+  }): Promise<ConsumeEntryAttemptOutcome>;
 }
 
 export interface TradingSessionManagerDeps {
@@ -257,11 +288,20 @@ export class BoxTradingSessionManager {
      * and the persistence-unhealthy flag below then refuses entry until it lands.
      */
     rollbackOnFailure: boolean,
+    /**
+     * Whether this write ESTABLISHES the attempt budget rather than merely saving around it.
+     *
+     * Only arming and disarming may set `entry_attempts`/`max_entry_attempts`. Every other save must
+     * leave the durable counter untouched, because it is owned by the atomic consumption statement
+     * and a full-row overwrite from this manager's snapshot would hand spent attempts back — the
+     * stale-rollback defect in `tests/pg/sessionBudgetTwoManagers.test.mjs`.
+     */
+    claimsAttemptBudget = false,
   ): Promise<boolean> {
     const previous = this.record;
     this.record = next;
     try {
-      await this.deps.persistence.save(next);
+      await this.deps.persistence.save(next, { claimsAttemptBudget });
       this.writeFailed = false;
       return true;
     } catch (error) {
@@ -389,7 +429,10 @@ export class BoxTradingSessionManager {
       previous: this.record,
       now: this.now(),
     });
-    if (!(await this.commit(next, "arm", true))) {
+    // ARM CLAIMS THE BUDGET. A new session id, the operator's ceiling and zero spent attempts are
+    // exactly what this write exists to establish, so it is one of the two writes permitted to set
+    // the attempt-budget columns.
+    if (!(await this.commit(next, "arm", true, true))) {
       return { ok: false, reason: "the session could not be persisted, so arming was refused" };
     }
     return { ok: true, record: this.record };
@@ -473,12 +516,11 @@ export class BoxTradingSessionManager {
     }
     // SERIALIZED, and the budget is re-checked INSIDE the critical section.
     //
-    // Both halves matter. Deriving `next` from `this.record` here rather than from a value read
-    // before queueing is what makes two concurrent consumptions compose into +2 instead of +1.
-    // Re-evaluating the ceiling here is what stops two callers who each passed the synchronous
-    // `evaluateEntry` gate from both spending the LAST allowance: the second one now finds the
-    // budget already exhausted and is refused, which is the durable equivalent of the
-    // claim-before-yield fix in the coordinator's prologue.
+    // The promise chain remains, but it is now an IN-PROCESS OPTIMISATION rather than the authority.
+    // It keeps this manager's own mutations ordered (so a consumption cannot interleave with an arm
+    // it queued behind) and it avoids pointless database contention between callers in one process.
+    // It orders NOTHING against another manager or another process — it is a per-instance field — so
+    // the ceiling itself is enforced by `consumeEntryAttempt`'s single SQL statement below.
     return this.serialize(async () => {
       if (!this.loaded || !isArmed(this.record)) {
         // Unreadable or unarmed sessions are already refused by evaluateEntry; reaching here means
@@ -496,6 +538,11 @@ export class BoxTradingSessionManager {
       // must be honoured here rather than spending an attempt against a session that has since
       // closed. Honouring only one reason left the other able to slip through.
       //
+      // This is still a LOCAL pre-check and it is still worth doing: it refuses on the
+      // completed-cycle ceiling, which the durable statement below deliberately knows nothing about.
+      // What it is NOT is the attempt-ceiling authority — a local record can be stale, so a local
+      // "allowed" is only permission to ASK the database.
+      //
       // `recoveryActive` is deliberately false: this manager does not observe recovery state, and
       // the caller's synchronous gate is the authority on it. That is a narrowing, and it is safe
       // in the conservative direction only because recovery activation cannot make a refusal into
@@ -509,6 +556,76 @@ export class BoxTradingSessionManager {
             `the armed trading session refused the attempt (${verdict.reason ?? "session_limit_reached"})`,
         };
       }
+
+      const consume = this.deps.persistence.consumeEntryAttempt;
+      if (consume !== undefined) {
+        // THE DURABLE AUTHORITY. One statement increments and bounds under one row lock, fenced to
+        // the session id this attempt was authorised under, so concurrent managers in any number of
+        // processes cannot both spend the same allowance.
+        let outcome: ConsumeEntryAttemptOutcome;
+        try {
+          outcome = await consume.call(this.deps.persistence, {
+            sessionId: this.record.session_id,
+            now: this.now(),
+          });
+        } catch (error) {
+          outcome = {
+            ok: false,
+            reason: "error",
+            detail: `the entry attempt could not be durably consumed (${
+              error instanceof Error ? error.message : String(error)
+            })`,
+            entry_attempts: null,
+            max_entry_attempts: null,
+          };
+        }
+        if (!outcome.ok) {
+          if (outcome.reason === "error") {
+            // A write fault, not a refusal by the ceiling. Nothing was sent and nothing was counted,
+            // so entry is refused and the record is untouched — the same conservative direction the
+            // rollback path took.
+            this.writeFailed = true;
+            this.deps.log?.(
+              `[Box] the durable entry-attempt consumption failed (${outcome.detail}); ` +
+                "entry stays refused, because an unrecorded attempt would be unbounded.",
+            );
+            return {
+              ok: false,
+              detail:
+                "the entry attempt could not be durably recorded, so it was NOT started. Counting attempts " +
+                "is what bounds repeated failed attempts, and an unrecorded attempt would be unbounded. " +
+                `(${outcome.detail})`,
+            };
+          }
+          // A genuine refusal by the durable ceiling or by session identity. ADOPT what the database
+          // reported, so a manager whose view had drifted behind another writer stops offering an
+          // allowance that is already spent.
+          if (outcome.entry_attempts !== null) {
+            this.record = {
+              ...this.record,
+              entry_attempts: outcome.entry_attempts,
+              ...(outcome.max_entry_attempts !== null
+                ? { max_entry_attempts: outcome.max_entry_attempts }
+                : {}),
+            };
+          }
+          return { ok: false, detail: outcome.detail };
+        }
+        // Admitted. The returned counter is the durable truth; adopting it rather than our own
+        // arithmetic self-heals a stale view and can never under-count.
+        this.record = {
+          ...this.record,
+          entry_attempts: outcome.entry_attempts,
+          max_entry_attempts: outcome.max_entry_attempts,
+          updated_at: this.now(),
+        };
+        this.writeFailed = false;
+        return { ok: true, detail: null };
+      }
+
+      // FALLBACK: no atomic consumption was injected. Correct for a single manager, and the only
+      // behaviour that existed before; `usesAtomicAttemptConsumption()` reports that the stronger
+      // guarantee is absent so nothing downstream claims it.
       const next = recordEntryAttemptStarted(this.record, this.now());
       if (!(await this.commit(next, "entry attempt started", true))) {
         return {
@@ -520,6 +637,16 @@ export class BoxTradingSessionManager {
       }
       return { ok: true, detail: null };
     });
+  }
+
+  /**
+   * Whether the attempt ceiling is enforced by the DATABASE rather than by this process's memory.
+   *
+   * Published so the status projection cannot imply a cross-process guarantee that is not in force.
+   * False means the ceiling bounds this manager only.
+   */
+  usesAtomicAttemptConsumption(): boolean {
+    return this.deps.persistence.consumeEntryAttempt !== undefined;
   }
 
   async recordAborted(): Promise<void> {

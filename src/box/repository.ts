@@ -22,6 +22,7 @@
 import { randomBytes } from "node:crypto";
 import type { PoolClient } from "pg";
 import {
+  boundedError,
   getPool,
   isPgReady,
   isUniqueViolation,
@@ -3274,17 +3275,50 @@ export async function loadBoxTradingSession(): Promise<
   }
 }
 
-/** Persist the trading-session record. THROWS on failure, deliberately. */
 /** A non-negative integer, defaulting a missing/hostile value to 0. Never NaN, never null. */
 function nonNegativeInt(value: unknown): number {
   const n = typeof value === "number" ? value : Number(value);
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
 }
 
-export async function saveBoxTradingSession(record: BoxSessionRecord): Promise<void> {
+/**
+ * Persist the trading-session record.
+ *
+ * THE ATTEMPT-BUDGET COLUMNS ARE NOT WRITTEN BY DEFAULT, AND THAT IS THE SAFETY PROPERTY.
+ *
+ * This used to be an unconditional full-row upsert including `entry_attempts = $11`, where `$11`
+ * was a number computed in Node from a record read at some earlier instant. Two consequences, both
+ * reproduced in `tests/pg/sessionBudgetTwoManagers.test.mjs`:
+ *
+ *   1. LOST UPDATE. Two managers that each read `entry_attempts = 0` both computed 1 and both wrote
+ *      1. Both were admitted; the row said one attempt had been spent. With a ceiling of 4 and ten
+ *      concurrent consumers, all ten were admitted and the row said 4.
+ *   2. STALE ROLLBACK. Any OTHER mutation — `recordAborted()`, `recordCompleted()`, boot
+ *      reconciliation — rewrote the whole row from its own snapshot. A manager holding a record from
+ *      before two attempts were spent reset the counter to 0 and handed the budget back.
+ *
+ * Consumption now goes through `consumeBoxTradingSessionEntryAttempt`, which increments inside the
+ * database. For that to mean anything, every other writer must leave the counter alone — otherwise
+ * the atomic increment is simply overwritten by the next unrelated save. So on conflict this
+ * statement preserves the DURABLE `entry_attempts`/`max_entry_attempts` unless the caller explicitly
+ * claims them.
+ *
+ * `claimsAttemptBudget` is for the writes that legitimately ESTABLISH a budget rather than spend it:
+ * arming a session (a new `session_id`, ceiling from the operator, zero spent) and disarming one.
+ * Those are the only callers permitted to set these two columns, they are already serialised by the
+ * manager, and they are the ones whose whole purpose is to define the budget.
+ *
+ * On INSERT (no row yet) the record's own values are used in both modes: there is no durable value
+ * to preserve, and a first write is by definition establishing.
+ */
+export async function saveBoxTradingSession(
+  record: BoxSessionRecord,
+  options?: { readonly claimsAttemptBudget?: boolean },
+): Promise<void> {
   if (!isBoxDbEnabled()) {
     throw new Error("Box persistence is not configured, so session state cannot be saved.");
   }
+  const claims = options?.claimsAttemptBudget === true;
   await query(
     `INSERT INTO box_trading_session
        (id, session_id, armed_at, armed_by, max_completed_trades, established_trade_ids,
@@ -3295,7 +3329,8 @@ export async function saveBoxTradingSession(record: BoxSessionRecord): Promise<v
        session_id = $2, armed_at = $3, armed_by = $4, max_completed_trades = $5,
        established_trade_ids = $6::jsonb, completed_trade_ids = $7::jsonb,
        aborted_attempts = $8, arm_count = $9, updated_at = $10,
-       entry_attempts = $11, max_entry_attempts = $12`,
+       entry_attempts = ${claims ? "$11" : "box_trading_session.entry_attempts"},
+       max_entry_attempts = ${claims ? "$12" : "box_trading_session.max_entry_attempts"}`,
     [
       TRADING_SESSION_ID, record.session_id,
       record.armed_at === null ? null : new Date(record.armed_at), record.armed_by,
@@ -3313,6 +3348,125 @@ export async function saveBoxTradingSession(record: BoxSessionRecord): Promise<v
       nonNegativeInt(record.entry_attempts), nonNegativeInt(record.max_entry_attempts),
     ],
   );
+}
+
+/** The outcome of trying to spend one durable entry attempt. */
+export type ConsumeEntryAttemptOutcome =
+  | { readonly ok: true; readonly entry_attempts: number; readonly max_entry_attempts: number }
+  | {
+      readonly ok: false;
+      readonly reason: "budget_exhausted" | "session_changed" | "no_session" | "error";
+      readonly detail: string;
+      readonly entry_attempts: number | null;
+      readonly max_entry_attempts: number | null;
+    };
+
+/**
+ * SPEND ONE ENTRY ATTEMPT, ATOMICALLY, INSIDE POSTGRESQL.
+ *
+ * This is the authority for the attempt ceiling. It replaces a read-modify-write that happened in
+ * Node across an `await`, which could not bound anything once more than one manager existed (see the
+ * docblock on `saveBoxTradingSession` and `tests/pg/sessionBudgetTwoManagers.test.mjs`).
+ *
+ * The whole decision is one statement, so PostgreSQL's row lock serialises every contender:
+ *
+ *   - `entry_attempts = entry_attempts + 1` reads and writes the DURABLE value. No caller snapshot
+ *     participates, so there is nothing to lose and nothing stale to roll back.
+ *   - `entry_attempts < max_entry_attempts` is evaluated against that same durable value under the
+ *     same lock, so the ceiling is the ceiling no matter how many callers arrive together. A zero
+ *     ceiling means UNBOUNDED, matching `isAttemptBudgetExhausted` in the pure state machine.
+ *   - `session_id = $2` fences the spend to the session the caller was authorised under. An attempt
+ *     admitted against a session that has since been re-armed must NOT consume the new session's
+ *     budget — re-arming is an operator establishing a fresh allowance, not topping up an old one.
+ *
+ * A zero `rowCount` is the refusal, and it is deliberately not self-explaining: the same zero covers
+ * "exhausted", "re-armed" and "no row". So on refusal we re-read to say which, for the operator's
+ * benefit only — the refusal itself is already decided and cannot be revised by that read.
+ *
+ * RETURNS the post-increment counter on success. The caller should adopt it rather than its own
+ * arithmetic: it is the durable truth, and adopting it self-heals a manager whose in-memory view had
+ * drifted behind another writer.
+ */
+export async function consumeBoxTradingSessionEntryAttempt(args: {
+  readonly sessionId: string;
+  readonly now: number;
+}): Promise<ConsumeEntryAttemptOutcome> {
+  if (!isBoxDbEnabled()) {
+    return {
+      ok: false,
+      reason: "error",
+      detail: "Box persistence is not configured, so an entry attempt cannot be durably consumed.",
+      entry_attempts: null,
+      max_entry_attempts: null,
+    };
+  }
+  try {
+    const { rows } = await query(
+      `UPDATE box_trading_session
+          SET entry_attempts = entry_attempts + 1,
+              updated_at = $3
+        WHERE id = $1
+          AND session_id = $2
+          AND (max_entry_attempts = 0 OR entry_attempts < max_entry_attempts)
+        RETURNING entry_attempts, max_entry_attempts`,
+      [TRADING_SESSION_ID, args.sessionId, new Date(args.now)],
+    );
+    const row = rows[0];
+    if (row) {
+      return {
+        ok: true,
+        entry_attempts: nonNegativeInt(row.entry_attempts),
+        max_entry_attempts: nonNegativeInt(row.max_entry_attempts),
+      };
+    }
+    // Refused. Explain which of the three predicates failed, for the operator-facing detail only.
+    const { rows: current } = await query(
+      `SELECT session_id, entry_attempts, max_entry_attempts FROM box_trading_session WHERE id = $1`,
+      [TRADING_SESSION_ID],
+    );
+    const now = current[0];
+    if (!now) {
+      return {
+        ok: false,
+        reason: "no_session",
+        detail:
+          "there is no durable trading-session row, so an entry attempt cannot be accounted for. " +
+          "Arm a session before entering.",
+        entry_attempts: null,
+        max_entry_attempts: null,
+      };
+    }
+    const spent = nonNegativeInt(now.entry_attempts);
+    const ceiling = nonNegativeInt(now.max_entry_attempts);
+    if (typeof now.session_id === "string" && now.session_id !== args.sessionId) {
+      return {
+        ok: false,
+        reason: "session_changed",
+        detail:
+          "the durable trading session was re-armed under a new session id after this entry was " +
+          "admitted, so its authorisation is void and no attempt was consumed",
+        entry_attempts: spent,
+        max_entry_attempts: ceiling,
+      };
+    }
+    return {
+      ok: false,
+      reason: "budget_exhausted",
+      detail:
+        `the session attempt budget is exhausted (${spent} of ${ceiling} spent), so no further ` +
+        "entry attempt may be started under this arming",
+      entry_attempts: spent,
+      max_entry_attempts: ceiling,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      reason: "error",
+      detail: `the entry attempt could not be durably consumed (${boundedError(err)})`,
+      entry_attempts: null,
+      max_entry_attempts: null,
+    };
+  }
 }
 
 /* ------------------- execution-latency calibration samples ------------------- */

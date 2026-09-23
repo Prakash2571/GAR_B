@@ -226,6 +226,7 @@ import {
   loadOpenBoxTrades,
   loadUnresolvedBoxExecutionAttempts,
   markBoxTradeRecovery,
+  consumeBoxTradingSessionEntryAttempt,
   loadBoxCalibrationSamples,
   persistBoxCalibrationSamples,
   prepareBoxPnlDeletion,
@@ -1547,8 +1548,14 @@ export class BoxEngine {
     this.session = new BoxTradingSessionManager({
       persistence: {
         load: () => loadBoxTradingSession(),
-        save: (record) => saveBoxTradingSession(record),
+        save: (record, options) => saveBoxTradingSession(record, options),
         flatTradeIds: (ids) => loadFlatBoxTradeIds(ids),
+        // THE ATTEMPT CEILING IS ENFORCED IN THE DATABASE, not in this process's memory. One
+        // statement increments and bounds under one row lock, fenced to the session id the attempt
+        // was authorised under, so two managers — in one process or two — cannot both spend the same
+        // allowance. See `consumeBoxTradingSessionEntryAttempt` and
+        // `tests/pg/sessionBudgetTwoManagers.test.mjs`.
+        consumeEntryAttempt: (args) => consumeBoxTradingSessionEntryAttempt(args),
       },
       configuredMaxCompletedTrades: () => this.cfg.sessionMaxCompletedTrades,
       // THE ATTEMPT CEILING. Bounds attempts STARTED, not trades completed — see the field comment
