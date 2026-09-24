@@ -15,6 +15,7 @@ import type { Express, Request, RequestHandler, Response } from "express";
 import { KiteError } from "../kite.js";
 import { rateLimit } from "../ratelimit.js";
 import type { BoxEngine } from "./engine.js";
+import { flattenHttpStatus } from "./flattenOutcome.js";
 import {
   isBoxDbEnabled,
   loadBoxEvents,
@@ -510,6 +511,12 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
    * A refused sweep is now **409**, and a partially-failed sweep is **207**, so a client cannot read
    * either as a clean result. The full result object carries `blocked_reason`, `examined`, `eligible`
    * and per-intent `failures`.
+   *
+   * It also carries `operation_id` and `deduplicated`. A browser that gives up on a request does NOT
+   * cancel the server operation, so a client whose deadline expired and retried would otherwise start a
+   * second sweep racing the first. A second concurrent request JOINS the running operation and receives
+   * its real result; `deduplicated: true` says so, and the shared `operation_id` lets the client
+   * correlate the two. See `exposureOperations.ts`.
    */
   app.post("/api/box/live/cancel-working", requireOperator, async (req: Request, res: Response) => {
     if (!requireFull(req, res)) return;
@@ -531,10 +538,29 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
     } catch (err) { fail(res, err); }
   });
 
+  /**
+   * EMERGENCY FLATTEN OF ATTRIBUTED BOX EXPOSURE.
+   *
+   * `ok` and the status code come from WHAT WAS ACHIEVED, not from the fact that the call returned.
+   * This route used to be `res.json({ ok: true, ...(await engine.flattenAttributedBoxExposure()), … })`
+   * — a hardcoded literal, always HTTP 200, over a `results: unknown[]` whose entries are frequently
+   * `{ ok: false }` (exchange closed, feed unhealthy, position in RECOVERY, position already closing,
+   * PostgreSQL down). The frontend inspected only the cancellation and reconciliation halves, so an
+   * operator whose every position failed to close saw a green success toast.
+   *
+   * Now: **200** only on positive evidence that nothing remains, **409** when nothing was reduced and
+   * every reason is known, **207** for anything mixed or unproven. `outcome`, `blockers`,
+   * `remaining_quantity` (null = UNKNOWN, never rendered as zero) and `next_action` carry the detail.
+   * See `flattenOutcome.ts` for the aggregation rules.
+   *
+   * This is the same correction the cancel-working route above already received, and for the same
+   * reason: a successful HTTP response is not evidence of flatness.
+   */
   app.post("/api/box/live/flatten", requireOperator, async (req: Request, res: Response) => {
     if (!requireFull(req, res)) return;
     try {
-      res.json({ ok: true, ...(await engine.flattenAttributedBoxExposure()), status: engine.getStatus() });
+      const result = await engine.flattenAttributedBoxExposure();
+      res.status(flattenHttpStatus(result)).json({ ...result, status: engine.getStatus() });
     } catch (err) { fail(res, err); }
   });
 

@@ -116,6 +116,20 @@ export interface BoxMonitorDeps {
   istMinutesOfDay: () => number;
   isMarketOpen: () => boolean;
   isFeedHealthy: () => boolean;
+  /**
+   * WHY a reduction cannot be worked right now while the WS feed is unhealthy, or null when it can.
+   *
+   * Optional so every existing construction site is unchanged: absent means "no degraded assessment is
+   * wired", and the caller falls back to the plain `isFeedHealthy()` gate exactly as before.
+   *
+   * It exists because returning early on `!isFeedHealthy()` was SILENT. The monitor bailed out above
+   * its liquidity gate, so an outage emitted no `EXIT_SKIPPED_LIQUIDITY` event and set no
+   * `exit_blocked_reason` — the position simply went quiet, and the one alarm that still fired
+   * (`EXPIRY_SAFETY`) demanded an exit that was blocked four lines later with no explanation.
+   *
+   * See `degradedRecovery.ts` for the policy this reports.
+   */
+  degradedReductionBlockReason?: (pos: BoxOpenPosition) => string | null;
 }
 
 /**
@@ -473,7 +487,35 @@ export class BoxPositionMonitor {
     // Outside market hours / dead feed: refresh metrics, attempt nothing. Neither
     // is a liquidity event. Detection above has already run and alerted.
     if (!this.deps.isMarketOpen()) return;
-    if (!this.deps.isFeedHealthy()) return;
+    if (!this.deps.isFeedHealthy()) {
+      /*
+       * THE OUTAGE IS NOW VISIBLE — BUT IT IS NOT LABELLED A LIQUIDITY PROBLEM.
+       *
+       * This used to be a bare `return`, which was the defect: the monitor bailed out ABOVE its
+       * liquidity gate, so nothing was recorded at all. An operator watching a position through a feed
+       * outage saw nothing — and on expiry day the EXPIRY_SAFETY alarm above fired demanding an exit
+       * that was blocked here with no explanation.
+       *
+       * The event is deliberately ERROR and NOT `EXIT_SKIPPED_LIQUIDITY`. A dead feed is not a thin
+       * book, and saying "skipped for liquidity" would send the operator looking at depth that is
+       * simply unobserved. ERROR is the same channel the RECOVERY block below uses for exactly this
+       * reason: blocked, but not by the market.
+       *
+       * Nothing is attempted, exactly as before. Deduplicated by `lastBlockedKey` so a dead socket
+       * cannot flood the ledger.
+       */
+      const detail = this.deps.degradedReductionBlockReason?.(pos)
+        ?? "the market-data feed is not healthy enough to price a reduction, so nothing was attempted. " +
+           "The position is unchanged, still owned and still monitored. If this does not clear, reduce " +
+           "it at the broker terminal.";
+      pos.exit_blocked_reason = detail;
+      const gapKey = `feed_unhealthy:${detail.slice(0, 80)}`;
+      if (this.lastBlockedKey.get(pos.id) !== gapKey) {
+        this.lastBlockedKey.set(pos.id, gapKey);
+        this.deps.onEvent("ERROR", pos, metrics, detail);
+      }
+      return;
+    }
 
     // RECOVERY means broker attribution/quantity is not yet trusted. Never feed it
     // into ordinary box convergence or automatic flattening; OrderManager
@@ -1193,9 +1235,15 @@ export class BoxPositionMonitor {
       };
     }
     if (!this.deps.isFeedHealthy()) {
+      // The refusal now carries the DEGRADED assessment when one is wired, so the operator learns
+      // whether the broker could price this at all and what the remaining route is — rather than a
+      // bare "feed unavailable" that leaves them guessing. Nothing is attempted either way.
+      const detail = this.deps.degradedReductionBlockReason?.(pos)
+        ?? "Cannot close while the live WebSocket feed is unavailable. The position is still monitored.";
+      pos.exit_blocked_reason = detail;
       return {
         ok: false,
-        error: "Cannot close while the live WebSocket feed is unavailable. The position is still monitored.",
+        error: detail,
         metrics: pos.metrics,
         code: 409,
       };

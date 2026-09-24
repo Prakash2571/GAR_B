@@ -131,6 +131,23 @@ import {
   isDeploymentIdExplicit,
   type ReservationStack,
 } from "./reservations/index.js";
+import { mintOwnerId } from "./reservations/identity.js";
+import { BoxExecutionLeaseManager, executionLeaseStatus } from "./executionLease.js";
+import {
+  buildAttributedFlattenResult,
+  classifyPositionClose,
+  classifyResidualFlatten,
+  type AttributedFlattenResult,
+  type FlattenItemOutcome,
+} from "./flattenOutcome.js";
+import { ExposureOperationRegistry } from "./exposureOperations.js";
+import {
+  degradedRecoveryStatus,
+  degradedRecoveryVerdict,
+  type DegradedRecoveryStatus,
+  type FeedCondition,
+  type RecoveryDepthCapability,
+} from "./degradedRecovery.js";
 import {
   BoxOrderManager,
   orderManagerLimitsFromConfig,
@@ -226,6 +243,7 @@ import {
   loadOpenBoxTrades,
   loadUnresolvedBoxExecutionAttempts,
   markBoxTradeRecovery,
+  consumeBoxTradingSessionEntryAttempt,
   loadBoxCalibrationSamples,
   persistBoxCalibrationSamples,
   prepareBoxPnlDeletion,
@@ -845,6 +863,31 @@ export class BoxEngine {
    */
   private readonly session: BoxTradingSessionManager;
   /**
+   * EXCLUSIVE, ACCOUNT-SCOPED EXECUTION OWNERSHIP.
+   *
+   * The one thing the deployment previously assumed rather than enforced. `backend_instance_epoch`
+   * orders a frontend's readiness decisions across a restart; it grants no exclusivity, and because
+   * its increment is atomic two live processes always get DIFFERENT ordinals, so the "two instances"
+   * branch of `orderReadinessDecision()` — which needs EQUAL ordinals — cannot fire for the topology
+   * it was meant to catch. UI restart ordering is not execution fencing.
+   *
+   * Its `dispatchBlockReason()` is consulted SYNCHRONOUSLY at CHECKPOINT 5 in the order manager. See
+   * `executionLease.ts` for exactly what a lease can and cannot guarantee — in particular that it
+   * cannot retract a request already on the wire, and that neither broker accepts a fencing token.
+   */
+  private readonly executionLease: BoxExecutionLeaseManager;
+  /**
+   * SERVER-SIDE SINGLE-FLIGHT for the exposure-reducing operations.
+   *
+   * A browser that abandons a request does not cancel the server operation, so bounding the client's
+   * wait creates the risk that an operator retries and a SECOND cancellation or flatten begins while the
+   * first is still working. A second caller joins the running operation and receives its real result;
+   * no second broker action is taken. See `exposureOperations.ts`.
+   */
+  private readonly exposureOperations = new ExposureOperationRegistry({
+    log: (message) => console.warn(message),
+  });
+  /**
    * The live broker adapter, when one was constructed.
    *
    * Null in every paper deployment — which is the structural guarantee that a paper process
@@ -1349,6 +1392,15 @@ export class BoxEngine {
           }
           return null;
         },
+        // EXCLUSIVE EXECUTION OWNERSHIP, asked synchronously in the last instant before the wire.
+        //
+        // Every other guard in CHECKPOINT 5 reads only THIS process's state and would authorise a
+        // second instance's POST just as readily. This is the only one that can answer "might another
+        // process be trading this account right now".
+        //
+        // Read through a closure rather than captured, because `this.executionLease` is constructed
+        // after the order manager — and because the lease state legitimately changes under it.
+        executionOwnershipBlockReason: (use) => this.executionLease.dispatchBlockReason(use),
       });
     }
     const centralGateway = this.centralGateway = new CentralBoxExecutionGateway({
@@ -1547,8 +1599,14 @@ export class BoxEngine {
     this.session = new BoxTradingSessionManager({
       persistence: {
         load: () => loadBoxTradingSession(),
-        save: (record) => saveBoxTradingSession(record),
+        save: (record, options) => saveBoxTradingSession(record, options),
         flatTradeIds: (ids) => loadFlatBoxTradeIds(ids),
+        // THE ATTEMPT CEILING IS ENFORCED IN THE DATABASE, not in this process's memory. One
+        // statement increments and bounds under one row lock, fenced to the session id the attempt
+        // was authorised under, so two managers — in one process or two — cannot both spend the same
+        // allowance. See `consumeBoxTradingSessionEntryAttempt` and
+        // `tests/pg/sessionBudgetTwoManagers.test.mjs`.
+        consumeEntryAttempt: (args) => consumeBoxTradingSessionEntryAttempt(args),
       },
       configuredMaxCompletedTrades: () => this.cfg.sessionMaxCompletedTrades,
       // THE ATTEMPT CEILING. Bounds attempts STARTED, not trades completed — see the field comment
@@ -1558,6 +1616,41 @@ export class BoxEngine {
       // leave the session layer inert; the second must fail entry closed.
       persistenceAvailable: () => isBoxDbEnabled(),
       log: (message) => console.warn(message),
+    });
+
+    // EXECUTION OWNERSHIP. Constructed here, beside the session manager, because the two answer
+    // adjacent questions: the session bounds HOW MANY attempts this deployment may make, and the lease
+    // bounds WHICH PROCESS may make them. A bounded budget spent by two processes is still two
+    // processes trading one account.
+    this.executionLease = new BoxExecutionLeaseManager({
+      deployment: this.reservations.identity.deployment,
+      instance: this.reservations.identity.instance,
+      // One owner id per process, minted from the same identity the instrument reservations use, so a
+      // restarted process with a recycled pid is correctly "not me".
+      owner: mintOwnerId(this.reservations.identity, "exec-lease", 0),
+      broker: () => String(this.deps.activeBroker()),
+      // Prefer the adapter's own account — resolved from the credential holder, so it cannot drift
+      // from the token in use — and fall back to the session account. Null when neither can prove it,
+      // which makes the lease inactive and (per `dispatchBlockReason`) refuses NEW ENTRY only.
+      account: () => this.liveAdapter?.dispatchAccount?.() ?? this.liveBrokerAccount(),
+      persistenceAvailable: () => isBoxDbEnabled(),
+      liveCapable: () => this.cfg.executionMode === "live",
+      log: (message) => console.warn(message),
+      // TAKEOVER RECONCILIATION. Before a successor may start NEW entry it must establish what the
+      // previous owner left behind at the broker. `reconcile()` is the existing pass that walks the
+      // durable order journal against broker state; requiring it to COMPLETE (not merely run) is what
+      // the reconciled stamp records.
+      reconcileAfterTakeover: async () => {
+        const manager = this.orderManager;
+        if (manager === null) return false;
+        try {
+          await manager.reconcile();
+          return manager.status().health.reconciliation_complete === true;
+        } catch (err) {
+          console.warn("[Box] takeover reconciliation pass failed:", err);
+          return false;
+        }
+      },
     });
 
     this.coordinator = new CoordinatedBoxExecutionGateway({
@@ -1763,6 +1856,10 @@ export class BoxEngine {
       istMinutesOfDay: () => istMinutesOfDay(),
       isMarketOpen: () => this.marketOpen,
       isFeedHealthy: () => this.isFeedHealthy(),
+      // WHY a reduction cannot be worked while the WS feed is unhealthy. The monitor used to return
+      // silently here; now the position carries the reason and the reason names the broker terminal when
+      // that is the only remaining route. See `degradedRecovery.ts`.
+      degradedReductionBlockReason: (pos) => this.degradedReductionBlockReason(pos),
     });
 
     // Read-path cache for today's closed trades (inert without Upstash).
@@ -1846,6 +1943,22 @@ export class BoxEngine {
     // reports and fails closed on, not a reason to stop the engine from booting and
     // managing exposure that already exists.
     const durableReady = await this.reservations.initialise();
+    // EXECUTION OWNERSHIP, established as early as possible — right after the reservation identity is
+    // usable and before anything can reach a broker. Never throws: a failure leaves the manager
+    // refusing NEW ENTRY while leaving every reduction path open, which is the same trade-off the
+    // durable reservation boot check makes. Refusing to boot would also refuse to monitor, reconcile
+    // and flatten exposure that already exists.
+    await this.executionLease.initialise();
+    if (this.cfg.executionMode === "live") {
+      const lease = this.executionLease.snapshot();
+      console.log(
+        `[Box] execution ownership: ${lease.kind}` +
+          (lease.kind === "held"
+            ? ` (account=${lease.lease.account} fence=${lease.lease.fence}` +
+              `${lease.lease.reconciled ? "" : " takeover NOT yet reconciled"})`
+            : ` — ${lease.detail}`),
+      );
+    }
     if (this.cfg.durableReservationsEnabled) {
       console.log(
         `[Box] durable instrument reservations ${durableReady ? "READY" : "UNAVAILABLE"} ` +
@@ -2974,17 +3087,47 @@ export class BoxEngine {
    * Typed concretely (it was `Promise<unknown>`) so the route cannot accidentally publish a refusal
    * as a success — the compiler now knows there is an `attempted`/`ok`/`blocked_reason` to inspect.
    */
-  async cancelWorkingBoxOrders(): Promise<CancelWorkingBoxOrdersResult> {
-    if (!this.orderManager) throw new Error("Live order manager is unavailable.");
-    return this.orderManager.cancelWorkingBoxOrders();
-  }
-
-  async flattenAttributedBoxExposure(): Promise<{
-    attempted: number;
-    results: unknown[];
-    settlement: { cancelled: number; failures: string[]; blocked: string | null; reconciled: boolean };
+  async cancelWorkingBoxOrders(): Promise<CancelWorkingBoxOrdersResult & {
+    operation_id: string;
+    deduplicated: boolean;
   }> {
     if (!this.orderManager) throw new Error("Live order manager is unavailable.");
+    const manager = this.orderManager;
+    // SINGLE-FLIGHT BY OPERATION KIND. A client whose request timed out and retried must not cause a
+    // second sweep: browser abort does not cancel the server operation. A second caller JOINS the one
+    // already running and receives its real result, so the operator learns what happened instead of
+    // being told "no" about work that is in progress. See `exposureOperations.ts`.
+    const outcome = await this.exposureOperations.run("cancel_working", () =>
+      manager.cancelWorkingBoxOrders(),
+    );
+    return {
+      ...outcome.result,
+      operation_id: outcome.operation_id,
+      deduplicated: outcome.deduplicated,
+    };
+  }
+
+  async flattenAttributedBoxExposure(): Promise<AttributedFlattenResult & {
+    operation_id: string;
+    deduplicated: boolean;
+  }> {
+    // SINGLE-FLIGHT BY OPERATION KIND, for the same reason as the cancellation sweep: a client that
+    // gave up waiting and pressed the button again must not start a second flatten racing the first.
+    // Two flattens over one position can double-close it. A second caller joins and receives the real
+    // result. Kinds are independent, so a wedged cancel sweep does not block this.
+    const outcome = await this.exposureOperations.run("flatten", () =>
+      this.flattenAttributedBoxExposureOnce(),
+    );
+    return {
+      ...outcome.result,
+      operation_id: outcome.operation_id,
+      deduplicated: outcome.deduplicated,
+    };
+  }
+
+  private async flattenAttributedBoxExposureOnce(): Promise<AttributedFlattenResult> {
+    if (!this.orderManager) throw new Error("Live order manager is unavailable.");
+    const manager = this.orderManager;
     const managerStatus = this.orderManager.status();
     if (!managerStatus.controls.emergencyFlatten) {
       throw new Error("box_emergency_flatten is disabled.");
@@ -3022,7 +3165,12 @@ export class BoxEngine {
       cancelled: 0, failures: [], blocked: null, reconciled: false,
     };
     try {
-      const sweep = await this.orderManager.cancelWorkingBoxOrders();
+      // Through the registry, so this JOINS an operator-initiated sweep that is already running rather
+      // than issuing a duplicate that would race it. Dedup, not blocking: the kinds are independent, so
+      // the flatten is never held up by anything other than a cancel sweep it genuinely needs.
+      const sweep = (await this.exposureOperations.run("cancel_working", () =>
+        manager.cancelWorkingBoxOrders(),
+      )).result;
       settlement.cancelled = sweep.cancelled.length;
       settlement.failures = sweep.failures;
       settlement.blocked = sweep.blocked_reason;
@@ -3058,7 +3206,8 @@ export class BoxEngine {
         projectedSymbols.add(`${inst.exchange}:${inst.tradingsymbol}`);
       }
     }
-    const results: unknown[] = [];
+    const items: FlattenItemOutcome[] = [];
+    let attempted = 0;
     for (const position of positions) {
       if (position.position_state === "RECOVERY") {
         // Reconciliation established exact broker equality with the durable map;
@@ -3070,7 +3219,23 @@ export class BoxEngine {
           ? "PARTIALLY_EXITED"
           : deriveBoxPositionState(position.remaining_qty_by_role);
       }
-      results.push(await this.monitor.closeManually(position.id));
+      const label = `${position.underlying} ${position.expiry} ${position.lower_strike}/${position.upper_strike}`;
+      attempted += 1;
+      // EVERY per-position outcome is classified and published. It used to be pushed into an
+      // `unknown[]` that nothing inspected, under a hardcoded `ok: true`.
+      try {
+        const closed = await this.monitor.closeManually(position.id);
+        items.push(classifyPositionClose({ id: position.id, label, result: closed }));
+      } catch (error) {
+        // A throw establishes nothing about whether orders reached the broker, so this is UNRESOLVED
+        // with an unknown remaining quantity — never "not reduced", and never absent from the result.
+        items.push(classifyPositionClose({
+          id: position.id,
+          label,
+          result: null,
+          thrown: error instanceof Error ? error.message : String(error),
+        }));
+      }
     }
     // A crash can leave COMPLETE owned intents before their trade projection was
     // inserted. Reconciliation attributes those exact symbols/quantities; flatten
@@ -3090,7 +3255,26 @@ export class BoxEngine {
         at: new Date(),
       });
       if (!recovery) {
-        throw new Error("Cannot flatten crash-only attributed exposure without a durable recovery ledger row.");
+        // REPORTED, not thrown. Throwing here discarded every per-position outcome computed above —
+        // including successful closes and, worse, unresolved ones the operator most needs to see.
+        items.push({
+          kind: "residual",
+          id: recoveryId,
+          label: crashOnly.map((r) => r.tradingsymbol).join(", "),
+          disposition: "not_reduced",
+          reason:
+            "crash-only attributed exposure cannot be flattened without a durable recovery ledger row, " +
+            "so nothing was attempted for it. The exposure is unchanged and still owned. Restore " +
+            "persistence, or reduce it at the broker terminal.",
+          remaining_quantity: crashOnly.reduce((sum, r) => sum + (r.quantity ?? 0), 0),
+          remaining_by_role: null,
+        });
+        return buildAttributedFlattenResult({
+          requested: positions.length + crashOnly.length,
+          attempted,
+          items,
+          settlement,
+        });
       }
       const durableRecoveryId = recovery._id.toString();
       const durableResidual = (recovery.residual_exposure ?? []) as ResidualLegExposure[];
@@ -3109,55 +3293,87 @@ export class BoxEngine {
         onNewCharge: (charge, observation) =>
           this.noteFlattenCharges(durableRecoveryId, charge, observation),
       });
-      const bootFlatten = await runInitialRegisteredResidualPass({
-        // Set the guard before registration arms the timer, then keep the authoritative row in the
-        // watchdog even when this first pass has no book, is gate-refused, or broker-rejected.
-        markInFlight: () => this.residualFlattenInFlight.add(durableRecoveryId),
-        register: () => this.registerResidual(
-          durableRecoveryId,
-          durableResidual,
-          durableVersion,
-          durableIdentity,
-        ),
-        flatten: async () => {
-          const flattened = await this.execution.flattenResidual({
-            residual: durableResidual,
-            keyPrefix: durableRecoveryId,
-          });
-          const command = createResidualProjectionCommand({
-            attemptId: durableRecoveryId,
-            expectedVersion: durableVersion,
-            expectedResidual: durableResidual,
-            nextResidual: flattened.remaining,
-            flattenChargeDelta: flattened.flatten_charges,
-            flattenChargeDay: this.deps.istDayKey(),
-          });
-          if (residualProjectionChanges(command)) {
-            try {
-              const projection = await this.persistResidualProjection(durableRecoveryId, command);
-              if (projection.status === "not_found") {
+      const requestedResidualQuantity = durableResidual.reduce(
+        (sum, leg) => sum + (Number.isFinite(leg.quantity) ? leg.quantity : 0),
+        0,
+      );
+      attempted += 1;
+      let residualOutcome: FlattenItemOutcome;
+      const residualLabel = durableResidual.map((leg) => leg.tradingsymbol).join(", ");
+      try {
+        const bootFlatten = await runInitialRegisteredResidualPass({
+          // Set the guard before registration arms the timer, then keep the authoritative row in the
+          // watchdog even when this first pass has no book, is gate-refused, or broker-rejected.
+          markInFlight: () => this.residualFlattenInFlight.add(durableRecoveryId),
+          register: () => this.registerResidual(
+            durableRecoveryId,
+            durableResidual,
+            durableVersion,
+            durableIdentity,
+          ),
+          flatten: async () => {
+            const flattened = await this.execution.flattenResidual({
+              residual: durableResidual,
+              keyPrefix: durableRecoveryId,
+            });
+            const command = createResidualProjectionCommand({
+              attemptId: durableRecoveryId,
+              expectedVersion: durableVersion,
+              expectedResidual: durableResidual,
+              nextResidual: flattened.remaining,
+              flattenChargeDelta: flattened.flatten_charges,
+              flattenChargeDay: this.deps.istDayKey(),
+            });
+            if (residualProjectionChanges(command)) {
+              try {
+                const projection = await this.persistResidualProjection(durableRecoveryId, command);
+                if (projection.status === "not_found") {
+                  this.pendingResidualPersists.set(durableRecoveryId, command);
+                  this.execution.invariantViolation("crash-only flatten durable recovery row disappeared");
+                } else if (projection.status === "stale") {
+                  this.execution.invariantViolation(
+                    `crash-only flatten adopted newer durable projection version ${projection.projection_version}`,
+                  );
+                }
+              } catch {
                 this.pendingResidualPersists.set(durableRecoveryId, command);
-                this.execution.invariantViolation("crash-only flatten durable recovery row disappeared");
-              } else if (projection.status === "stale") {
-                this.execution.invariantViolation(
-                  `crash-only flatten adopted newer durable projection version ${projection.projection_version}`,
-                );
+                this.execution.invariantViolation("crash-only flatten awaits durable accounting acknowledgement");
               }
-            } catch {
-              this.pendingResidualPersists.set(durableRecoveryId, command);
-              this.execution.invariantViolation("crash-only flatten awaits durable accounting acknowledgement");
             }
-          }
-          return flattened;
-        },
-        clearInFlight: () => this.residualFlattenInFlight.delete(durableRecoveryId),
-      });
-      results.push(bootFlatten);
+            return flattened;
+          },
+          clearInFlight: () => this.residualFlattenInFlight.delete(durableRecoveryId),
+        });
+        residualOutcome = classifyResidualFlatten({
+          id: durableRecoveryId,
+          label: residualLabel,
+          result: bootFlatten,
+          requestedQuantity: requestedResidualQuantity,
+        });
+      } catch (error) {
+        residualOutcome = classifyResidualFlatten({
+          id: durableRecoveryId,
+          label: residualLabel,
+          result: null,
+          requestedQuantity: requestedResidualQuantity,
+          thrown: error instanceof Error ? error.message : String(error),
+        });
+      }
+      items.push(residualOutcome);
     }
     // `settlement` is published so the operator can see what the flatten did BEFORE it planned:
     // whether working orders were cancelled, whether any refused, and whether quantities were
     // re-established. A flatten that proceeded on an unreconciled snapshot must be visible as such.
-    return { attempted: positions.length + crashOnly.length, results, settlement };
+    //
+    // `ok` and the HTTP status are DERIVED from the per-item outcomes plus settlement, replacing the
+    // route's hardcoded `ok: true`. See `flattenOutcome.ts` for the aggregation rules — in particular
+    // that any unknown remaining quantity makes the whole result unresolved rather than flat.
+    return buildAttributedFlattenResult({
+      requested: positions.length + crashOnly.length,
+      attempted,
+      items,
+      settlement,
+    });
   }
 
   /**
@@ -3204,6 +3420,12 @@ export class BoxEngine {
     // unref'd, but stopping it explicitly keeps the "every timer the engine owns is
     // cleared" property this method exists to guarantee.
     this.coordinator.dispose();
+    // The execution-lease heartbeat. Stopped synchronously here so the "every timer the engine owns is
+    // cleared" property holds; the lease ROW is released by `releaseExecutionOwnership()`, which is a
+    // database write and therefore an awaited shutdown step of its own, ordered before `closePg()`.
+    // Stopping the heartbeat alone is already safe: the cached observation ages out and the dispatch
+    // guard then refuses.
+    this.executionLease.stopHeartbeat();
     // The balance poller. Unref'd, so it could not hold the process open, but stopping it keeps the
     // "every timer the engine owns is cleared" property this method exists to guarantee.
     this.stopAccountFundsTimer(false);
@@ -3219,6 +3441,31 @@ export class BoxEngine {
       this.releaseRetainer();
       this.releaseRetainer = null;
     }
+  }
+
+  /**
+   * RELEASE EXCLUSIVE EXECUTION OWNERSHIP. A separate, awaited shutdown step because it is a database
+   * write and must therefore be ordered before `closePg()`.
+   *
+   * SIGTERM is not an instruction to liquidate, and this does not liquidate: it hands the account back
+   * so a successor need not wait out the lease TTL before it can monitor and reduce the exposure this
+   * process leaves open. A failure here is not a safety problem — the TTL reaps the row — so it never
+   * throws and never blocks shutdown.
+   */
+  async releaseExecutionOwnership(): Promise<void> {
+    await this.executionLease.release().catch((err: unknown) => {
+      console.warn("[Box] failed to release execution ownership during shutdown:", err);
+    });
+  }
+
+  /** The execution-ownership projection, for status and readiness. Never a dispatch decision. */
+  executionOwnershipStatus(): ReturnType<typeof executionLeaseStatus> {
+    return executionLeaseStatus({
+      state: this.executionLease.snapshot(),
+      liveCapable: this.cfg.executionMode === "live",
+      entryBlockReason: this.executionLease.dispatchBlockReason("new_entry"),
+      reductionBlockReason: this.executionLease.dispatchBlockReason("exposure_reduction"),
+    });
   }
 
   /**
@@ -3547,6 +3794,86 @@ export class BoxEngine {
       this.scanner.setFeedHealthy(true);
       this.orderManager?.setFeedHealthy(true);
     }
+  }
+
+  /**
+   * DEGRADED-RECOVERY CAPABILITY for the active broker.
+   *
+   * `supported` records whether the broker has a REST depth endpoint that does NOT substitute the last
+   * traded price for a missing touch:
+   *
+   *   · Zerodha — YES, via `KiteClient.getQuoteLadder()`, which returns real 5-level bids/asks filtered
+   *     to `price > 0`. NOT `getQuoteDepth()`, whose `?? last` fallback manufactures a two-sided price
+   *     for an unquoted instrument.
+   *   · Dhan — YES in principle, via `DhanClient.marketFeedQuote()`, which carries 5-level depth with
+   *     per-level order counts.
+   *
+   * `enabled` is separate and currently always FALSE, and that is deliberate rather than an oversight.
+   * The admission test and the policy are complete and tested, but admitting a REST-sourced reference
+   * price at the DISPATCH BOUNDARY is not wired: `executionGateway.precheckOne` is synchronous and
+   * demands a WS quote with a current feed generation, and `checkedFeedBlockReason` re-validates that
+   * same stamp at CHECKPOINT 3 and CHECKPOINT 5. A REST-priced order would therefore be refused at the
+   * last instant anyway, and half-wiring the most safety-critical code in the process to avoid that
+   * would be worse than reporting honestly.
+   *
+   * So the degraded path today makes the outage VISIBLE and EXACT — which position, why, and that the
+   * broker terminal is the remaining route — without claiming it can execute. See
+   * `docs/DEGRADED_RECOVERY.md`.
+   */
+  private degradedRecoveryCapability(): RecoveryDepthCapability {
+    const broker = String(this.deps.activeBroker());
+    const supported = broker === "zerodha" || broker === "dhan";
+    return {
+      supported,
+      enabled: false,
+      detail: supported
+        ? "REST depth exists for this broker, but admitting a REST-sourced reference price at the order " +
+          "dispatch boundary is not wired, so this process will not price a reduction from it. Reductions " +
+          "still require a healthy WebSocket book."
+        : `no REST depth source is known for broker ${broker}, so a reduction cannot be priced while the ` +
+          "WebSocket feed is unhealthy.",
+    };
+  }
+
+  /**
+   * WHY this position cannot be reduced right now, or null when it can.
+   *
+   * Consulted by the monitor in place of a bare `return` on an unhealthy feed. Never consulted for entry:
+   * a degraded feed can never justify creating a new four-leg box, and `streamHealthPolicy.ts` already
+   * records that asymmetry.
+   */
+  private degradedReductionBlockReason(pos: BoxOpenPosition): string | null {
+    const decision = degradedRecoveryVerdict({
+      marketOpen: this.marketOpen,
+      feed: this.isFeedHealthy() ? "healthy" : "unhealthy",
+      capability: this.degradedRecoveryCapability(),
+      // No REST observation is sought while the path is not enabled. When it is, this is where the
+      // per-instrument admission verdict arrives.
+      admission: null,
+      tradingsymbol: `${pos.underlying} ${pos.expiry} ${pos.lower_strike}/${pos.upper_strike}`,
+    });
+    if (decision.kind === "normal") return null;
+    if (decision.kind === "degraded") return null;
+    return decision.blocker;
+  }
+
+  /** The degraded-recovery projection, so the operator sees the state rather than inferring it. */
+  degradedRecoveryState(): DegradedRecoveryStatus {
+    const feed: FeedCondition = this.isFeedHealthy() ? "healthy" : "unhealthy";
+    // Bounded: only positions that actually carry a blocked reason, capped so a wide outage cannot
+    // produce an unbounded projection.
+    const blocked: { tradingsymbol: string; reason: string }[] = [];
+    for (const pos of this.positions.list()) {
+      if (blocked.length >= 20) break;
+      const reason = pos.exit_blocked_reason;
+      if (typeof reason === "string" && reason !== "") {
+        blocked.push({
+          tradingsymbol: `${pos.underlying} ${pos.expiry} ${pos.lower_strike}/${pos.upper_strike}`,
+          reason,
+        });
+      }
+    }
+    return degradedRecoveryStatus({ capability: this.degradedRecoveryCapability(), feed, blocked });
   }
 
   /** Whether the current socket has delivered any raw tick recently. */

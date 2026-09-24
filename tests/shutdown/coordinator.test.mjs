@@ -149,6 +149,10 @@ test("SIGTERM NEVER calls anything that could flatten a position", async () => {
       { name: "stop monitoring and timers (positions preserved)", run: () => {/* dispose: no flatten */} },
       { name: "flush bounded Mongo outbox work", run: () => {} },
       { name: "close HTTP and SSE", run: () => {} },
+      // Hands the broker account back. Named here so the spy proves it is NOT a liquidation: a
+      // successor must be able to adopt and reduce the exposure this process leaves open, and handing
+      // ownership back is how it does that WITHOUT anything being closed on the way out.
+      { name: "release execution ownership", run: () => {/* fence-pinned DELETE: no flatten */} },
       { name: "close MongoDB", run: () => {} },
       { name: "close PostgreSQL", run: () => {} },
     ],
@@ -157,7 +161,7 @@ test("SIGTERM NEVER calls anything that could flatten a position", async () => {
   const result = await coordinator.run("SIGTERM");
   assert.equal(flattenCalls, 0, "NO shutdown step may flatten/liquidate/close a position");
   assert.equal(result.failed.length, 0);
-  assert.equal(result.completed.length, 9);
+  assert.equal(result.completed.length, 10);
 });
 
 test("the Mongo flush is BOUNDED — one pass, not drain-until-empty", async () => {
@@ -215,10 +219,33 @@ test("the declared order matches the specified shutdown order", () => {
     "stop monitoring and timers (positions preserved)",    // stop monitoring/timers
     "flush bounded Mongo outbox work",                     // flush BOUNDED Mongo outbox
     "close HTTP and SSE",                                   // close HTTP/SSE
+    // Hands the broker account back so a replacement instance need not wait out the lease TTL before
+    // it can monitor and reduce the exposure this process leaves open. A DATABASE WRITE, so it must
+    // sit after the engine has stopped and strictly before PostgreSQL closes. It does not liquidate.
+    "release execution ownership",
     "close MongoDB",                                        // close Mongo
     "close PostgreSQL",                                     // close PostgreSQL LAST
   ];
   assert.deepEqual(declared, expected, "the declared step order must match the specified order exactly");
+});
+
+test("execution ownership is released before PostgreSQL closes, and is not a liquidation", () => {
+  const declared = parseDeclaredStepNames();
+  const release = declared.indexOf("release execution ownership");
+  assert.ok(release >= 0, "the lease must be released during shutdown, not merely left to lapse");
+  assert.ok(
+    release < declared.indexOf("close PostgreSQL"),
+    "releasing the lease is a PostgreSQL write, so it must precede closing PostgreSQL",
+  );
+  assert.ok(
+    release > declared.indexOf("stop monitoring and timers (positions preserved)"),
+    "ownership must not be handed back while this process could still dispatch",
+  );
+  assert.doesNotMatch(
+    declared[release],
+    /flatten|liquidate|close position|square.?off/i,
+    "handing back ownership must not be describable as liquidating anything",
+  );
 });
 
 test("PostgreSQL is the LAST declared step and Mongo precedes it", () => {
