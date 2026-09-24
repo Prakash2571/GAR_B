@@ -74,6 +74,15 @@ export interface PendingLogin {
   consentId: string | null;
   startedAtMs: number;
   expiresAtMs: number;
+  /**
+   * When a token exchange for this initiation started, or null when none is running.
+   *
+   * This is what makes the claim single-use WITHOUT destroying the initiation up front: while a claim is
+   * outstanding nothing else may claim the same entry (so a replay cannot run a second exchange), and if
+   * that exchange fails the claim is released rather than the entry deleted. Lapses after
+   * {@link CLAIM_LAPSE_MS} so a crashed exchange cannot lock an operator out.
+   */
+  claimedAtMs: number | null;
 }
 
 /** Why a callback was refused. Stable codes; safe to put in a redirect query string. */
@@ -81,11 +90,39 @@ export type PendingLoginRejection =
   | "no_pending_login"
   | "login_expired"
   | "state_mismatch"
-  | "state_missing";
+  | "state_missing"
+  /** A token exchange for this initiation is already running; a second caller must not start one. */
+  | "login_in_progress";
 
 export type ConsumeResult =
   | { ok: true; pending: PendingLogin }
   | { ok: false; reason: PendingLoginRejection };
+
+/**
+ * A claim on one initiation: the right to attempt ONE token exchange against it.
+ *
+ * Opaque on purpose — a caller may only hand it back to {@link PendingLoginStore.commit} or
+ * {@link PendingLoginStore.release}. It carries the entry for the audit line and the nonce as the key.
+ */
+export interface PendingLoginClaim {
+  readonly pending: PendingLogin;
+  readonly nonce: string;
+  readonly claimedAtMs: number;
+}
+
+export type ClaimResult =
+  | { ok: true; claim: PendingLoginClaim }
+  | { ok: false; reason: PendingLoginRejection };
+
+/**
+ * How long one in-flight exchange may hold a claim before the initiation becomes claimable again.
+ *
+ * Without a lapse, a process that died mid-exchange — or an exchange that hangs on a broker socket —
+ * would leave the operator's initiation locked until its TTL, turning a crash into the very
+ * denial-of-login this protocol exists to prevent. Generous next to a token exchange (one HTTPS call)
+ * and short next to the ten-minute login TTL.
+ */
+export const CLAIM_LAPSE_MS = 60_000;
 
 export interface PendingLoginStoreOptions {
   ttlMs?: number;
@@ -164,6 +201,7 @@ export class PendingLoginStore {
       consentId: opts.consentId ?? null,
       startedAtMs,
       expiresAtMs: startedAtMs + this.ttlMs,
+      claimedAtMs: null,
     };
 
     // Prune lapsed entries first, so a quiet period never counts against the cap.
@@ -178,22 +216,46 @@ export class PendingLoginStore {
     return pending;
   }
 
+  /** Is this entry free to be claimed? A lapsed claim counts as free — see {@link CLAIM_LAPSE_MS}. */
+  private claimable(entry: PendingLogin): boolean {
+    if (entry.claimedAtMs === null) return true;
+    return this.now() - entry.claimedAtMs >= CLAIM_LAPSE_MS;
+  }
+
   /**
-   * Claim the pending login for `broker`, single-use.
+   * ─────────────────────────────────────────────────────────────────────────────────────────────────
+   * CLAIM an initiation for ONE token exchange, WITHOUT spending it yet.
    *
-   * `presentedNonce` is the `state` from the redirect. Pass `null` for a broker that
-   * cannot round-trip one (Dhan); pass the value for one that can (Zerodha). Requiring
-   * the nonce is decided by `requireNonce`, NOT by whether the caller happened to supply
-   * one — otherwise an attacker could downgrade the check simply by omitting `state`.
+   * WHY THIS REPLACED "DELETE, THEN EXCHANGE". The callback is necessarily unauthenticated (the session
+   * cookie is SameSite=Strict, so the browser sends nothing when arriving from the broker). For Zerodha
+   * that is fine: the nonce comes back and proves the caller holds it. For DHAN the broker round-trips
+   * nothing of ours, so any caller presenting a non-empty `tokenId` reached the store — and the store
+   * then DELETED the operator's newest initiation before the exchange was attempted. So a junk callback,
+   * fired while someone was signing in, consumed their attempt; their real redirect arrived moments
+   * later, found nothing claimable, and was told its login had expired. A denial-of-login, repeatable by
+   * anyone who could reach the URL.
+   *
+   * Deleting first was not protecting anything either. The property that matters is that ONE SUCCESSFUL
+   * EXCHANGE happens per initiation, and deleting up front does not provide it — it only guarantees that
+   * a FAILED exchange also destroys the initiation, which is pure loss.
+   *
+   * So the claim is now two-phase. A claim reserves the entry: nothing else may claim it while an
+   * exchange is in flight, which is what stops a replay running a second exchange. Then
+   *   · {@link commit} deletes it — the initiation is spent, and a replayed callback finds nothing;
+   *   · {@link release} un-reserves it — the caller proved nothing, so the real redirect can still use it.
+   * A claim that is never resolved lapses, so a crash cannot lock an operator out.
+   *
+   * `presentedNonce` is the `state` from the redirect. Pass `null` for a broker that cannot round-trip
+   * one (Dhan); pass the value for one that can (Zerodha). Requiring the nonce is decided by
+   * `requireNonce`, NOT by whether the caller happened to supply one — otherwise an attacker could
+   * downgrade the check simply by omitting `state`.
+   * ─────────────────────────────────────────────────────────────────────────────────────────────────
    */
-  consume(
+  claim(
     broker: BrokerId,
     presentedNonce: string | null,
     opts: { requireNonce: boolean },
-  ): ConsumeResult {
-    // Were there ANY entries for this broker, live or lapsed? Distinguishing that from "none
-    // at all" is what lets an operator be told their attempt EXPIRED rather than that it
-    // never happened.
+  ): ClaimResult {
     const existedAtAll = [...this.entries.values()].some((e) => e.broker === broker);
     const live = this.liveFor(broker); // also prunes the lapsed ones
     if (live.length === 0) {
@@ -202,40 +264,82 @@ export class PendingLoginStore {
 
     if (opts.requireNonce) {
       /**
-       * A FAILED PROOF MUST NOT CONSUME THE INITIATION.
-       *
-       * This originally deleted the entry before validating anything, on the reasoning that
-       * a single-use claim should be spent whatever the outcome. That was a denial-of-service:
-       * the callback is necessarily unauthenticated, so ANYONE who could reach it could send
-       * one request with a wrong (or absent) `state` and destroy the operator's in-flight
-       * sign-in — repeatably, and with an error message that blamed the operator's own
-       * browser ("could not be matched to a request from this app").
-       *
-       * A caller that cannot present the nonce has proved nothing and therefore consumes
-       * nothing; the entry stays claimable by the real redirect and otherwise lapses on its
-       * TTL. Single-use still holds where it matters, because a MATCHED claim is spent below.
+       * A FAILED PROOF MUST NOT CONSUME THE INITIATION. (See the long note that used to live in
+       * `consume`: an unauthenticated caller with a wrong or absent `state` could otherwise destroy an
+       * operator's in-flight sign-in, repeatably.) A caller that cannot present the nonce has proved
+       * nothing and therefore claims nothing.
        */
       if (!presentedNonce) return { ok: false, reason: "state_missing" };
-      // Matched against EVERY live entry for this broker, so one operator's redirect is
-      // never refused because a colleague started a sign-in in the meantime. Each candidate
-      // is compared in constant time; a nonce belonging to the other broker cannot match
-      // because `live` is already filtered by broker.
       const matched = live.find((entry) => nonceMatches(presentedNonce, entry.nonce));
       if (!matched) return { ok: false, reason: "state_mismatch" };
-      this.entries.delete(matched.nonce);
-      return { ok: true, pending: matched };
+      // A matched nonce whose exchange is ALREADY running is a replay, not a new login. Refuse without
+      // disturbing the exchange in flight.
+      if (!this.claimable(matched)) return { ok: false, reason: "login_in_progress" };
+      matched.claimedAtMs = this.now();
+      return { ok: true, claim: { pending: matched, nonce: matched.nonce, claimedAtMs: matched.claimedAtMs } };
     }
 
     /**
-     * DHAN: no nonce comes back, so the entries are indistinguishable and ANY live one
-     * authorises this exchange. The most recent is chosen — with concurrent sign-ins the
-     * latest intent is the one most likely being completed right now — and only that one is
-     * spent, so a colleague's parallel attempt survives.
+     * DHAN: no nonce comes back, so the entries are indistinguishable and ANY claimable one authorises
+     * this exchange. The most recent is chosen — with concurrent sign-ins the latest intent is the one
+     * most likely being completed right now — and only that one is reserved, so a colleague's parallel
+     * attempt is untouched.
      */
-    const chosen = live[live.length - 1];
-    if (!chosen) return { ok: false, reason: "no_pending_login" };
-    this.entries.delete(chosen.nonce);
-    return { ok: true, pending: chosen };
+    const claimable = live.filter((entry) => this.claimable(entry));
+    if (claimable.length === 0) {
+      // Every live initiation already has an exchange running. Serialising here is what keeps an
+      // unauthenticated flood from multiplying outbound token exchanges.
+      return { ok: false, reason: "login_in_progress" };
+    }
+    const chosen = claimable[claimable.length - 1];
+    if (chosen === undefined) return { ok: false, reason: "no_pending_login" };
+    chosen.claimedAtMs = this.now();
+    return { ok: true, claim: { pending: chosen, nonce: chosen.nonce, claimedAtMs: chosen.claimedAtMs } };
+  }
+
+  /**
+   * SPEND the initiation: the exchange succeeded, so it must never be usable again.
+   *
+   * This is where single-use actually holds. Returns false when the entry has already gone (a lapsed
+   * claim whose entry expired, or a `clear()` in between), which is not an error — there is simply
+   * nothing left to spend.
+   */
+  commit(claim: PendingLoginClaim): boolean {
+    const entry = this.entries.get(claim.nonce);
+    if (entry === undefined) return false;
+    this.entries.delete(claim.nonce);
+    return true;
+  }
+
+  /**
+   * UN-RESERVE the initiation: this attempt proved nothing, so the operator's login survives.
+   *
+   * Ignored when the claim has already lapsed and someone else holds one, so a slow failed exchange
+   * cannot cancel a newer attempt's reservation.
+   */
+  release(claim: PendingLoginClaim): void {
+    const entry = this.entries.get(claim.nonce);
+    if (entry === undefined) return;
+    if (entry.claimedAtMs !== claim.claimedAtMs) return;
+    entry.claimedAtMs = null;
+  }
+
+  /**
+   * Claim and immediately spend, in one call.
+   *
+   * Kept for callers that have nothing to do between the two halves. The HTTP callback must NOT use it:
+   * it has a token exchange in between, and that exchange failing is exactly the case the two-phase
+   * protocol exists for.
+   */
+  consume(
+    broker: BrokerId,
+    presentedNonce: string | null,
+    opts: { requireNonce: boolean },
+  ): ConsumeResult {
+    const claimed = this.claim(broker, presentedNonce, opts);
+    if (!claimed.ok) return { ok: false, reason: claimed.reason };
+    this.commit(claimed.claim);
+    return { ok: true, pending: claimed.claim.pending };
   }
 
   /** Drop ALL of a broker's pending logins without claiming them (e.g. an explicit logout). */

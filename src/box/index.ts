@@ -33,6 +33,7 @@ import type {
   BoxMarginProvider,
   BoxMarketDataProvider,
 } from "./brokerContext.js";
+import { validateSession } from "../access/sessionStore.js";
 import { LocalChargeCalculator } from "./localCharges.js";
 import type { BoxBoardItem } from "./instruments.js";
 import { registerBoxRoutes } from "./routes.js";
@@ -96,6 +97,14 @@ export interface BoxModuleDeps {
    * what stops the SSE stream being authenticated by a token in the URL.
    */
   getOperatorRole: (req: Parameters<RequestHandler>[0]) => "full" | "trade" | null;
+  /**
+   * Is a session token still live? Optional; when omitted, `validateSession` is used.
+   *
+   * Only the SSE stream needs it, and it needs it because a stream authenticates ONCE and then lives
+   * for hours — see the header of `streamSession.ts`. It must REJECT (not resolve false) when the
+   * session store is unreachable, so "revoked" and "could not ask" stay distinguishable.
+   */
+  isSessionLive?: (sessionToken: string) => Promise<boolean>;
 
   /* ------------------------- broker-neutral overrides ------------------------ */
 
@@ -224,6 +233,10 @@ export function registerBoxModule(app: Express, deps: BoxModuleDeps): BoxModule 
     engine,
     requireOperator: deps.requireOperator,
     getOperatorRole: deps.getOperatorRole,
+    // The default is the same authority every other route uses. `validateSession` returns null for a
+    // revoked, expired or unknown session and THROWS when PostgreSQL cannot answer, and that difference
+    // is preserved here deliberately: the stream sentry treats the two differently.
+    isSessionLive: deps.isSessionLive ?? (async (token: string) => (await validateSession(token)) !== null),
   });
 
   return {

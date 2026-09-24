@@ -44,6 +44,7 @@
  * ─────────────────────────────────────────────────────────────────────────────────────────────────
  */
 
+import { performance } from "node:perf_hooks";
 import {
   acquireExecutionLease,
   ensureExecutionLeaseStoreReady,
@@ -70,6 +71,24 @@ export const DEFAULT_EXECUTION_LEASE_HEARTBEAT_MS = 8_000;
  */
 export const DEFAULT_EXECUTION_LEASE_GUARD_MARGIN_MS = 5_000;
 
+/**
+ * THE DURATION CLOCK. MONOTONIC, NEVER WALL-CLOCK.
+ *
+ * Every local reading in this module is used as one end of a DURATION — "how long ago did I observe the
+ * lease" — and never as an instant to compare against the server's clock. `Date.now()` cannot express
+ * that safely: it is settable. An NTP step, a manual `date -s`, a suspended-and-restored VM or a
+ * container clock correction can move it BACKWARDS, and a backwards step made the guard arithmetic
+ * `now() - observedAtLocal` negative, which the old `Math.max(0, …)` clamp then presented as "observed
+ * zero milliseconds ago" — i.e. maximally fresh. A guard whose freshness improves when the clock slips
+ * is not a guard, so the default source is now monotonic and unsettable.
+ *
+ * `performance.now()` is milliseconds since process start, taken from the platform's monotonic source.
+ * Its epoch is meaningless and that is fine: nothing here compares a local reading to a server instant.
+ */
+export function monotonicNowMs(): number {
+  return performance.now();
+}
+
 /** What a lease is being consulted for. New entry is held to a stricter standard than reduction. */
 export type ExecutionLeaseUse = "new_entry" | "exposure_reduction";
 
@@ -91,9 +110,23 @@ interface ObservedLease {
   readonly fence: number;
   readonly account: string;
   readonly broker: string;
-  /** Server-clock lifetime remaining at the instant of observation, in ms. Never negative. */
+  /**
+   * Server-clock lifetime remaining at the instant of observation, in ms. Never negative.
+   *
+   * ALREADY NET OF THE DATABASE CALL. The server evaluates `clock_timestamp()` inside the statement,
+   * but the application only learns the answer once the statement has finished, the row has crossed the
+   * network, the driver has parsed it and the event loop has got round to the continuation. Every one of
+   * those milliseconds is lease life that had ALREADY been spent by the time this process could act on
+   * the number, so the measured duration of the call is subtracted here. Charging the whole call rather
+   * than half of it is deliberate: the only safe assumption is that the server read its clock at the
+   * earliest possible moment, and being early about expiry costs a refusal while being late costs two
+   * processes on one account.
+   */
   readonly remainingAtObservationMs: number;
-  /** `Date.now()` when that observation was recorded. Used only as a DURATION, never compared. */
+  /**
+   * A MONOTONIC reading (see {@link monotonicNowMs}) taken when that observation was recorded. Used
+   * only as one end of a DURATION, never compared against a server instant.
+   */
   readonly observedAtLocal: number;
   readonly reconciled: boolean;
   /**
@@ -107,13 +140,51 @@ interface ObservedLease {
   readonly takeoverReason: string;
 }
 
+/**
+ * THE STATE MACHINE.
+ *
+ * `refused` and `lost` are the two PROVEN-FOREIGN states: something authoritative told this process
+ * that another instance owns, or may own, the account. They carry the scope the proof was about, so a
+ * later broker switch or account replacement can retire evidence that no longer applies while a
+ * transient database fault cannot. See {@link BoxExecutionLeaseManager.adoptUnproven}.
+ */
 export type ExecutionLeaseState =
   /** No account is known yet, or leasing is not applicable (paper, no live account). */
   | { readonly kind: "inactive"; readonly detail: string }
   | { readonly kind: "held"; readonly lease: ObservedLease }
-  | { readonly kind: "refused"; readonly detail: string; readonly holder: string | null }
-  | { readonly kind: "lost"; readonly detail: string }
+  | {
+      readonly kind: "refused";
+      readonly detail: string;
+      readonly holder: string | null;
+      /** The scope this refusal was proved for. Null when it could not be determined. */
+      readonly scope: string | null;
+    }
+  | {
+      readonly kind: "lost";
+      readonly detail: string;
+      /** The scope this loss was proved for. Null when it could not be determined. */
+      readonly scope: string | null;
+    }
   | { readonly kind: "unavailable"; readonly detail: string };
+
+/**
+ * The durable-store operations this manager drives.
+ *
+ * Injectable for ONE reason that matters: the defect this seam was added for was a bad STATE
+ * TRANSITION — a store error overwriting proven-foreign evidence — and a transition can only be
+ * tested by driving the real state machine across two passes with different store answers. Installing
+ * states directly (as the guard tests do) cannot catch it, and a PostgreSQL-backed test cannot easily
+ * produce "the driver threw" on the second call only. Defaults are the real module functions, so
+ * production wiring passes nothing and behaves exactly as before.
+ */
+export interface ExecutionLeaseStoreOps {
+  readonly acquire: typeof acquireExecutionLease;
+  readonly renew: typeof renewExecutionLease;
+  readonly markReconciled: typeof markExecutionLeaseReconciled;
+  readonly release: typeof releaseExecutionLease;
+  readonly read: typeof readExecutionLease;
+  readonly ready: typeof ensureExecutionLeaseStoreReady;
+}
 
 export interface ExecutionLeaseManagerDeps {
   readonly deployment: string;
@@ -154,6 +225,8 @@ export interface ExecutionLeaseManagerDeps {
    * module must not know how it works — only that it has to happen first.
    */
   readonly reconcileAfterTakeover?: () => Promise<boolean>;
+  /** Override individual durable-store operations. Tests only — see {@link ExecutionLeaseStoreOps}. */
+  readonly store?: Partial<ExecutionLeaseStoreOps>;
 }
 
 export class BoxExecutionLeaseManager {
@@ -169,10 +242,30 @@ export class BoxExecutionLeaseManager {
   /** The scope this manager currently holds or last tried, so a release can be fence-pinned. */
   private currentScope: string | null = null;
 
-  constructor(private readonly deps: ExecutionLeaseManagerDeps) {}
+  private readonly deps: ExecutionLeaseManagerDeps;
+  private readonly store: ExecutionLeaseStoreOps;
 
+  constructor(deps: ExecutionLeaseManagerDeps) {
+    this.deps = deps;
+    this.store = {
+      acquire: deps.store?.acquire ?? acquireExecutionLease,
+      renew: deps.store?.renew ?? renewExecutionLease,
+      markReconciled: deps.store?.markReconciled ?? markExecutionLeaseReconciled,
+      release: deps.store?.release ?? releaseExecutionLease,
+      read: deps.store?.read ?? readExecutionLease,
+      ready: deps.store?.ready ?? ensureExecutionLeaseStoreReady,
+    };
+  }
+
+  /**
+   * The duration clock. Monotonic unless a test injects its own (a counter, which is also monotonic).
+   *
+   * Both readings that ever meet — the observation stamp and the elapsed measurement in
+   * `dispatchBlockReason` — come from HERE, so they are always the same clock. Do not reintroduce
+   * `Date.now()`: see {@link monotonicNowMs}.
+   */
   private now(): number {
-    return this.deps.now ? this.deps.now() : Date.now();
+    return this.deps.now ? this.deps.now() : monotonicNowMs();
   }
 
   private ttl(): number {
@@ -201,9 +294,12 @@ export class BoxExecutionLeaseManager {
    * observation the heartbeat maintains.
    *
    * THE ARITHMETIC IS SKEW-FREE. `remainingAtObservationMs` is a DIFFERENCE of two server-clock
-   * readings (`expires_at - clock_timestamp()`) taken in one statement, so no local clock takes part.
-   * The local clock contributes only ELAPSED time since the observation, used as a duration. Nothing
-   * compares a local instant with a server instant.
+   * readings (`expires_at - clock_timestamp()`) taken in one statement, so no local clock takes part —
+   * less the measured duration of the database call itself, which had already elapsed before this
+   * process could act on the answer. The local clock contributes only ELAPSED time since the
+   * observation, used as a duration and read from a MONOTONIC source, so nothing compares a local
+   * instant with a server instant and no settable clock can make the observation look younger than it
+   * is. A duration that measures negative anyway is treated as unprovable, never as fresh.
    *
    * ────────────────────────────────────────────────────────────────────────────────────────────────
    * THE ASYMMETRY BETWEEN ENTRY AND REDUCTION IS THE MOST IMPORTANT THING IN THIS METHOD.
@@ -233,7 +329,26 @@ export class BoxExecutionLeaseManager {
 
     const state = this.state;
     if (state.kind === "held") {
-      const elapsed = Math.max(0, this.now() - state.lease.observedAtLocal);
+      const rawElapsed = this.now() - state.lease.observedAtLocal;
+      if (rawElapsed < 0) {
+        /*
+         * THE CLOCK WENT BACKWARDS. Refuse both directions.
+         *
+         * This is unreachable with the default monotonic source and is kept as a hard backstop for an
+         * injected clock. It used to be silently clamped to zero by `Math.max(0, …)`, which reported the
+         * observation as maximally FRESH and let the guard pass for as long as the backwards step was
+         * large — the one failure mode where a broken clock made the guard more permissive instead of
+         * less. An unexplained negative duration means the measurement cannot be trusted at all, and an
+         * untrustworthy measurement is not proof of ownership.
+         */
+        return (
+          `this process cannot prove it still owns execution for ${state.lease.broker} account ` +
+          `${state.lease.account}: its duration clock moved BACKWARDS by ` +
+          `${Math.round(-rawElapsed)}ms since the lease was observed, so the age of that observation ` +
+          "cannot be measured. Refusing rather than treat an unmeasurable observation as fresh."
+        );
+      }
+      const elapsed = rawElapsed;
       const remaining = state.lease.remainingAtObservationMs - elapsed;
       if (remaining <= this.margin()) {
         // PROVEN-UNPROVABLE: we cannot show we still hold it, so a successor may already exist.
@@ -242,9 +357,9 @@ export class BoxExecutionLeaseManager {
         // case reduction is already refused upstream for want of the durable order journal.
         return (
           `this process cannot prove it still owns execution for ${state.lease.broker} account ` +
-          `${state.lease.account}: its lease observation is ${elapsed}ms old and leaves ` +
-          `${Math.max(0, remaining)}ms of provable life, under the ${this.margin()}ms guard margin. ` +
-          "Refusing rather than risk two instances acting on one account."
+          `${state.lease.account}: its lease observation is ${Math.round(elapsed)}ms old and leaves ` +
+          `${Math.round(Math.max(0, remaining))}ms of provable life, under the ${this.margin()}ms guard ` +
+          "margin. Refusing rather than risk two instances acting on one account."
         );
       }
       if (use === "new_entry" && !state.lease.reconciled) {
@@ -331,21 +446,32 @@ export class BoxExecutionLeaseManager {
       // No durable authority ⇒ exclusivity cannot be established. For a LIVE-capable deployment that
       // is a refusal, not a pass: without PostgreSQL there is no way to know whether another instance
       // is trading the same account.
-      return this.adopt({
-        kind: "unavailable",
-        detail:
-          "durable persistence is unavailable, so exclusive execution ownership cannot be " +
-          "established or proven. Live order dispatch stays refused until PostgreSQL is reachable.",
-      });
+      //
+      // UNPROVEN, so it cannot overwrite a standing refusal: losing the database does not mean the
+      // instance that holds the lease stopped trading — if anything it is the same outage.
+      return this.adoptUnproven(
+        {
+          kind: "unavailable",
+          detail:
+            "durable persistence is unavailable, so exclusive execution ownership cannot be " +
+            "established or proven. Live order dispatch stays refused until PostgreSQL is reachable.",
+        },
+        null,
+      );
     }
     const account = this.deps.account();
     if (account === null || account.trim() === "") {
-      return this.adopt({
-        kind: "inactive",
-        detail:
-          "the live broker account is not proven yet, so there is nothing to lease. Live dispatch " +
-          "stays refused until the account is known, because an unknown account cannot be fenced.",
-      });
+      // Also UNPROVEN: an account that can no longer be resolved is not evidence that a previously
+      // proven foreign owner went away, and the scope cannot be computed to retire the evidence.
+      return this.adoptUnproven(
+        {
+          kind: "inactive",
+          detail:
+            "the live broker account is not proven yet, so there is nothing to lease. Live dispatch " +
+            "stays refused until the account is known, because an unknown account cannot be fenced.",
+        },
+        null,
+      );
     }
     const broker = this.deps.broker();
     const scope = executionLeaseScope({ deployment: this.deps.deployment, broker, account });
@@ -358,7 +484,12 @@ export class BoxExecutionLeaseManager {
 
     const held = this.state.kind === "held" ? this.state.lease : null;
     if (held !== null && held.scope === scope) {
-      const renewed = await renewExecutionLease({
+      // THE CALL IS TIMED, and its duration is charged against the lifetime the row reports. The server
+      // stamped `clock_timestamp()` when the statement ran; by the time the answer is in this variable
+      // that much of the lease is already gone. See `ObservedLease.remainingAtObservationMs`.
+      const renewIssuedAt = this.now();
+      const renewElapsedMs = (): number => Math.max(0, this.now() - renewIssuedAt);
+      const renewed = await this.store.renew({
         scope,
         owner: held.owner,
         fence: held.fence,
@@ -380,13 +511,14 @@ export class BoxExecutionLeaseManager {
       if (renewed === null) {
         return this.adopt({
           kind: "lost",
+          scope,
           detail:
             "the execution lease was not renewable — it lapsed and may have been taken over by " +
             "another instance. New entry is stopped. Do NOT assume this process's in-flight broker " +
             "requests were cancelled: a lease cannot retract a request already sent.",
         });
       }
-      const renewedState = this.adopt({ kind: "held", lease: this.observe(renewed) });
+      const renewedState = this.adopt({ kind: "held", lease: this.observe(renewed, renewElapsedMs()) });
       // RETRY RECONCILIATION ON EVERY RENEWAL while it is still outstanding. Attempting it only at
       // acquisition left entry blocked forever whenever the first pass could not complete — which is
       // the common case, because ownership is established before the broker session is necessarily
@@ -395,7 +527,8 @@ export class BoxExecutionLeaseManager {
       return renewedState;
     }
 
-    const acquired = await acquireExecutionLease({
+    const acquireIssuedAt = this.now();
+    const acquired = await this.store.acquire({
       deployment: this.deps.deployment,
       broker,
       account,
@@ -408,6 +541,7 @@ export class BoxExecutionLeaseManager {
       detail: `the execution lease could not be acquired (${err instanceof Error ? err.message : String(err)})`,
       holder: null,
     }));
+    const acquireElapsedMs = Math.max(0, this.now() - acquireIssuedAt);
 
     if (!acquired.ok) {
       this.currentScope = scope;
@@ -415,15 +549,20 @@ export class BoxExecutionLeaseManager {
         this.log(`[Box] EXECUTION LEASE REFUSED: ${acquired.detail}`);
         return this.adopt({
           kind: "refused",
+          scope,
           detail: acquired.detail,
           holder: acquired.holder?.owner ?? null,
         });
       }
-      return this.adopt({ kind: "unavailable", detail: acquired.detail });
+      // NOT AUTHORITATIVE. `unavailable` here means the store could not answer — a thrown driver error,
+      // a failed fence-sequence read, PostgreSQL unreachable. That is "cannot tell", and it must never
+      // erase a `refused`/`lost` we already proved for this scope, because doing so would re-permit
+      // exposure reduction while the other owner is still live. See `adoptUnproven`.
+      return this.adoptUnproven({ kind: "unavailable", detail: acquired.detail }, scope);
     }
 
     this.currentScope = scope;
-    const observed = this.observe(acquired.lease);
+    const observed = this.observe(acquired.lease, acquireElapsedMs);
     const next = this.adopt({ kind: "held", lease: observed });
     if (acquired.took_over) {
       this.log(
@@ -469,18 +608,21 @@ export class BoxExecutionLeaseManager {
         );
         return;
       }
-      const stamped = await markExecutionLeaseReconciled({ scope, owner, fence });
+      const stampIssuedAt = this.now();
+      const stamped = await this.store.markReconciled({ scope, owner, fence });
+      const stampElapsedMs = Math.max(0, this.now() - stampIssuedAt);
       if (stamped === null) {
         // We lost the lease while reconciling. Refuse rather than claim a reconciled takeover.
         this.adopt({
           kind: "lost",
+          scope,
           detail:
             "the execution lease lapsed while reconciling the previous owner's broker operations, so " +
             "it may now belong to another instance",
         });
         return;
       }
-      this.adopt({ kind: "held", lease: this.observe(stamped) });
+      this.adopt({ kind: "held", lease: this.observe(stamped, stampElapsedMs) });
       this.log("[Box] takeover reconciliation complete; this instance now owns execution for the account.");
     } catch (err) {
       this.log(
@@ -492,24 +634,97 @@ export class BoxExecutionLeaseManager {
     }
   }
 
-  private observe(row: ExecutionLeaseRow): ObservedLease {
+  /**
+   * Turn a database row into the cached observation the synchronous guard reads.
+   *
+   * `dbCallElapsedMs` is the MEASURED duration of the statement that produced the row, from a monotonic
+   * reading taken before the call to one taken after. It is subtracted from the reported lifetime
+   * because the server's `clock_timestamp()` was read at some unknown point inside that window, so every
+   * millisecond of it is lease life that may already have been spent. Omitting it was defect (2): a
+   * slow or queued response made the cached lease look valid for longer than the row actually was,
+   * which is exactly the window in which a successor takes over.
+   */
+  private observe(row: ExecutionLeaseRow, dbCallElapsedMs: number): ObservedLease {
+    // A DIFFERENCE of two readings of the same server clock. No local INSTANT participates — only the
+    // locally-measured DURATION of the call, as a deduction.
+    const reportedLifeMs = Math.max(0, row.expires_at - row.server_now);
     return {
       scope: row.scope,
       owner: row.owner,
       fence: row.fence,
       account: row.account,
       broker: row.broker,
-      // A DIFFERENCE of two readings of the same server clock. No local time participates.
-      remainingAtObservationMs: Math.max(0, row.expires_at - row.server_now),
+      // Floored, never rounded: a fractional millisecond of claimed life is not worth having, and
+      // rounding UP would hand back part of what the deduction just took away.
+      remainingAtObservationMs: Math.max(0, Math.floor(reportedLifeMs - Math.max(0, dbCallElapsedMs))),
       observedAtLocal: this.now(),
       reconciled: row.takeover_reconciled_at !== null,
       takeoverReason: row.takeover_reason,
     };
   }
 
+  /**
+   * Install a state on AUTHORITY: the database answered, or this process itself released.
+   *
+   * Everything that is not authoritative must go through {@link adoptUnproven} instead.
+   */
   private adopt(state: ExecutionLeaseState): ExecutionLeaseState {
     this.state = state;
     return state;
+  }
+
+  /**
+   * ────────────────────────────────────────────────────────────────────────────────────────────────
+   * PROVEN-FOREIGN EVIDENCE OUTRANKS "CANNOT TELL". THIS IS A SAFETY RULE, NOT A TIDINESS RULE.
+   *
+   * `unavailable` and `inactive` both mean "no evidence either way", and `dispatchBlockReason`
+   * deliberately PERMITS exposure reduction in that case — refusing it would strand real positions for
+   * a reason that is not evidence of anything. `refused` and `lost` mean the opposite: something
+   * authoritative said another instance owns this account, and BOTH directions must stop, because two
+   * processes flattening one position double-close it and two processes cancelling race each other.
+   *
+   * The defect this method exists to prevent: the acquire path could not distinguish "the lease is held
+   * by someone else" from "I could not ask". A single `catch` on the store call — or the store's own
+   * non-unique-violation catch, or a failed fence-sequence read — produced `reason: "unavailable"`, and
+   * writing that over an existing `refused` DISCARDED the proof that a second owner exists. The state
+   * went from "block both directions" to "reduction permitted" purely because a query failed, so a
+   * database blip could reopen exactly the concurrent-flatten race the lease is for. Nothing about a
+   * failed query is evidence that the other owner went away; in fact the most likely cause of a lease
+   * store error — PostgreSQL being unreachable — leaves the other owner running untouched.
+   *
+   * THE RULE: once a proven-foreign state is installed for a scope, only an authoritative answer about
+   * that scope may replace it —
+   *   · a successful acquire/renew (`held`): we now demonstrably own it, which is proof the refusal is
+   *     stale. This is the "authoritative reacquisition" the rule waits for;
+   *   · another proven-foreign answer (`refused`/`lost`): still foreign, only the detail changes;
+   *   · an authoritative clear via {@link adopt} — a fence-pinned release, a scope this manager no
+   *     longer leases, or a deployment that cannot place live orders at all.
+   * A mere failure to ask changes nothing and is logged rather than applied.
+   *
+   * SCOPE IS PART OF THE RULE. A broker switch or account replacement makes an old refusal irrelevant —
+   * it was about a different account — so evidence is retired when the incoming state is known to
+   * concern a DIFFERENT scope. When either scope is unknown the evidence is KEPT, because "I cannot
+   * prove the scope changed" is not proof that it did.
+   * ────────────────────────────────────────────────────────────────────────────────────────────────
+   */
+  private adoptUnproven(
+    next: Extract<ExecutionLeaseState, { kind: "unavailable" | "inactive" }>,
+    scope: string | null,
+  ): ExecutionLeaseState {
+    const current = this.state;
+    if (current.kind === "refused" || current.kind === "lost") {
+      const sameScope = current.scope === null || scope === null || current.scope === scope;
+      if (sameScope) {
+        this.log(
+          `[Box] the execution lease could not be re-established (${next.detail}) — KEEPING the ` +
+            `existing ${current.kind} state, because a failure to ask is not evidence that the other ` +
+            "owner released the account. Both new entry and exposure reduction stay refused until an " +
+            "acquisition actually succeeds.",
+        );
+        return current;
+      }
+    }
+    return this.adopt(next);
   }
 
   /**
@@ -529,12 +744,16 @@ export class BoxExecutionLeaseManager {
     }
     if (this.deps.persistenceAvailable()) {
       try {
-        await ensureExecutionLeaseStoreReady();
+        await this.store.ready();
       } catch (err) {
-        this.adopt({
-          kind: "unavailable",
-          detail: err instanceof Error ? err.message : String(err),
-        });
+        // Unproven: a store that cannot be verified says nothing about who owns the account.
+        this.adoptUnproven(
+          {
+            kind: "unavailable",
+            detail: err instanceof Error ? err.message : String(err),
+          },
+          null,
+        );
         this.startHeartbeat();
         return;
       }
@@ -563,7 +782,7 @@ export class BoxExecutionLeaseManager {
       return;
     }
     try {
-      const removed = await releaseExecutionLease({
+      const removed = await this.store.release({
         scope,
         owner: state.lease.owner,
         fence: state.lease.fence,
@@ -621,7 +840,7 @@ export class BoxExecutionLeaseManager {
   async inspect(): Promise<ExecutionLeaseRow | null> {
     const scope = this.currentScope;
     if (scope === null) return null;
-    return readExecutionLease(scope).catch(() => null);
+    return this.store.read(scope).catch(() => null);
   }
 }
 

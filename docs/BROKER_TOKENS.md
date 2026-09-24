@@ -38,9 +38,11 @@ step 2 happens in the operator's browser.
         https://<api-host>/api/broker/{broker}/callback
 
   3. GET /api/broker/{broker}/callback
-     The pending-login entry is claimed (single-use), the one-time code is exchanged
-     for an access token server-side, the token is sealed into PostgreSQL and
-     installed, then the browser is redirected to
+     The pending-login entry is CLAIMED (reserved, not yet spent), the one-time code
+     is exchanged for an access token server-side, the entry is then COMMITTED
+     (strictly single-use) — or RELEASED if the exchange failed, so a caller that
+     proved nothing cannot destroy the operator's sign-in — the token is sealed into
+     PostgreSQL and installed, then the browser is redirected to
         {FRONTEND_URL}/box?broker_login={broker}&status=connected
      or ...&status=failed&reason=<stable code>
 ```
@@ -54,6 +56,8 @@ step 2 happens in the operator's browser.
 | Exchange | `POST api.kite.trade/session/token` with `checksum = sha256(api_key + request_token + api_secret)` | `GET {authRoot}/app/consumeApp-consent?tokenId=…` with the id/secret headers |
 | Token expiry | **Day-scoped.** Dies at the IST day boundary; no stated instant, and one is never invented. | **Explicit `expiryTime`.** `null` means UNKNOWN — validated by use, never treated as immortal or expired. |
 | CSRF proof on callback | `state` nonce matched in constant time | existence + TTL + single-use only (Dhan round-trips nothing of ours) |
+| Failed exchange | entry RELEASED, claimable again by the real redirect | entry RELEASED — this is what stops a junk `tokenId` denying the operator a login |
+| Duplicate callback mid-exchange | refused `login_in_progress`; the in-flight exchange is untouched | same |
 
 **The redirect URL must be registered on the broker app and must point at this
 backend's callback.** Both brokers ignore any redirect target we send and always use
@@ -81,7 +85,8 @@ consent-id spellings for the same reason.
   a single `AbortController`, and cap the response body at 64 KiB.
 - The callback is authenticated by the **pending-login store**, not the session
   cookie (which is `SameSite=Strict` and therefore absent on a cross-site redirect).
-  Entries are single-use and expire in 10 minutes.
+  Entries are single-use on SUCCESS and expire in 10 minutes. A claim held by an
+  exchange that never answers lapses after 60s, so a crash cannot lock an operator out.
 - **Several operators may sign in at the same time.** Entries are keyed by nonce, not by
   broker, so two people clicking "Connect Zerodha" within the TTL each complete on their own
   nonce (bounded at 8 live entries per broker, oldest evicted). This is a shared console:

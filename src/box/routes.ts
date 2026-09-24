@@ -12,9 +12,17 @@
  */
 
 import type { Express, Request, RequestHandler, Response } from "express";
+import { ApiError, sendApiError } from "../access/middleware.js";
 import { KiteError } from "../kite.js";
 import { rateLimit } from "../ratelimit.js";
 import type { BoxEngine } from "./engine.js";
+import {
+  boxFailureLogLine,
+  brokerFailureResponse,
+  GENERIC_BOX_FAILURE,
+} from "./failureResponse.js";
+import { BoxOperatorError } from "./operatorError.js";
+import { StreamSessionSentry } from "./streamSession.js";
 import { flattenHttpStatus } from "./flattenOutcome.js";
 import {
   isBoxDbEnabled,
@@ -34,16 +42,86 @@ export interface BoxRouteDeps {
    * which is why an SSE stream cannot be authenticated by a token in the URL.
    */
   getOperatorRole: (req: Request) => "full" | "trade" | null;
+  /**
+   * Is this session token still live? Used ONLY by the SSE stream, to keep enforcing what
+   * `requireOperator` checked once when the stream opened.
+   *
+   * Resolves false for a revoked/expired/unknown session, and REJECTS when the session store cannot be
+   * reached — the two are handled differently on purpose (see `streamSession.ts`), so this must not
+   * collapse a failure into `false`.
+   */
+  isSessionLive: (sessionToken: string) => Promise<boolean>;
+  /** Override the tolerance for unverifiable sessions on an open stream. Tests only. */
+  streamSessionGraceMs?: number;
+  /**
+   * Override the stream heartbeat / session re-check cadence. Tests only.
+   *
+   * Injectable because the property worth testing — "a revoked session stops receiving snapshots" — is
+   * otherwise only observable after a 20-second wait, and a test nobody is willing to wait for is a test
+   * that does not get written.
+   */
+  streamHeartbeatMs?: number;
 }
 
+/**
+ * SSE heartbeat cadence. Doubles as the session re-check cadence, which makes it the BOUND on how long
+ * a revoked session may keep receiving snapshots. Twenty seconds is short enough to be a real bound and
+ * long enough that a handful of open streams cost one indexed lookup each per beat.
+ */
+const SSE_HEARTBEAT_MS = 20_000;
+
+/**
+ * ─────────────────────────────────────────────────────────────────────────────────────────────────
+ * THE FAILURE BOUNDARY FOR EVERY BOX ROUTE.
+ *
+ * WHAT WAS WRONG. This helper returned `err.message` for ANY `Error` and logged the whole error object.
+ * Both are leaks, and the box routes are precisely where it matters: several of them are backed by
+ * PostgreSQL, and `pg` attaches the failing SQL — text, parameters, table and constraint names — to its
+ * errors. So a database fault could put internal schema detail (and whatever values were being bound)
+ * into an authenticated HTTP response and the process logs, while the rest of the application routed
+ * the same class of error through `errorHandler()`, which emits a generic message and logs only
+ * `boundedError(err)`. Nothing about being authenticated makes a caller entitled to the server's
+ * internals, and logs are read, shipped and pasted into tickets.
+ *
+ * THE RULE NOW:
+ *   · An `ApiError` is an APPROVED message with a stable code. It was constructed deliberately by
+ *     application code that meant the operator to read it, so it is sent as-is.
+ *   · A `KiteError` is the BROKER's own text. Operators genuinely need it — "insufficient margin",
+ *     "instrument not tradable" — so it is kept, but `sanitize()`d for credential-shaped substrings and
+ *     length-bounded, because a broker error is still an untrusted string from outside this process.
+ *   · Anything else is UNEXPECTED. The client gets one generic sentence and a stable code; the server
+ *     log gets `boundedError(err)` — one line, no stack, no SQL. The cause is not guessed at and not
+ *     forwarded.
+ *
+ * Every response now also carries `code`, matching `ApiErrorBody`, so the frontend can branch on a
+ * stable string instead of parsing prose.
+ * ─────────────────────────────────────────────────────────────────────────────────────────────────
+ */
 function fail(res: Response, err: unknown): void {
-  if (err instanceof KiteError) {
-    res.status(err.status || 502).json({ error: err.message });
+  if (res.headersSent) return;
+
+  // Deliberate, operator-facing refusals: message and code were both chosen by the code that threw.
+  // `BoxOperatorError` is the domain-side equivalent — see `operatorError.ts` for why the engine does
+  // not throw the HTTP class directly.
+  if (err instanceof ApiError) {
+    sendApiError(res, err.status, err.code, err.message);
     return;
   }
-  const message = err instanceof Error ? err.message : "Unexpected server error.";
-  console.error("[Box] request failed:", err);
-  res.status(500).json({ error: message });
+  if (err instanceof BoxOperatorError) {
+    sendApiError(res, err.status, err.code, err.message);
+    return;
+  }
+
+  if (err instanceof KiteError) {
+    // The broker's own words, redacted and bounded — see `brokerFailureResponse`.
+    const broker = brokerFailureResponse(err.status, err.message);
+    sendApiError(res, broker.status, broker.code, broker.message);
+    return;
+  }
+
+  // UNEXPECTED. One bounded, redacted line server-side; nothing derived from the error to the client.
+  console.error("[Box] request failed:", boxFailureLogLine(err));
+  sendApiError(res, GENERIC_BOX_FAILURE.status, GENERIC_BOX_FAILURE.code, GENERIC_BOX_FAILURE.message);
 }
 
 /**
@@ -769,10 +847,18 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
    * requireOperator — EventSource sends cookies on same-origin requests. A session
    * token in the query string is NEVER accepted; the guard reads only the validated
    * session the middleware attached to the request.
+   *
+   * AND IT KEEPS AUTHENTICATING. Every other route is checked per request, so a revoked session stops
+   * working on its next call; a stream has one request and then lives for hours. The check at open was
+   * therefore the ONLY check, and a client that simply held its connection went on receiving full state
+   * snapshots after logout and after the session's hard expiry. The heartbeat now carries that
+   * enforcement — expiry locally, revocation with one bounded lookup per beat — and the stream is ended
+   * from THIS side when it fails. See `streamSession.ts` for the policy and its stated limits.
    */
   app.get("/api/box/stream", requireOperator, (req: Request, res: Response) => {
-    if (deps.getOperatorRole(req) === null) {
-      res.status(401).json({ error: "Authentication required" });
+    const operator = req.operator;
+    if (deps.getOperatorRole(req) === null || operator === undefined) {
+      res.status(401).json({ error: "Authentication required", code: "unauthenticated" });
       return;
     }
 
@@ -782,19 +868,76 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
     res.flushHeaders?.();
 
     const remove = engine.addSseClient(res);
-    const keepAlive = setInterval(() => {
+    let closed = false;
+    // Declared before `shutdown` so the teardown never depends on hoisting to find its own timers.
+    let keepAlive: NodeJS.Timeout | null = null;
+    let expiryTimer: NodeJS.Timeout | null = null;
+    /** One teardown path for every reason a stream ends, so none of them can skip a step. */
+    const shutdown = (reason: string | null): void => {
+      if (closed) return;
+      closed = true;
+      if (keepAlive !== null) clearInterval(keepAlive);
+      if (expiryTimer !== null) clearTimeout(expiryTimer);
+      if (reason !== null) engine.closeSseClient(res, reason);
+      remove();
+      res.end();
+    };
+
+    const heartbeatMs = Math.max(1, deps.streamHeartbeatMs ?? SSE_HEARTBEAT_MS);
+    const sentry = new StreamSessionSentry({
+      expiresAtMs: operator.expiresAt.getTime(),
+      isSessionLive: () => deps.isSessionLive(operator.sessionToken),
+      ...(deps.streamSessionGraceMs !== undefined ? { graceMs: deps.streamSessionGraceMs } : {}),
+    });
+
+    let checkInFlight = false;
+    const enforceSession = (): void => {
+      // Never overlap checks: a slow session store must not accumulate one query per heartbeat.
+      if (checkInFlight || closed) return;
+      checkInFlight = true;
+      void sentry
+        .check()
+        .then((verdict) => {
+          if (verdict.kind === "ok" || closed) return;
+          console.warn(`[Box] closing an SSE stream: ${verdict.detail}.`);
+          shutdown(verdict.detail);
+        })
+        .catch(() => {
+          // `check()` already converts a failed lookup into a verdict; this is belt-and-braces so an
+          // unexpected throw can never leave a stream unenforced *and* silent.
+        })
+        .finally(() => {
+          checkInFlight = false;
+        });
+    };
+
+    keepAlive = setInterval(() => {
+      if (closed) return;
+      // A comment frame keeps proxies from idling the connection out. Its return value is ignored on
+      // purpose: it is a keep-alive, not state, and the bounded writer owns the real backpressure.
       try {
         res.write(`: ping\n\n`);
       } catch {
         /* the close handler cleans up */
       }
-    }, 20000);
+      enforceSession();
+    }, heartbeatMs);
     keepAlive.unref?.();
 
-    req.on("close", () => {
-      clearInterval(keepAlive);
-      remove();
-      res.end();
-    });
+    // A session that expires BEFORE the next heartbeat is closed on its own timer, so a stream opened
+    // moments before expiry cannot outlive it by a whole heartbeat.
+    const untilExpiry = operator.expiresAt.getTime() - Date.now();
+    if (untilExpiry < heartbeatMs) {
+      expiryTimer = setTimeout(
+        () => {
+          shutdown("the operator session reached its hard expiry while this stream was open");
+        },
+        Math.max(0, untilExpiry),
+      );
+      expiryTimer.unref?.();
+    }
+
+    // The peer went away; there is nobody to tell, so no closing frame.
+    req.on("close", () => shutdown(null));
   });
 }

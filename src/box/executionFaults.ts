@@ -172,8 +172,14 @@ export function classifyExecutionFault(args: {
 
 /* ---------------------------- bounded diagnostics -------------------------- */
 
-/** Redact anything that looks like a credential before it is stored or logged. */
-function sanitize(text: string, maxLength: number): string {
+/**
+ * Redact anything that looks like a credential before it is stored or logged.
+ *
+ * Exported because the box HTTP boundary needs exactly this treatment for broker error text it passes
+ * on to an operator (`routes.ts`): a broker message is useful and is also an untrusted string from
+ * outside this process, so it is redacted and length-bounded rather than either trusted or discarded.
+ */
+export function sanitize(text: string, maxLength: number): string {
   const redacted = text
     .replace(/(api[_-]?key|access[_-]?token|authorization|password|secret|bearer)\s*[:=]\s*\S+/gi, "$1=[redacted]")
     .replace(/\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g, "[redacted-jwt]");
