@@ -7199,6 +7199,14 @@ export class BoxEngine {
        * means the effective hurdle is `flat / lotSize` per unit, which differs ~1000x across an
        * F&O universe and concentrates entries in the largest-lot names.
        */
+      /*
+       * A PUBLICATION rule, published with the other scanner settings rather than in
+       * `execution-control`'s `risk` block. It decides what the board SHOWS, not what may be
+       * entered, and listing it among the risk controls would misrepresent a display preference as
+       * a safety control — the per-underlying entry guarantee is `one_active_box_per_underlying`,
+       * which is already reported there.
+       */
+      one_opportunity_per_underlying: this.cfg.oneOpportunityPerUnderlying,
       lot_relative_thresholds: lotRelativeThresholdsEnabled(this.cfg),
       min_expected_net_profit_per_unit: this.cfg.minExpectedNetProfitPerUnit,
       min_gross_edge_per_unit: this.cfg.minGrossEdgePerUnit,
@@ -7493,7 +7501,6 @@ export class BoxEngine {
         max_box_capital_metric: "gross_entry_order_notional_rupees",
         capital: this.centralGateway.capitalDiagnostics(),
         one_active_box_per_underlying: this.cfg.oneActiveBoxPerUnderlying,
-        one_opportunity_per_underlying: this.cfg.oneOpportunityPerUnderlying,
         active_underlyings: [...activeUnderlyingMap.values()].map((activity) => ({
           underlying: activity.underlying,
           kinds: activity.kinds,
