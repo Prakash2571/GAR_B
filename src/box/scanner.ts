@@ -229,6 +229,28 @@ export class BoxScanner {
   private opportunities = new Map<string, BoxOpportunity>();
   /** Candidates with an entry pipeline in flight. */
   private entryInFlight = new Set<string>();
+  /**
+   * Underlyings with an entry pipeline already running, mapped to the candidate that owns it.
+   *
+   * SEPARATE FROM `entryInFlight` BECAUSE THEY ANSWER DIFFERENT QUESTIONS. That set is keyed by
+   * CANDIDATE — the strike pair and direction — so it stops the same box being fired twice. It
+   * cannot see two DIFFERENT strike pairs on one underlying, and at BOX_STRIKE_LEVEL=1 there are
+   * three pairs per name that routinely move together, so a single dislocation produces three
+   * qualifying candidates on the same tick.
+   *
+   * WHAT THAT COST BEFORE THIS EXISTED. All three reached the coordinator. The duplicate guard is
+   * keyed on the opportunity, so it did not fire; the Layer 1a per-underlying lock reads the
+   * durable position book, and none of them had written to it yet; so each one SPENT A SESSION
+   * ENTRY ATTEMPT and only then met the Layer 1b cross-process hold, which is taken AFTER the
+   * attempt is consumed. Three attempts for one box — and on a one-attempt supervised trial the
+   * entire safety budget could be consumed by a candidate colliding with itself.
+   *
+   * This is the cheapest possible enforcement point: in-process, synchronous, before a reservation
+   * exists, before any durable write and long before any broker POST. It does not replace the
+   * coordinator's locks — those are the guarantee, and they are what make it correct across
+   * processes and restarts. It exists so the guarantee is almost never reached.
+   */
+  private entryInFlightUnderlyings = new Map<string, string>();
   private lastRejectLogAt = new Map<string, number>();
 
   private discovering = false;
@@ -479,6 +501,21 @@ export class BoxScanner {
     }
     if (!passedPrefilter) return;
     if (this.entryInFlight.has(cand.key)) return;
+    /*
+     * ONE ENTRY PIPELINE PER UNDERLYING AT A TIME.
+     *
+     * Gated on the SAME setting that already promises this downstream, so there is one operator
+     * intent rather than a second knob that could disagree with it. Placed AFTER `publish` (the
+     * board still shows the other pairs with their real economics, so nothing is hidden from the
+     * operator) and BEFORE `positions.reserve`, the session attempt and any order.
+     */
+    if (
+      this.deps.cfg.oneActiveBoxPerUnderlying &&
+      this.entryInFlightUnderlyings.has(cand.underlying)
+    ) {
+      this.stats.rejectedDuplicate++;
+      return;
+    }
     if (!this.deps.executionSim.hasCapacity()) return;
 
     // Only candidates that clear the fast local net-profit projection are worth
@@ -571,6 +608,14 @@ export class BoxScanner {
       return;
     }
     this.entryInFlight.add(cand.key);
+    /*
+     * Claimed here, synchronously, in the same turn of the event loop as the reservation above and
+     * BEFORE the first `await` in this method — otherwise two candidates on one tick would both
+     * read the map as empty and both proceed, which is the exact TOCTOU this guard exists to
+     * close. Released in the `finally` alongside `entryInFlight`, and only if this candidate still
+     * owns the claim, so a late unwind cannot free a claim that now belongs to another pipeline.
+     */
+    this.entryInFlightUnderlyings.set(cand.underlying, cand.key);
     this.stats.qualifyAttempts++;
     this.stats.executionsAttempted++;
     // This parent id represents ONE strategy decision. Four leg orders, recovery
@@ -811,6 +856,11 @@ export class BoxScanner {
       this.deps.positions.release(cand.key);
     } finally {
       this.entryInFlight.delete(cand.key);
+      // Guarded on still owning the claim: releasing unconditionally would let a slow unwind free
+      // a claim a different candidate has since taken, reopening the window for that underlying.
+      if (this.entryInFlightUnderlyings.get(cand.underlying) === cand.key) {
+        this.entryInFlightUnderlyings.delete(cand.underlying);
+      }
     }
   }
 
@@ -1287,7 +1337,46 @@ export class BoxScanner {
       const bn = b.expected_net_profit ?? b.gross_edge ?? Number.NEGATIVE_INFINITY;
       return bn - an;
     });
-    return rows.slice(0, limit);
+    return this.collapsePerUnderlying(rows).slice(0, limit);
+  }
+
+  /**
+   * At most ONE candidate row per (underlying, direction) — the best one.
+   *
+   * WHY. At BOX_STRIKE_LEVEL=1 a name has three strike pairs, and they are not independent: one
+   * dislocation in the underlying's book moves all three, so the board showed the same edge three
+   * times under three strike labels. Since only one box per underlying can ever be entered
+   * (BOX_ONE_ACTIVE_BOX_PER_UNDERLYING), the extra rows are not three opportunities — they are one
+   * opportunity, three ways, crowding the other 149 names out of a list capped at
+   * BOX_MAX_PUBLISHED_OPPORTUNITIES.
+   *
+   * KEYED BY DIRECTION AS WELL AS UNDERLYING, because a long and a short box on the same name are
+   * opposite trades, not duplicates. With BOX_ENABLE_SHORT_BOX=false there is only ever one
+   * direction, so this reduces to one row per underlying.
+   *
+   * EXPOSURE IS NEVER COLLAPSED. A row describing a real position (OPEN / PAPER_OPENED /
+   * LIVE_OPENED) is always emitted, and never counts as the survivor for its group, so a live
+   * position can never hide a genuine new edge on the same name and — far more important — a new
+   * edge can never hide a live position. Suppressing an operator's view of exposure to tidy a list
+   * would be the worst possible trade.
+   *
+   * `rows` MUST ALREADY BE SORTED best-first: the first candidate seen per key is the one kept.
+   */
+  private collapsePerUnderlying(rows: BoxOpportunity[]): BoxOpportunity[] {
+    if (!this.deps.cfg.oneOpportunityPerUnderlying) return rows;
+    const kept: BoxOpportunity[] = [];
+    const taken = new Set<string>();
+    for (const opp of rows) {
+      if (opp.status === "OPEN" || opp.status === "PAPER_OPENED" || opp.status === "LIVE_OPENED") {
+        kept.push(opp);
+        continue;
+      }
+      const key = `${opp.underlying}|${opp.direction ?? "LONG_BOX"}`;
+      if (taken.has(key)) continue;
+      taken.add(key);
+      kept.push(opp);
+    }
+    return kept;
   }
 
   opportunitiesFor(underlying: string): BoxOpportunity[] {

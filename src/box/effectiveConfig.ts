@@ -139,6 +139,7 @@ const KNOBS: readonly KnobSpec[] = [
   { key: "liveEntrySubmitConcurrency", envVar: "BOX_LIVE_ENTRY_SUBMIT_CONCURRENCY", kind: "int", default: 1, min: 1, max: 4 },
   { key: "liveMaxResidualLegs", envVar: "BOX_LIVE_MAX_RESIDUAL_LEGS", kind: "int", default: 1, min: 0, max: 4, strict: true },
   { key: "oneActiveBoxPerUnderlying", envVar: "BOX_ONE_ACTIVE_BOX_PER_UNDERLYING", kind: "bool", default: false },
+  { key: "oneOpportunityPerUnderlying", envVar: "BOX_ONE_OPPORTUNITY_PER_UNDERLYING", kind: "bool", default: false },
   { key: "sessionMaxCompletedTrades", envVar: "BOX_SESSION_MAX_COMPLETED_TRADES", kind: "int", default: 0, min: 0, max: 10_000, strict: true },
   // The attempt ceiling was MISSING from this table while the trade ceiling beside it was present.
   // This is the operator-facing "what is actually in force, and where did it come from" report, and

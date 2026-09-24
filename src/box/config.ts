@@ -819,6 +819,20 @@ export interface BoxConfig {
    */
   oneActiveBoxPerUnderlying: boolean;
   /**
+   * Publish at most ONE candidate opportunity per (underlying, direction) — the best one.
+   *
+   * A DISPLAY/PUBLICATION rule, never an entry control: what may be entered is decided by
+   * {@link oneActiveBoxPerUnderlying} and the inventory ceilings, and this cannot loosen them.
+   *
+   * WHY IT IS WORTH A SETTING. At `BOX_STRIKE_LEVEL=1` a name has three strike pairs that move
+   * together, so one dislocation appears as three rows. Only one box per underlying can be
+   * entered, so those are not three opportunities; they are one opportunity three ways, crowding a
+   * 150-name universe out of a list capped at {@link maxPublishedOpportunities}.
+   *
+   * Rows describing REAL EXPOSURE (OPEN / PAPER_OPENED / LIVE_OPENED) are never collapsed.
+   */
+  oneOpportunityPerUnderlying: boolean;
+  /**
    * Maximum COMPLETE Box lifecycles (ENTRY → HOLD → EXIT → FLAT) an armed session may run.
    * `0` = unlimited (default), `1` = one-shot, `N` = N cycles. See `tradingSession.ts`.
    */
@@ -1869,6 +1883,8 @@ export function loadBoxConfig(): BoxConfig {
      * exactly this reason, and this one was inconsistent with it.
      */
     oneActiveBoxPerUnderlying: strictBool("BOX_ONE_ACTIVE_BOX_PER_UNDERLYING", false),
+    // Defaults false so an existing dashboard keeps the row set it has always been sent.
+    oneOpportunityPerUnderlying: strictBool("BOX_ONE_OPPORTUNITY_PER_UNDERLYING", false),
     sessionMaxCompletedTrades: strictLimitInt("BOX_SESSION_MAX_COMPLETED_TRADES", 0, 0, 10_000),
     sessionMaxEntryAttempts: strictLimitInt("BOX_SESSION_MAX_ENTRY_ATTEMPTS", 0, 0, 10_000),
     /*
@@ -2347,6 +2363,7 @@ export function configSnapshot(cfg: BoxConfig): BoxScannerConfigSnapshot {
     live_entry_submit_concurrency: cfg.liveEntrySubmitConcurrency,
     live_max_box_capital_rupees: cfg.liveMaxBoxCapitalRupees,
     one_active_box_per_underlying: cfg.oneActiveBoxPerUnderlying,
+    one_opportunity_per_underlying: cfg.oneOpportunityPerUnderlying,
     session_max_completed_trades: cfg.sessionMaxCompletedTrades,
     session_max_entry_attempts: cfg.sessionMaxEntryAttempts,
     // Executable-order-pricing knobs, frozen so a paper_legging fill stays

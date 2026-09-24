@@ -7493,6 +7493,7 @@ export class BoxEngine {
         max_box_capital_metric: "gross_entry_order_notional_rupees",
         capital: this.centralGateway.capitalDiagnostics(),
         one_active_box_per_underlying: this.cfg.oneActiveBoxPerUnderlying,
+        one_opportunity_per_underlying: this.cfg.oneOpportunityPerUnderlying,
         active_underlyings: [...activeUnderlyingMap.values()].map((activity) => ({
           underlying: activity.underlying,
           kinds: activity.kinds,

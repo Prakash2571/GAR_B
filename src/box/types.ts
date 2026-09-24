@@ -1661,6 +1661,13 @@ export interface BoxScannerConfigSnapshot {
   live_max_box_capital_rupees?: number;
   /** Whether the underlying-level entry restriction was in force. */
   one_active_box_per_underlying?: boolean;
+  /**
+   * Publication rule frozen for audit: was the board collapsed to one row per underlying?
+   *
+   * A trade's row set is what an operator was looking at when they let it happen, so "why was
+   * only one NIFTY pair visible?" must be answerable from the document alone.
+   */
+  one_opportunity_per_underlying?: boolean;
   /** The session cycle budget in force. 0 = unlimited. */
   session_max_completed_trades?: number;
   /**

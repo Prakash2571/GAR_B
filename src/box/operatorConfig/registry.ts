@@ -476,6 +476,25 @@ export const OPERATOR_SETTINGS: readonly SettingSpec[] = [
     requiresFullAdmin: true,
   },
   {
+    key: "oneOpportunityPerUnderlying",
+    envVar: "BOX_ONE_OPPORTUNITY_PER_UNDERLYING",
+    boxConfigField: "oneOpportunityPerUnderlying",
+    category: "strategy",
+    label: "Show one opportunity per underlying",
+    description:
+      "Publishes only the best candidate per underlying instead of one row per strike pair. At ATM±1 a name has three pairs that move together, so a single dislocation appears three times and crowds other names off a capped board. Display only: it cannot admit or refuse an entry, and a row for a Box that is actually open is never hidden.",
+    type: "boolean",
+    unit: "none",
+    // `replace`, not `floor`: this changes what is DISPLAYED, so neither value is safer and a
+    // deployment has no safety interest in forcing it on. `neutral` for the same reason.
+    containment: "replace",
+    safeDirection: "neutral",
+    policy: "HOT_SAFE",
+    takesEffect: "immediately",
+    dangerous: false,
+    requiresFullAdmin: false,
+  },
+  {
     key: "maxConcurrentPerUnderlying",
     envVar: "BOX_MAX_CONCURRENT_PER_UNDERLYING",
     boxConfigField: "maxConcurrentPerUnderlying",
@@ -1200,6 +1219,7 @@ export const CODE_DEFAULTS: ReadonlyMap<string, SettingValue> = new Map<string, 
   // risk
   ["maxOpenBoxes", 0],
   ["oneActiveBoxPerUnderlying", false],
+  ["oneOpportunityPerUnderlying", false],
   ["maxConcurrentPerUnderlying", 2],
   ["liveMaxBoxCapitalRupees", 0],
   ["paperMaxBoxCapitalRupees", 0],
