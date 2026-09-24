@@ -15,7 +15,14 @@
  */
 
 import type { BoxConfig } from "./config.js";
-import { configSnapshot, prefilterGrossThreshold, requiredNetProfit } from "./config.js";
+import {
+  configSnapshot,
+  entrySlippageAllowanceForLot,
+  exitSlippageAllowanceForLot,
+  prefilterGrossThresholdForLot,
+  requiredNetProfitForLot,
+  safetyBufferForLot,
+} from "./config.js";
 import {
   BoxChargeEstimator,
   buildEntryChargeLegs,
@@ -222,6 +229,28 @@ export class BoxScanner {
   private opportunities = new Map<string, BoxOpportunity>();
   /** Candidates with an entry pipeline in flight. */
   private entryInFlight = new Set<string>();
+  /**
+   * Underlyings with an entry pipeline already running, mapped to the candidate that owns it.
+   *
+   * SEPARATE FROM `entryInFlight` BECAUSE THEY ANSWER DIFFERENT QUESTIONS. That set is keyed by
+   * CANDIDATE — the strike pair and direction — so it stops the same box being fired twice. It
+   * cannot see two DIFFERENT strike pairs on one underlying, and at BOX_STRIKE_LEVEL=1 there are
+   * three pairs per name that routinely move together, so a single dislocation produces three
+   * qualifying candidates on the same tick.
+   *
+   * WHAT THAT COST BEFORE THIS EXISTED. All three reached the coordinator. The duplicate guard is
+   * keyed on the opportunity, so it did not fire; the Layer 1a per-underlying lock reads the
+   * durable position book, and none of them had written to it yet; so each one SPENT A SESSION
+   * ENTRY ATTEMPT and only then met the Layer 1b cross-process hold, which is taken AFTER the
+   * attempt is consumed. Three attempts for one box — and on a one-attempt supervised trial the
+   * entire safety budget could be consumed by a candidate colliding with itself.
+   *
+   * This is the cheapest possible enforcement point: in-process, synchronous, before a reservation
+   * exists, before any durable write and long before any broker POST. It does not replace the
+   * coordinator's locks — those are the guarantee, and they are what make it correct across
+   * processes and restarts. It exists so the guarantee is almost never reached.
+   */
+  private entryInFlightUnderlyings = new Map<string, string>();
   private lastRejectLogAt = new Map<string, number>();
 
   private discovering = false;
@@ -432,14 +461,19 @@ export class BoxScanner {
     }
 
     const openKeyTaken = this.deps.positions.getByKey(cand.key) !== undefined;
-    const threshold = prefilterGrossThreshold(this.deps.cfg);
+    // Lot-resolved: the prefilter must stay a lower bound on the SAME lot the net gate will use,
+    // otherwise it can discard a candidate that would have qualified.
+    const threshold = prefilterGrossThresholdForLot(this.deps.cfg, cand.lot_size);
     const passedPrefilter = passesGrossPrefilter(evaluation.gross_edge, threshold);
     if (passedPrefilter) this.stats.prefilterPasses++;
 
     this.publish(evaluation, {
       openKeyTaken,
       passedPrefilter,
-      decision: this.localDecisionFor(evaluation, this.deps.cfg.expectedEntrySlippage),
+      decision: this.localDecisionFor(
+        evaluation,
+        entrySlippageAllowanceForLot(this.deps.cfg, cand.lot_size),
+      ),
     });
 
     if (!this.discovering) return;
@@ -467,11 +501,29 @@ export class BoxScanner {
     }
     if (!passedPrefilter) return;
     if (this.entryInFlight.has(cand.key)) return;
+    /*
+     * ONE ENTRY PIPELINE PER UNDERLYING AT A TIME.
+     *
+     * Gated on the SAME setting that already promises this downstream, so there is one operator
+     * intent rather than a second knob that could disagree with it. Placed AFTER `publish` (the
+     * board still shows the other pairs with their real economics, so nothing is hidden from the
+     * operator) and BEFORE `positions.reserve`, the session attempt and any order.
+     */
+    if (
+      this.deps.cfg.oneActiveBoxPerUnderlying &&
+      this.entryInFlightUnderlyings.has(cand.underlying)
+    ) {
+      this.stats.rejectedDuplicate++;
+      return;
+    }
     if (!this.deps.executionSim.hasCapacity()) return;
 
     // Only candidates that clear the fast local net-profit projection are worth
     // spending an execution pipeline on. This keeps the hot path cheap.
-    const localDecision = this.localDecisionFor(evaluation, this.deps.cfg.expectedEntrySlippage);
+    const localDecision = this.localDecisionFor(
+      evaluation,
+      entrySlippageAllowanceForLot(this.deps.cfg, cand.lot_size),
+    );
     if (!localDecision || !localDecision.qualifies) {
       if (localDecision && localDecision.reject === "below_expected_net_profit") {
         this.noteNetProfitRejection(cand, evaluation, localDecision);
@@ -525,7 +577,11 @@ export class BoxScanner {
       // PRE-EXECUTION PROJECTION: this is the DETECTION gross edge, so an expected
       // entry-slippage allowance is deducted alongside the future exit allowance.
       entrySlippageAllowance,
-      futureExitSlippageAllowance: this.deps.cfg.expectedExitSlippage,
+      futureExitSlippageAllowance: exitSlippageAllowanceForLot(
+        this.deps.cfg,
+        evaluation.candidate.lot_size,
+      ),
+      lotSize: evaluation.candidate.lot_size,
       cfg: this.deps.cfg,
     });
   }
@@ -552,6 +608,14 @@ export class BoxScanner {
       return;
     }
     this.entryInFlight.add(cand.key);
+    /*
+     * Claimed here, synchronously, in the same turn of the event loop as the reservation above and
+     * BEFORE the first `await` in this method — otherwise two candidates on one tick would both
+     * read the map as empty and both proceed, which is the exact TOCTOU this guard exists to
+     * close. Released in the `finally` alongside `entryInFlight`, and only if this candidate still
+     * owns the claim, so a late unwind cannot free a claim that now belongs to another pipeline.
+     */
+    this.entryInFlightUnderlyings.set(cand.underlying, cand.key);
     this.stats.qualifyAttempts++;
     this.stats.executionsAttempted++;
     // This parent id represents ONE strategy decision. Four leg orders, recovery
@@ -612,7 +676,10 @@ export class BoxScanner {
     };
 
     try {
-      detectionDecision = this.localDecisionFor(detection, this.deps.cfg.expectedEntrySlippage);
+      detectionDecision = this.localDecisionFor(
+        detection,
+        entrySlippageAllowanceForLot(this.deps.cfg, cand.lot_size),
+      );
       stage = "execution";
       // Independent role orders in paper_legging and live modes.
       if (this.deps.cfg.executionMode === "paper_legging" || this.deps.cfg.executionMode === "live") {
@@ -789,6 +856,11 @@ export class BoxScanner {
       this.deps.positions.release(cand.key);
     } finally {
       this.entryInFlight.delete(cand.key);
+      // Guarded on still owning the claim: releasing unconditionally would let a slow unwind free
+      // a claim a different candidate has since taken, reopening the window for that underlying.
+      if (this.entryInFlightUnderlyings.get(cand.underlying) === cand.key) {
+        this.entryInFlightUnderlyings.delete(cand.underlying);
+      }
     }
   }
 
@@ -811,9 +883,12 @@ export class BoxScanner {
         entry_slippage_allowance: 0,
         future_exit_slippage_allowance: 0,
         measured_entry_slippage: null,
-        safety_buffer: this.deps.cfg.safetyBuffer,
+        safety_buffer: safetyBufferForLot(this.deps.cfg, execution.candidate.lot_size),
         expected_net_profit: null,
-        min_expected_net_profit: requiredNetProfit(this.deps.cfg),
+        min_expected_net_profit: requiredNetProfitForLot(
+          this.deps.cfg,
+          execution.candidate.lot_size,
+        ),
         passes_gross_prefilter: false,
         qualifies: false,
         reject: "unpriced_charges",
@@ -832,8 +907,12 @@ export class BoxScanner {
       entryCharges: totals.entry,
       estimatedExitCharges: totals.exit,
       entrySlippageAllowance: 0,
-      futureExitSlippageAllowance: this.deps.cfg.expectedExitSlippage,
+      futureExitSlippageAllowance: exitSlippageAllowanceForLot(
+        this.deps.cfg,
+        execution.candidate.lot_size,
+      ),
       measuredEntrySlippage: measuredSlippage,
+      lotSize: execution.candidate.lot_size,
       cfg: this.deps.cfg,
     });
   }
@@ -1097,7 +1176,12 @@ export class BoxScanner {
     evaluation: BoxEvaluation,
     detail?: string,
   ): void {
-    if (!passesGrossPrefilter(evaluation.gross_edge, prefilterGrossThreshold(this.deps.cfg))) {
+    if (
+      !passesGrossPrefilter(
+        evaluation.gross_edge,
+        prefilterGrossThresholdForLot(this.deps.cfg, cand.lot_size),
+      )
+    ) {
       return;
     }
     const logKey = `${event}|${cand.key}`;
@@ -1160,11 +1244,19 @@ export class BoxScanner {
       gross_edge: evaluation.gross_edge,
       entry_charges: decision ? decision.entry_charges : null,
       estimated_exit_charges: decision ? decision.estimated_exit_charges : null,
-      execution_cost: decision ? decision.execution_cost : cfg.expectedEntrySlippage + cfg.expectedExitSlippage,
-      safety_buffer: cfg.safetyBuffer,
+      // Lot-resolved on the fallback path too: when there is no priced decision the published
+      // allowance must still describe THIS candidate's lot, or the board shows a cost that the
+      // gate would never have used.
+      execution_cost: decision
+        ? decision.execution_cost
+        : round2(
+            entrySlippageAllowanceForLot(cfg, cand.lot_size) +
+              exitSlippageAllowanceForLot(cfg, cand.lot_size),
+          ),
+      safety_buffer: safetyBufferForLot(cfg, cand.lot_size),
       projected_net_edge: expectedNet,
       expected_net_profit: expectedNet,
-      min_expected_net_profit: requiredNetProfit(cfg),
+      min_expected_net_profit: requiredNetProfitForLot(cfg, cand.lot_size),
       charge_origin: "local",
       entry_sides: evaluation.legs.map((l) => ({
         role: l.role,
@@ -1199,7 +1291,7 @@ export class BoxScanner {
         openKeyTaken: openKeys.has(cand.key),
         passedPrefilter: passesGrossPrefilter(
           evaluation.gross_edge,
-          prefilterGrossThreshold(this.deps.cfg),
+          prefilterGrossThresholdForLot(this.deps.cfg, cand.lot_size),
         ),
         decision: null,
         priceSource: "last_close",
@@ -1214,9 +1306,12 @@ export class BoxScanner {
    * cleared the gross prefilter, and anything already open.
    */
   listOpportunities(limit: number): BoxOpportunity[] {
-    const threshold = prefilterGrossThreshold(this.deps.cfg);
     const rows: BoxOpportunity[] = [];
     for (const opp of this.opportunities.values()) {
+      // Resolved per ROW, not once for the whole list: with lot-relative thresholds the figure
+      // differs by underlying, so a single shared threshold would judge every row by some other
+      // instrument's hurdle.
+      const threshold = prefilterGrossThresholdForLot(this.deps.cfg, opp.lot_size);
       const interesting =
         opp.status === "OPEN" ||
         opp.status === "PAPER_OPENED" ||
@@ -1242,7 +1337,46 @@ export class BoxScanner {
       const bn = b.expected_net_profit ?? b.gross_edge ?? Number.NEGATIVE_INFINITY;
       return bn - an;
     });
-    return rows.slice(0, limit);
+    return this.collapsePerUnderlying(rows).slice(0, limit);
+  }
+
+  /**
+   * At most ONE candidate row per (underlying, direction) — the best one.
+   *
+   * WHY. At BOX_STRIKE_LEVEL=1 a name has three strike pairs, and they are not independent: one
+   * dislocation in the underlying's book moves all three, so the board showed the same edge three
+   * times under three strike labels. Since only one box per underlying can ever be entered
+   * (BOX_ONE_ACTIVE_BOX_PER_UNDERLYING), the extra rows are not three opportunities — they are one
+   * opportunity, three ways, crowding the other 149 names out of a list capped at
+   * BOX_MAX_PUBLISHED_OPPORTUNITIES.
+   *
+   * KEYED BY DIRECTION AS WELL AS UNDERLYING, because a long and a short box on the same name are
+   * opposite trades, not duplicates. With BOX_ENABLE_SHORT_BOX=false there is only ever one
+   * direction, so this reduces to one row per underlying.
+   *
+   * EXPOSURE IS NEVER COLLAPSED. A row describing a real position (OPEN / PAPER_OPENED /
+   * LIVE_OPENED) is always emitted, and never counts as the survivor for its group, so a live
+   * position can never hide a genuine new edge on the same name and — far more important — a new
+   * edge can never hide a live position. Suppressing an operator's view of exposure to tidy a list
+   * would be the worst possible trade.
+   *
+   * `rows` MUST ALREADY BE SORTED best-first: the first candidate seen per key is the one kept.
+   */
+  private collapsePerUnderlying(rows: BoxOpportunity[]): BoxOpportunity[] {
+    if (!this.deps.cfg.oneOpportunityPerUnderlying) return rows;
+    const kept: BoxOpportunity[] = [];
+    const taken = new Set<string>();
+    for (const opp of rows) {
+      if (opp.status === "OPEN" || opp.status === "PAPER_OPENED" || opp.status === "LIVE_OPENED") {
+        kept.push(opp);
+        continue;
+      }
+      const key = `${opp.underlying}|${opp.direction ?? "LONG_BOX"}`;
+      if (taken.has(key)) continue;
+      taken.add(key);
+      kept.push(opp);
+    }
+    return kept;
   }
 
   opportunitiesFor(underlying: string): BoxOpportunity[] {

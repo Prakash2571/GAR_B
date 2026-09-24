@@ -146,6 +146,125 @@ export const OPERATOR_SETTINGS: readonly SettingSpec[] = [
     dangerous: true,
     requiresFullAdmin: true,
   },
+
+  /*
+   * ── THE SAME FIVE ECONOMICS, EXPRESSED PER UNIT OF QUANTITY ──────────────────────────────────
+   *
+   * A Box's gross edge is `grossEdgePerUnit x lotSize`, so it scales with the lot. The flat rupee
+   * figures above do not. Because F&O lots span ~35 to 40,000+, one flat figure is a ~1000x
+   * different per-unit hurdle depending on the instrument — which is not one policy applied to the
+   * universe, it is "never trade the small lots, take almost anything on the large ones".
+   *
+   * Each rate below resolves against a candidate's own lot as `max(flat, rate x lotSize)`. Every
+   * one defaults to 0, which reproduces the flat arithmetic exactly.
+   *
+   * `zeroMeans: "value"` is the correct declaration, NOT `"disabled"`. Although 0 does switch the
+   * rate off, `"disabled"` in this registry is the AMBIGUOUS-SENTINEL meaning reserved for ceilings
+   * where 0 removes a bound — `toComparable` maps it to +Infinity, i.e. maximally permissive. These
+   * are `higher_is_safer` requirements, so 0 is genuinely the numerically LOWEST and least safe
+   * setting, exactly what `"value"` expresses. Declaring `"disabled"` would invert their comparison
+   * and tell the policy layer that lowering a rate to 0 was a tightening.
+   */
+  {
+    key: "minExpectedNetProfitPerUnit",
+    envVar: "BOX_MIN_EXPECTED_NET_PROFIT_PER_UNIT",
+    boxConfigField: "minExpectedNetProfitPerUnit",
+    category: "strategy",
+    label: "Minimum expected net profit per unit",
+    description:
+      "The entry gate expressed per unit of quantity, so one setting means the same hurdle on a 35-lot index and a 40,000-lot stock. A candidate must clear whichever is higher: the flat gate, or this rate times its lot size. 0 leaves the flat gate acting alone.",
+    type: "number",
+    unit: "rupees",
+    min: 0,
+    max: RUPEE_MAX,
+    zeroMeans: "value",
+    containment: "replace",
+    safeDirection: "higher_is_safer",
+    policy: "TIGHTEN_ONLY_WHILE_ARMED",
+    takesEffect: "next_candidate",
+    dangerous: true,
+    requiresFullAdmin: true,
+  },
+  {
+    key: "minGrossEdgePerUnit",
+    envVar: "MIN_BOX_GROSS_EDGE_PER_UNIT",
+    boxConfigField: "minGrossEdgePerUnit",
+    category: "strategy",
+    label: "Prefilter gross edge per unit",
+    description:
+      "The cheap first filter expressed per unit of quantity. Held at or below the per-unit net gate at startup, because above it the prefilter would discard candidates that would have qualified. 0 leaves the flat prefilter acting alone.",
+    type: "number",
+    unit: "rupees",
+    min: 0,
+    max: RUPEE_MAX,
+    zeroMeans: "value",
+    containment: "replace",
+    safeDirection: "higher_is_safer",
+    policy: "HOT_SAFE",
+    takesEffect: "next_candidate",
+    dangerous: false,
+    requiresFullAdmin: false,
+  },
+  {
+    key: "safetyBufferPerUnit",
+    envVar: "BOX_SAFETY_BUFFER_PER_UNIT",
+    boxConfigField: "safetyBufferPerUnit",
+    category: "strategy",
+    label: "Safety buffer per unit",
+    description:
+      "The risk allowance expressed per unit of quantity, deducted inside the expected-net figure. A candidate is charged whichever is higher: the flat buffer, or this rate times its lot size.",
+    type: "number",
+    unit: "rupees",
+    min: 0,
+    max: RUPEE_MAX,
+    zeroMeans: "value",
+    containment: "replace",
+    safeDirection: "higher_is_safer",
+    policy: "TIGHTEN_ONLY_WHILE_ARMED",
+    takesEffect: "next_candidate",
+    dangerous: true,
+    requiresFullAdmin: true,
+  },
+  {
+    key: "expectedEntrySlippagePerUnit",
+    envVar: "BOX_EXPECTED_ENTRY_SLIPPAGE_PER_UNIT",
+    boxConfigField: "expectedEntrySlippagePerUnit",
+    category: "strategy",
+    label: "Expected entry slippage per unit",
+    description:
+      "Assumed entry slippage per unit of quantity. This is the figure a flat rupee amount got most wrong, because slippage is ticks times quantity: a flat allowance understates the true cost on a large lot by almost all of it, making exactly those candidates look more profitable than they are.",
+    type: "number",
+    unit: "rupees",
+    min: 0,
+    max: RUPEE_MAX,
+    zeroMeans: "value",
+    containment: "replace",
+    safeDirection: "higher_is_safer",
+    policy: "TIGHTEN_ONLY_WHILE_ARMED",
+    takesEffect: "next_candidate",
+    dangerous: true,
+    requiresFullAdmin: true,
+  },
+  {
+    key: "expectedExitSlippagePerUnit",
+    envVar: "BOX_EXPECTED_EXIT_SLIPPAGE_PER_UNIT",
+    boxConfigField: "expectedExitSlippagePerUnit",
+    category: "strategy",
+    label: "Expected exit slippage per unit",
+    description:
+      "Assumed exit slippage per unit of quantity, used when judging expected profit at entry and the realisable exit figure while a position is open. Same reasoning as the entry rate.",
+    type: "number",
+    unit: "rupees",
+    min: 0,
+    max: RUPEE_MAX,
+    zeroMeans: "value",
+    containment: "replace",
+    safeDirection: "higher_is_safer",
+    policy: "TIGHTEN_ONLY_WHILE_ARMED",
+    takesEffect: "next_candidate",
+    dangerous: true,
+    requiresFullAdmin: true,
+  },
   {
     key: "strikeLevel",
     envVar: "BOX_STRIKE_LEVEL",
@@ -241,6 +360,28 @@ export const OPERATOR_SETTINGS: readonly SettingSpec[] = [
       "Raising this delays an automatic take-profit. It can never prevent risk reduction: EXPIRY_SAFETY overrides profitability, and no protective or emergency path consults this value.",
   },
   {
+    key: "minExitNetPnlPerUnit",
+    envVar: "BOX_MIN_EXIT_NET_PNL_PER_UNIT",
+    boxConfigField: "minExitNetPnlPerUnit",
+    category: "strategy",
+    label: "Minimum profit to take per unit",
+    description:
+      "The voluntary take-profit target expressed per unit of quantity, so it scales with the lot exactly as the entry gate does. Set alongside the per-unit entry gate: if entry demands a lot-relative profit while this stays flat, a large-lot Box is entered against a real hurdle and then released against a trivial one. 0 leaves the flat target acting alone.",
+    type: "number",
+    unit: "rupees",
+    min: 0,
+    max: RUPEE_MAX,
+    zeroMeans: "value",
+    containment: "replace",
+    safeDirection: "neutral",
+    policy: "HOT_SAFE",
+    takesEffect: "next_candidate",
+    dangerous: false,
+    requiresFullAdmin: false,
+    caveat:
+      "Like the flat target, this is a profit goal and never an exit permission. EXPIRY_SAFETY, manual closes, protective cancels and emergency flattening all ignore it.",
+  },
+  {
     key: "profitCapturePct",
     envVar: "BOX_PROFIT_CAPTURE_PCT",
     boxConfigField: "profitCapturePct",
@@ -333,6 +474,25 @@ export const OPERATOR_SETTINGS: readonly SettingSpec[] = [
     takesEffect: "next_candidate",
     dangerous: true,
     requiresFullAdmin: true,
+  },
+  {
+    key: "oneOpportunityPerUnderlying",
+    envVar: "BOX_ONE_OPPORTUNITY_PER_UNDERLYING",
+    boxConfigField: "oneOpportunityPerUnderlying",
+    category: "strategy",
+    label: "Show one opportunity per underlying",
+    description:
+      "Publishes only the best candidate per underlying instead of one row per strike pair. At ATM±1 a name has three pairs that move together, so a single dislocation appears three times and crowds other names off a capped board. Display only: it cannot admit or refuse an entry, and a row for a Box that is actually open is never hidden.",
+    type: "boolean",
+    unit: "none",
+    // `replace`, not `floor`: this changes what is DISPLAYED, so neither value is safer and a
+    // deployment has no safety interest in forcing it on. `neutral` for the same reason.
+    containment: "replace",
+    safeDirection: "neutral",
+    policy: "HOT_SAFE",
+    takesEffect: "immediately",
+    dangerous: false,
+    requiresFullAdmin: false,
   },
   {
     key: "maxConcurrentPerUnderlying",
@@ -1040,6 +1200,14 @@ export const CODE_DEFAULTS: ReadonlyMap<string, SettingValue> = new Map<string, 
   ["minGrossEdge", 1200],
   ["expectedEntrySlippage", 250],
   ["expectedExitSlippage", 250],
+  // The per-unit rates. All 0 so a first deployment reproduces the flat arithmetic exactly; the
+  // parity test matches each against the literal in `loadBoxConfig`.
+  ["minExpectedNetProfitPerUnit", 0],
+  ["minGrossEdgePerUnit", 0],
+  ["safetyBufferPerUnit", 0],
+  ["expectedEntrySlippagePerUnit", 0],
+  ["expectedExitSlippagePerUnit", 0],
+  ["minExitNetPnlPerUnit", 0],
   ["strikeLevel", 3],
   ["enableShortBox", true],
   ["convergenceFloor", 200],
@@ -1051,6 +1219,7 @@ export const CODE_DEFAULTS: ReadonlyMap<string, SettingValue> = new Map<string, 
   // risk
   ["maxOpenBoxes", 0],
   ["oneActiveBoxPerUnderlying", false],
+  ["oneOpportunityPerUnderlying", false],
   ["maxConcurrentPerUnderlying", 2],
   ["liveMaxBoxCapitalRupees", 0],
   ["paperMaxBoxCapitalRupees", 0],

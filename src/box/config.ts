@@ -819,6 +819,20 @@ export interface BoxConfig {
    */
   oneActiveBoxPerUnderlying: boolean;
   /**
+   * Publish at most ONE candidate opportunity per (underlying, direction) — the best one.
+   *
+   * A DISPLAY/PUBLICATION rule, never an entry control: what may be entered is decided by
+   * {@link oneActiveBoxPerUnderlying} and the inventory ceilings, and this cannot loosen them.
+   *
+   * WHY IT IS WORTH A SETTING. At `BOX_STRIKE_LEVEL=1` a name has three strike pairs that move
+   * together, so one dislocation appears as three rows. Only one box per underlying can be
+   * entered, so those are not three opportunities; they are one opportunity three ways, crowding a
+   * 150-name universe out of a list capped at {@link maxPublishedOpportunities}.
+   *
+   * Rows describing REAL EXPOSURE (OPEN / PAPER_OPENED / LIVE_OPENED) are never collapsed.
+   */
+  oneOpportunityPerUnderlying: boolean;
+  /**
    * Maximum COMPLETE Box lifecycles (ENTRY → HOLD → EXIT → FLAT) an armed session may run.
    * `0` = unlimited (default), `1` = one-shot, `N` = N cycles. See `tradingSession.ts`.
    */
@@ -995,10 +1009,66 @@ export interface BoxConfig {
    * happened yet, so its slippage cannot be measured at entry time.
    */
   expectedExitSlippage: number;
+
+  // ---- Entry qualification, PER UNIT of quantity ----
+  /*
+   * WHY THESE EXIST — A FLAT RUPEE GATE IS A DIFFERENT GATE ON EVERY INSTRUMENT.
+   *
+   * `grossEdge = grossEdgePerUnit × lotSize`, so the edge a box can produce scales with the lot.
+   * The five figures above do NOT. F&O lot sizes span roughly 35 (BANKNIFTY) to 40,000+ (the
+   * large-lot single stocks) — a ~1000x range — so one flat ₹ figure means:
+   *
+   *   required mispricing per unit = flatFigure / lotSize
+   *
+   * At the shipped defaults (₹1,200 gate + ₹150 buffer + ₹250 + ₹250 slippage = ₹1,850) that is
+   * ≈₹53/unit on BANKNIFTY — a ~50% dislocation on a 2-step box, i.e. unreachable — and
+   * ≈₹0.046/unit on a 40,000 lot, i.e. inside the bid-ask noise and hit constantly. The gate was
+   * therefore not one policy applied to 150 names; it was "never trade the small lots, take almost
+   * anything on the large ones". That is exactly the observed symptom: very few opportunities, and
+   * the ones that appear are always the same handful of large-lot underlyings.
+   *
+   * Each figure below is a RATE in ₹ per unit of quantity, resolved against a candidate's own lot:
+   *
+   *   effective = max(flatFigure, perUnitFigure × lotSize)
+   *
+   * `max`, not replace, for two reasons: a 0 default is exactly today's behaviour so no existing
+   * deployment changes on upgrade, and the flat figure keeps acting as an absolute floor so a
+   * per-unit rate can never silently admit a box worth ₹12. To get lot-relative behaviour an
+   * operator LOWERS the flat figure to the smallest ticket worth taking and sets the rate to the
+   * real economic hurdle.
+   */
+  /** Minimum expected NET profit, ₹ per unit. 0 disables the rate and leaves the flat gate alone. */
+  minExpectedNetProfitPerUnit: number;
+  /** Gross PREFILTER, ₹ per unit. Held at or below the net rate for the same reason as the flat pair. */
+  minGrossEdgePerUnit: number;
+  /** Safety allowance, ₹ per unit. */
+  safetyBufferPerUnit: number;
+  /**
+   * Expected ENTRY slippage, ₹ per unit.
+   *
+   * This is the figure that was most wrong as a flat value: slippage IS ticks × quantity. A flat
+   * ₹250 over-charges a 35-lot index by ~7 ticks/unit and under-charges a 40,000 lot by ~99% of
+   * the true cost, so the projection was optimistic on exactly the names it most readily admitted.
+   */
+  expectedEntrySlippagePerUnit: number;
+  /** Expected EXIT slippage, ₹ per unit. Same argument as the entry rate. */
+  expectedExitSlippagePerUnit: number;
+  /**
+   * Minimum net P&L to accept an exit, ₹ per unit.
+   *
+   * Scaled for the same reason and, more importantly, for CONSISTENCY WITH ENTRY: if entry demands
+   * a lot-relative profit but the exit floor stays flat, a large-lot box is entered against a real
+   * hurdle and then released against a trivial one.
+   */
+  minExitNetPnlPerUnit: number;
   /**
    * A deliberate LOWER bound on what a round trip can cost in charges (₹), used
    * only by the prefilter. Eight option orders at ₹20 brokerage plus GST is
    * already ≈ ₹189, so ₹160 is safe.
+   *
+   * Deliberately NOT given a per-unit companion: it is subtracted to make the prefilter
+   * under-state the true requirement, so under-stating it on a large lot is the SAFE direction
+   * (the prefilter stays a lower bound and still cannot discard a box that would have qualified).
    */
   prefilterChargeAllowance: number;
   /**
@@ -1813,6 +1883,8 @@ export function loadBoxConfig(): BoxConfig {
      * exactly this reason, and this one was inconsistent with it.
      */
     oneActiveBoxPerUnderlying: strictBool("BOX_ONE_ACTIVE_BOX_PER_UNDERLYING", false),
+    // Defaults false so an existing dashboard keeps the row set it has always been sent.
+    oneOpportunityPerUnderlying: strictBool("BOX_ONE_OPPORTUNITY_PER_UNDERLYING", false),
     sessionMaxCompletedTrades: strictLimitInt("BOX_SESSION_MAX_COMPLETED_TRADES", 0, 0, 10_000),
     sessionMaxEntryAttempts: strictLimitInt("BOX_SESSION_MAX_ENTRY_ATTEMPTS", 0, 0, 10_000),
     /*
@@ -1916,6 +1988,18 @@ export function loadBoxConfig(): BoxConfig {
     safetyBuffer: nonNegativeNum("BOX_SAFETY_BUFFER", 150),
     expectedEntrySlippage: nonNegativeNum("BOX_EXPECTED_ENTRY_SLIPPAGE", 250),
     expectedExitSlippage: nonNegativeNum("BOX_EXPECTED_EXIT_SLIPPAGE", 250),
+    /*
+     * PER-UNIT rates. All default to 0, which resolves `max(flat, 0 × lot)` back to the flat
+     * figure — so an existing deployment that sets none of these behaves exactly as before.
+     * `nonNegativeNum` refuses a negative fatally: a negative rate would LOOSEN the gate below
+     * the flat floor on precisely the largest lots.
+     */
+    minExpectedNetProfitPerUnit: nonNegativeNum("BOX_MIN_EXPECTED_NET_PROFIT_PER_UNIT", 0),
+    minGrossEdgePerUnit: nonNegativeNum("MIN_BOX_GROSS_EDGE_PER_UNIT", 0),
+    safetyBufferPerUnit: nonNegativeNum("BOX_SAFETY_BUFFER_PER_UNIT", 0),
+    expectedEntrySlippagePerUnit: nonNegativeNum("BOX_EXPECTED_ENTRY_SLIPPAGE_PER_UNIT", 0),
+    expectedExitSlippagePerUnit: nonNegativeNum("BOX_EXPECTED_EXIT_SLIPPAGE_PER_UNIT", 0),
+    minExitNetPnlPerUnit: nonNegativeNum("BOX_MIN_EXIT_NET_PNL_PER_UNIT", 0),
     prefilterChargeAllowance: nonNegativeNum("BOX_PREFILTER_CHARGE_ALLOWANCE", 160),
     requirePricedCharges: bool("BOX_REQUIRE_PRICED_CHARGES", true),
 
@@ -2052,6 +2136,35 @@ export function loadBoxConfig(): BoxConfig {
   const trialRefusal = supervisedTrialStartupRefusal(resolved.supervisedOneLotTrial, resolved);
   if (trialRefusal !== null) throw new Error(trialRefusal);
 
+  /*
+   * THE PREFILTER MUST STAY A LOWER BOUND — ENFORCED FOR THE PER-UNIT PAIR TOO.
+   *
+   * The gross prefilter exists only to skip candidates that cannot possibly qualify, so it must
+   * never ask for MORE than the net gate. `applyTuning` maintains that for the flat pair
+   * (`min(baseMinGrossEdge, requiredNetProfit)`); the per-unit pair needs the same guarantee, and
+   * needs it more urgently: the net gate falls back to its FLAT figure when its rate is 0, so a
+   * gross rate of ₹0.50/unit against no net rate would demand ₹20,000 of gross on a 40,000 lot
+   * while the net gate asked for ₹300 — silently discarding every large-lot candidate, which is
+   * the exact class of bug the per-unit rates were added to remove.
+   *
+   * Because both effective figures are `max(flat, rate x lot)`, clamping the RATES pointwise is
+   * sufficient: max of pointwise-smaller terms is pointwise-smaller, at every lot size.
+   */
+  const requestedGrossPerUnit = resolved.minGrossEdgePerUnit;
+  resolved.minGrossEdgePerUnit = Math.min(
+    requestedGrossPerUnit,
+    resolved.minExpectedNetProfitPerUnit,
+  );
+  if (resolved.minGrossEdgePerUnit !== requestedGrossPerUnit) {
+    console.warn(
+      `[BoxConfig] MIN_BOX_GROSS_EDGE_PER_UNIT=${requestedGrossPerUnit} exceeds ` +
+        `BOX_MIN_EXPECTED_NET_PROFIT_PER_UNIT=${resolved.minExpectedNetProfitPerUnit}, so it has been ` +
+        `held at ₹${resolved.minGrossEdgePerUnit}/unit. The gross prefilter is a cheap first pass, ` +
+        `not the decision: above the net rate it would discard candidates that WOULD have qualified. ` +
+        `Raise the net rate if a stricter first pass was the intent.`,
+    );
+  }
+
   return resolved;
 }
 
@@ -2065,6 +2178,124 @@ export function requiredNetProfit(
   cfg: Pick<BoxConfig, "minExpectedNetProfit" | "minNetEdge">,
 ): number {
   return Math.max(cfg.minExpectedNetProfit, cfg.minNetEdge > 0 ? cfg.minNetEdge : 0);
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Lot-relative thresholds                                                   */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The fields the ENTRY DECISION resolves — the gate, the prefilter and the buffer, each with its
+ * per-unit rate.
+ *
+ * Every helper below takes the NARROWEST `Pick` it actually reads rather than this whole type. That
+ * is not tidiness: `computeExitMetrics` and `evaluateExitDecision` legitimately hold only a
+ * five-field exit `Pick`, so a helper demanding the entry fields too would force those callers to
+ * widen to a config they have no business seeing.
+ */
+export type BoxThresholdConfig = Pick<
+  BoxConfig,
+  | "minExpectedNetProfit"
+  | "minNetEdge"
+  | "minGrossEdge"
+  | "safetyBuffer"
+  | "minExpectedNetProfitPerUnit"
+  | "minGrossEdgePerUnit"
+  | "safetyBufferPerUnit"
+>;
+
+/** Every per-unit RATE, for the "is this policy lot-relative at all" question. */
+export type BoxPerUnitRates = Pick<
+  BoxConfig,
+  | "minExpectedNetProfitPerUnit"
+  | "minGrossEdgePerUnit"
+  | "safetyBufferPerUnit"
+  | "expectedEntrySlippagePerUnit"
+  | "expectedExitSlippagePerUnit"
+  | "minExitNetPnlPerUnit"
+>;
+
+/**
+ * Resolve one flat/per-unit pair against a candidate's lot size.
+ *
+ * `max(flat, rate × lot)` — the single rule every lot-relative threshold uses, in one place so the
+ * entry gate, the prefilter and the exit floor cannot drift apart. A non-finite or non-positive lot
+ * yields the flat figure: an instrument whose lot metadata is unusable must not silently get a
+ * ZERO threshold (`0 × lot = 0` would admit anything), and `buildCandidates` already refuses such
+ * an instrument outright, so this is defence in depth rather than the primary guard.
+ */
+function resolvePerLot(flat: number, perUnit: number, lotSize: number): number {
+  if (!(perUnit > 0)) return flat;
+  if (!Number.isFinite(lotSize) || lotSize <= 0) return flat;
+  // Rounded to paise inline rather than via math.ts `round2`: math.ts imports THIS module, so
+  // importing it back would close an ESM cycle for one arithmetic helper.
+  return Math.max(flat, Math.round(perUnit * lotSize * 100) / 100);
+}
+
+/**
+ * THE ENTRY GATE for a candidate with this lot size.
+ *
+ * Use this — not {@link requiredNetProfit} — everywhere a DECISION is made. `requiredNetProfit`
+ * remains the configured absolute floor and is the right figure to display, but it is the wrong
+ * figure to gate on, because it means a different per-unit hurdle on every instrument.
+ */
+export function requiredNetProfitForLot(
+  cfg: Pick<BoxConfig, "minExpectedNetProfit" | "minNetEdge" | "minExpectedNetProfitPerUnit">,
+  lotSize: number,
+): number {
+  return resolvePerLot(requiredNetProfit(cfg), cfg.minExpectedNetProfitPerUnit, lotSize);
+}
+
+/** The gross PREFILTER for a candidate with this lot size. Still a deliberate lower bound. */
+export function prefilterGrossThresholdForLot(
+  cfg: Pick<BoxConfig, "minGrossEdge" | "minGrossEdgePerUnit">,
+  lotSize: number,
+): number {
+  return Math.max(0, resolvePerLot(cfg.minGrossEdge, cfg.minGrossEdgePerUnit, lotSize));
+}
+
+/** The safety allowance deducted inside the expected-net figure, for this lot size. */
+export function safetyBufferForLot(
+  cfg: Pick<BoxConfig, "safetyBuffer" | "safetyBufferPerUnit">,
+  lotSize: number,
+): number {
+  return resolvePerLot(cfg.safetyBuffer, cfg.safetyBufferPerUnit, lotSize);
+}
+
+/** The expected ENTRY slippage allowance for this lot size. */
+export function entrySlippageAllowanceForLot(
+  cfg: Pick<BoxConfig, "expectedEntrySlippage" | "expectedEntrySlippagePerUnit">,
+  lotSize: number,
+): number {
+  return resolvePerLot(cfg.expectedEntrySlippage, cfg.expectedEntrySlippagePerUnit, lotSize);
+}
+
+/** The expected EXIT slippage allowance for this lot size. */
+export function exitSlippageAllowanceForLot(
+  cfg: Pick<BoxConfig, "expectedExitSlippage" | "expectedExitSlippagePerUnit">,
+  lotSize: number,
+): number {
+  return resolvePerLot(cfg.expectedExitSlippage, cfg.expectedExitSlippagePerUnit, lotSize);
+}
+
+/** The minimum net P&L required to accept an exit, for this lot size. */
+export function minExitNetPnlForLot(
+  cfg: Pick<BoxConfig, "minExitNetPnl" | "minExitNetPnlPerUnit">,
+  lotSize: number,
+): number {
+  return resolvePerLot(cfg.minExitNetPnl, cfg.minExitNetPnlPerUnit, lotSize);
+}
+
+/** True when any per-unit rate is active, i.e. thresholds are lot-relative rather than flat. */
+export function lotRelativeThresholdsEnabled(cfg: BoxPerUnitRates): boolean {
+  return (
+    cfg.minExpectedNetProfitPerUnit > 0 ||
+    cfg.minGrossEdgePerUnit > 0 ||
+    cfg.safetyBufferPerUnit > 0 ||
+    cfg.expectedEntrySlippagePerUnit > 0 ||
+    cfg.expectedExitSlippagePerUnit > 0 ||
+    cfg.minExitNetPnlPerUnit > 0
+  );
 }
 
 /**
@@ -2089,6 +2320,12 @@ export function configSnapshot(cfg: BoxConfig): BoxScannerConfigSnapshot {
     safety_buffer: cfg.safetyBuffer,
     expected_entry_slippage: cfg.expectedEntrySlippage,
     expected_exit_slippage: cfg.expectedExitSlippage,
+    min_expected_net_profit_per_unit: cfg.minExpectedNetProfitPerUnit,
+    min_gross_edge_per_unit: cfg.minGrossEdgePerUnit,
+    safety_buffer_per_unit: cfg.safetyBufferPerUnit,
+    expected_entry_slippage_per_unit: cfg.expectedEntrySlippagePerUnit,
+    expected_exit_slippage_per_unit: cfg.expectedExitSlippagePerUnit,
+    min_exit_net_pnl_per_unit: cfg.minExitNetPnlPerUnit,
     quote_max_age_ms: cfg.quoteMaxAgeMs,
     strikes_each_side: cfg.strikesEachSide,
     convergence_floor: cfg.convergenceFloor,
@@ -2126,6 +2363,7 @@ export function configSnapshot(cfg: BoxConfig): BoxScannerConfigSnapshot {
     live_entry_submit_concurrency: cfg.liveEntrySubmitConcurrency,
     live_max_box_capital_rupees: cfg.liveMaxBoxCapitalRupees,
     one_active_box_per_underlying: cfg.oneActiveBoxPerUnderlying,
+    one_opportunity_per_underlying: cfg.oneOpportunityPerUnderlying,
     session_max_completed_trades: cfg.sessionMaxCompletedTrades,
     session_max_entry_attempts: cfg.sessionMaxEntryAttempts,
     // Executable-order-pricing knobs, frozen so a paper_legging fill stays

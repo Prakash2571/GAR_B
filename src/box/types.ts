@@ -1604,6 +1604,20 @@ export interface BoxScannerConfigSnapshot {
   /** Allowances used when a real measurement was not available yet (₹). */
   expected_entry_slippage?: number;
   expected_exit_slippage?: number;
+  /*
+   * PER-UNIT rates (₹ per unit of quantity), frozen so a fill stays interpretable.
+   *
+   * Without these a document records only the flat figures, and the question that actually decides
+   * whether a trade should have been taken — "what was the hurdle for THIS lot size?" — becomes
+   * unanswerable from the document alone once the rates are retuned. Optional: absent on every
+   * document written before lot-relative thresholds existed.
+   */
+  min_expected_net_profit_per_unit?: number;
+  min_gross_edge_per_unit?: number;
+  safety_buffer_per_unit?: number;
+  expected_entry_slippage_per_unit?: number;
+  expected_exit_slippage_per_unit?: number;
+  min_exit_net_pnl_per_unit?: number;
   quote_max_age_ms: number;
   strikes_each_side: number;
   convergence_floor: number;
@@ -1647,6 +1661,13 @@ export interface BoxScannerConfigSnapshot {
   live_max_box_capital_rupees?: number;
   /** Whether the underlying-level entry restriction was in force. */
   one_active_box_per_underlying?: boolean;
+  /**
+   * Publication rule frozen for audit: was the board collapsed to one row per underlying?
+   *
+   * A trade's row set is what an operator was looking at when they let it happen, so "why was
+   * only one NIFTY pair visible?" must be answerable from the document alone.
+   */
+  one_opportunity_per_underlying?: boolean;
   /** The session cycle budget in force. 0 = unlimited. */
   session_max_completed_trades?: number;
   /**

@@ -14,7 +14,10 @@
     "strike_level", "max_strikes", "max_candidates_per_underlying", "prefilter_gross_threshold",
     "convergence_floor", "convergence_pct", "min_exit_net_pnl", "profit_capture_pct",
     "expiry_safety_minutes", "max_subscribed_tokens", "lots", "universe", "indicative_discovery",
-    "closed_cache_enabled", "tunable"
+    "closed_cache_enabled", "tunable", "one_opportunity_per_underlying",
+    "lot_relative_thresholds", "min_expected_net_profit_per_unit", "min_gross_edge_per_unit",
+    "safety_buffer_per_unit", "expected_entry_slippage_per_unit",
+    "expected_exit_slippage_per_unit", "min_exit_net_pnl_per_unit"
   ],
   "properties": {
     "min_expected_net_profit": { "type": "number" },
@@ -50,6 +53,20 @@
     "universe": { "type": "string" },
     "indicative_discovery": { "type": "boolean" },
     "closed_cache_enabled": { "type": "boolean" },
+    "one_opportunity_per_underlying": {
+      "type": "boolean",
+      "description": "Whether the published opportunity list is collapsed to the best candidate per (underlying, direction). A PUBLICATION rule, not an entry control: at BOX_STRIKE_LEVEL=1 a name has three strike pairs that move together, so one dislocation otherwise appears as three rows and crowds other names off a list capped at max_published_opportunities. Rows describing a Box that is actually open are never collapsed. The per-underlying ENTRY guarantee is one_active_box_per_underlying, reported on box-execution-control."
+    },
+    "lot_relative_thresholds": {
+      "type": "boolean",
+      "description": "True when at least one per-unit rate below is non-zero, i.e. thresholds resolve as max(flat, rate x lotSize) per candidate rather than as one flat rupee figure for every instrument. Published because the flat figures alone cannot express which regime is active, and the two screen a mixed universe very differently: with flat-only gates the effective hurdle is flat/lotSize per unit, which varies by ~1000x across F&O lot sizes and concentrates every entry in the largest-lot underlyings."
+    },
+    "min_expected_net_profit_per_unit": { "type": "number" },
+    "min_gross_edge_per_unit": { "type": "number" },
+    "safety_buffer_per_unit": { "type": "number" },
+    "expected_entry_slippage_per_unit": { "type": "number" },
+    "expected_exit_slippage_per_unit": { "type": "number" },
+    "min_exit_net_pnl_per_unit": { "type": "number" },
     "tunable": {
       "type": "object",
       "additionalProperties": false,

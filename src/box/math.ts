@@ -34,7 +34,13 @@
  */
 
 import type { BoxConfig } from "./config.js";
-import { requiredNetProfit } from "./config.js";
+import {
+  minExitNetPnlForLot,
+  prefilterGrossThresholdForLot,
+  requiredNetProfitForLot,
+  safetyBufferForLot,
+  type BoxThresholdConfig,
+} from "./config.js";
 import { singleLotLegViolation } from "./singleLotInvariant.js";
 import {
   BOX_ENTRY_SIDES_BY_DIRECTION,
@@ -588,8 +594,13 @@ export function projectedNetEdge(args: {
  *               - entryCharges
  *               - estimatedExitCharges
  *               - (entrySlippageAllowance + futureExitSlippageAllowance)
- *               - safetyBuffer
- *   qualifies   = expectedNet >= requiredNetProfit(cfg)
+ *               - safetyBufferForLot(cfg, lotSize)
+ *   qualifies   = expectedNet >= requiredNetProfitForLot(cfg, lotSize)
+ *
+ * LOT-RELATIVE BY CONSTRUCTION. `grossEdge` is `grossEdgePerUnit × lotSize`, so both the gate and
+ * the buffer are resolved through `cfg`'s flat/per-unit pairs against the candidate's own lot. A
+ * caller that supplies only flat figures (every per-unit rate 0) gets exactly the previous
+ * arithmetic; a caller that sets rates gets one consistent per-unit hurdle across the universe.
  *
  * TWO DISTINCT CONTEXTS, ONE FUNCTION — and the difference is the whole point of
  * TASK 1 (fixing entry-slippage double counting):
@@ -623,12 +634,18 @@ export function evaluateEntryDecision(args: {
   futureExitSlippageAllowance?: number;
   /** Measured entry slippage for the record — NEVER deducted (analytics only). */
   measuredEntrySlippage?: number | null;
-  cfg: Pick<
-    BoxConfig,
-    "minExpectedNetProfit" | "minNetEdge" | "minGrossEdge" | "safetyBuffer"
-  >;
+  /**
+   * The candidate's EXCHANGE LOT SIZE, which resolves every lot-relative threshold.
+   *
+   * REQUIRED, not optional, and deliberately so: `grossEdge` already scales with the lot, so a
+   * gate that does not know the lot is a different gate on every instrument (see the per-unit
+   * block in config.ts). Making it required turns a missed call site into a COMPILE ERROR instead
+   * of a silently mis-scaled threshold on the live entry path.
+   */
+  lotSize: number;
+  cfg: BoxThresholdConfig;
 }): BoxEntryDecision {
-  const { grossEdge, entryCharges, estimatedExitCharges, cfg } = args;
+  const { grossEdge, entryCharges, estimatedExitCharges, cfg, lotSize } = args;
 
   // Resolve the two named allowances. When the explicit fields are supplied they
   // win; otherwise fall back to the legacy lumped `executionCost` (attributed to
@@ -645,8 +662,12 @@ export function evaluateEntryDecision(args: {
       ? null
       : round2(args.measuredEntrySlippage);
 
-  const minNet = requiredNetProfit(cfg);
-  const passesPrefilter = grossEdge !== null && grossEdge >= cfg.minGrossEdge;
+  // Every threshold is resolved against THIS candidate's lot, so one configured policy means the
+  // same per-unit hurdle on a 35-lot index and on a 40,000-lot single stock.
+  const minNet = requiredNetProfitForLot(cfg, lotSize);
+  const safetyBuffer = safetyBufferForLot(cfg, lotSize);
+  const passesPrefilter =
+    grossEdge !== null && grossEdge >= prefilterGrossThresholdForLot(cfg, lotSize);
 
   const base: Omit<BoxEntryDecision, "qualifies" | "reject" | "expected_net_profit"> = {
     gross_edge: grossEdge,
@@ -656,7 +677,7 @@ export function evaluateEntryDecision(args: {
     entry_slippage_allowance: entryAllowance,
     future_exit_slippage_allowance: futureExitAllowance,
     measured_entry_slippage: measuredEntrySlippage,
-    safety_buffer: cfg.safetyBuffer,
+    safety_buffer: safetyBuffer,
     min_expected_net_profit: minNet,
     passes_gross_prefilter: passesPrefilter,
   };
@@ -680,7 +701,7 @@ export function evaluateEntryDecision(args: {
     entryCharges,
     estimatedExitCharges,
     executionCost,
-    safetyBuffer: cfg.safetyBuffer,
+    safetyBuffer,
   });
 
   if (!passesPrefilter) {
@@ -993,6 +1014,10 @@ export function evaluateExitDecision(args: {
     | "convergenceFloor"
     | "convergencePct"
     | "minExitNetPnl"
+    // Resolved against `lotSize`, so the exit floor is the same per-unit hurdle as the entry gate.
+    // Without this the two disagree: a large-lot box would be admitted against a real requirement
+    // and then released against a trivial one.
+    | "minExitNetPnlPerUnit"
     | "profitCapturePct"
     | "minCapturedPct"
   >;
@@ -1039,7 +1064,7 @@ export function evaluateExitDecision(args: {
   if (netPnl === null || floorNet === null) {
     blocked = "unpriced_charges";
   } else if (netPnl > 0 && remainingEdge !== null) {
-    const clearsFloor = floorNet >= cfg.minExitNetPnl;
+    const clearsFloor = floorNet >= minExitNetPnlForLot(cfg, args.lotSize);
     const converged = remainingEdge <= threshold;
     const capturedEnough =
       floorNet >= captureTarget || (capturedPct !== null && capturedPct >= cfg.minCapturedPct);
@@ -1116,6 +1141,10 @@ export function computeExitMetrics(args: {
     | "convergenceFloor"
     | "convergencePct"
     | "minExitNetPnl"
+    // Resolved against `lotSize`, so the exit floor is the same per-unit hurdle as the entry gate.
+    // Without this the two disagree: a large-lot box would be admitted against a real requirement
+    // and then released against a trivial one.
+    | "minExitNetPnlPerUnit"
     | "profitCapturePct"
     | "minCapturedPct"
   >;
@@ -1184,7 +1213,9 @@ export function computeExitMetrics(args: {
     captured_edge: decision.captured_edge,
     captured_pct: decision.captured_pct,
     convergence_threshold: convergenceThreshold(entryNetEdge, cfg),
-    min_exit_net_pnl: cfg.minExitNetPnl,
+    // The EFFECTIVE floor for this lot, not the flat configured figure, so the reported number is
+    // the one the decision above actually compared against.
+    min_exit_net_pnl: minExitNetPnlForLot(cfg, lotSize),
     profit_capture_target: round2(cfg.profitCapturePct * entryNetEdge),
     min_captured_pct: cfg.minCapturedPct,
     time_in_trade_ms: args.openedAt === undefined ? null : Math.max(0, now - args.openedAt),
