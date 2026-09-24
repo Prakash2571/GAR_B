@@ -134,6 +134,8 @@ import {
 } from "./reservations/index.js";
 import { mintOwnerId } from "./reservations/identity.js";
 import { BoxExecutionLeaseManager, executionLeaseStatus } from "./executionLease.js";
+import { BoxOperatorError, liveManagerUnavailable } from "./operatorError.js";
+import { BoundedSseWriter } from "./sseWriter.js";
 import {
   buildAttributedFlattenResult,
   classifyPositionClose,
@@ -392,8 +394,17 @@ function istMinutesOfDay(at: number = Date.now()): number {
   return ist.getUTCHours() * 60 + ist.getUTCMinutes();
 }
 
+/**
+ * One SSE subscriber.
+ *
+ * The `writer` is what keeps a slow client from costing this process unbounded memory: every byte goes
+ * through it, it honours the socket's backpressure, it coalesces superseded snapshots and it disconnects
+ * a client that cannot be kept inside its budget. See `sseWriter.ts` for why ignoring `res.write()`'s
+ * return value was not survivable in the process that also dispatches orders.
+ */
 interface SseClient {
   res: Response;
+  writer: BoundedSseWriter;
 }
 
 /**
@@ -3099,7 +3110,7 @@ export class BoxEngine {
   }
 
   async reconcileLive(): Promise<unknown> {
-    if (!this.orderManager) throw new Error("Live order manager is unavailable.");
+    if (!this.orderManager) throw liveManagerUnavailable();
     this.syncManagerExposure();
     // Flush any consumption write that failed earlier. Reconciliation is exactly the right place:
     // it is the operation an operator runs when they suspect durable state has drifted.
@@ -3117,7 +3128,7 @@ export class BoxEngine {
     operation_id: string;
     deduplicated: boolean;
   }> {
-    if (!this.orderManager) throw new Error("Live order manager is unavailable.");
+    if (!this.orderManager) throw liveManagerUnavailable();
     const manager = this.orderManager;
     // SINGLE-FLIGHT BY OPERATION KIND. A client whose request timed out and retried must not cause a
     // second sweep: browser abort does not cancel the server operation. A second caller JOINS the one
@@ -3152,11 +3163,15 @@ export class BoxEngine {
   }
 
   private async flattenAttributedBoxExposureOnce(): Promise<AttributedFlattenResult> {
-    if (!this.orderManager) throw new Error("Live order manager is unavailable.");
+    if (!this.orderManager) throw liveManagerUnavailable();
     const manager = this.orderManager;
     const managerStatus = this.orderManager.status();
     if (!managerStatus.controls.emergencyFlatten) {
-      throw new Error("box_emergency_flatten is disabled.");
+      throw new BoxOperatorError(
+        409,
+        "emergency_flatten_disabled",
+        "box_emergency_flatten is disabled, so the emergency flatten was refused.",
+      );
     }
 
     /*
@@ -3218,7 +3233,9 @@ export class BoxEngine {
     // captured before the sweep.
     const settledStatus = this.orderManager.status();
     if (!settledStatus.health.reconciliation_complete && !this.orderManager.canSafelyReduceAttributedExposure()) {
-      throw new Error(
+      throw new BoxOperatorError(
+        409,
+        "flatten_unsafe",
         "Cannot flatten until broker state proves the full durable Box quantity can be reduced safely" +
         (settlement.blocked ? ` (cancellation was refused: ${settlement.blocked})` : "") +
         (settlement.failures.length > 0 ? ` [settlement issues: ${settlement.failures.join("; ")}]` : ""),
@@ -9301,7 +9318,25 @@ export class BoxEngine {
   /* ---------------------------------- SSE --------------------------------- */
 
   addSseClient(res: Response): () => void {
-    const client: SseClient = { res };
+    const client: SseClient = {
+      res,
+      writer: new BoundedSseWriter({
+        sink: res,
+        onOverBudget: ({ pendingBytes, queuedFrames }) => {
+          // The client stopped draining and is now costing this process memory it needs for execution.
+          // Dropping the connection is the visible, recoverable outcome: the browser reconnects and is
+          // given a complete fresh snapshot. It is removed from the registry here as well as by the
+          // request's own close handler, because `destroy()` may not surface as a `close` event before
+          // the next publish tick.
+          this.sseClients.delete(client);
+          console.warn(
+            `[Box] disconnected a slow SSE client: ${pendingBytes} bytes were still pending with ` +
+              `${queuedFrames} frame(s) queued, over its per-client budget. It will receive a full ` +
+              "snapshot when it reconnects.",
+          );
+        },
+      }),
+    };
     this.sseClients.add(client);
     if (!this.publishTimer) {
       this.publishTimer = setInterval(() => this.publish(), this.cfg.publishIntervalMs);
@@ -9310,6 +9345,7 @@ export class BoxEngine {
     this.writeFrame(client, "snapshot", this.snapshot());
     return () => {
       this.sseClients.delete(client);
+      client.writer.close();
       // `maybeReleaseFeed` now guards residuals itself; this pre-check is kept in step with it so
       // the two can never disagree about whether the feed is still needed.
       if (
@@ -9346,11 +9382,42 @@ export class BoxEngine {
     for (const client of this.sseClients) this.writeFrame(client, event, payload);
   }
 
+  /**
+   * THE ONLY PLACE AN SSE BYTE IS PRODUCED.
+   *
+   * `snapshot` frames carry the whole state, so they are marked superseding: a client that is backed up
+   * keeps only the newest one, which is what bounds a slow reader's cost. Every other event describes a
+   * DISCRETE thing that happened and is never coalesced — it is delivered, or the client is disconnected
+   * and rebuilt from a fresh snapshot on reconnect. Neither case silently drops an event.
+   */
   private writeFrame(client: SseClient, event: string, payload: unknown): void {
+    let data: string;
     try {
-      client.res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
+      data = JSON.stringify(payload);
     } catch {
-      // Broken pipe — the request's own close handler removes the client.
+      // A payload that cannot be serialised is a bug, but it must not take the stream down.
+      return;
+    }
+    client.writer.send(event, data, event === "snapshot" ? { coalesceKey: "snapshot" } : {});
+  }
+
+  /**
+   * Close one subscriber's stream from the SERVER side, with a final frame naming the reason.
+   *
+   * Exists for session enforcement: a stream whose session expired or was revoked has to be ended by
+   * this process, because nothing else will. The frame is best-effort — a peer that is not reading will
+   * never see it — so the connection is ended regardless.
+   */
+  closeSseClient(res: Response, reason: string): void {
+    for (const client of this.sseClients) {
+      if (client.res !== res) continue;
+      this.sseClients.delete(client);
+      try {
+        client.writer.sendCritical("stream_closed", JSON.stringify({ reason }));
+      } catch {
+        /* the peer is already gone */
+      }
+      client.writer.close();
     }
   }
 

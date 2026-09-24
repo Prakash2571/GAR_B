@@ -296,10 +296,23 @@ export function registerBrokerAuthRoutes(app: Express, deps: BrokerAuthRouteDeps
     // requirement is decided HERE by broker, never by whether a `state` happened to be
     // present — otherwise omitting it would silently downgrade the check.
     //
-    // `consume` spends the entry only on a MATCHED claim, so a wrong nonce leaves it
-    // claimable by the real redirect.
+    /*
+     * CLAIM, EXCHANGE, THEN SPEND — never "delete, then exchange".
+     *
+     * The initiation is RESERVED here and spent only once the exchange has actually established a
+     * session. That ordering is what closes the denial-of-login this route used to have: for Dhan the
+     * broker round-trips nothing of ours, so any caller with a non-empty `tokenId` reached the store and
+     * DELETED the operator's newest pending login before proving anything. Their real redirect then
+     * arrived to `login_expired`. Deleting first never bought any safety either — what must be
+     * single-use is a SUCCESSFUL exchange, which `commit` below provides — it only ensured that a failed
+     * attempt also destroyed the initiation.
+     *
+     * A claim also serialises: while one exchange is in flight nothing else may claim the same entry, so
+     * a replay cannot start a second one, and an unauthenticated flood cannot multiply outbound token
+     * exchanges. See `pendingLogins.ts`.
+     */
     const requireNonce = broker === "zerodha";
-    const claimed = pending.consume(broker, queryString(req, "state") || null, { requireNonce });
+    const claimed = pending.claim(broker, queryString(req, "state") || null, { requireNonce });
     if (!claimed.ok) {
       // eslint-disable-next-line no-console
       console.warn(`[BrokerLogin] ${broker} callback refused: ${claimed.reason}`);
@@ -311,6 +324,10 @@ export function registerBrokerAuthRoutes(app: Express, deps: BrokerAuthRouteDeps
       if (broker === "zerodha") await login.completeZerodhaLogin(credential);
       else await login.completeDhanLogin(credential);
     } catch (err) {
+      // RELEASED, NOT SPENT. This caller proved nothing — most likely it was not the operator at all —
+      // so the operator's initiation must survive for their real redirect. Replay protection is
+      // unaffected: nothing was established, so there is nothing to replay.
+      pending.release(claimed.claim);
       // The manager has already recorded an operator-facing reason on this broker's slot,
       // which the status endpoint surfaces. The redirect carries only a stable code — a
       // broker's own message must never be reflected into a URL.
@@ -322,6 +339,10 @@ export function registerBrokerAuthRoutes(app: Express, deps: BrokerAuthRouteDeps
       fail(res, broker, "exchange_failed");
       return;
     }
+
+    // SPENT, now that a session demonstrably exists. A replayed callback — Back button, a broker retry,
+    // a captured URL — finds nothing claimable and is refused.
+    pending.commit(claimed.claim);
 
     // GUARDED: the session is already installed and the entry already spent, so a throw
     // from a downstream publish hook must not turn a SUCCESSFUL sign-in into a bare 500
@@ -336,7 +357,7 @@ export function registerBrokerAuthRoutes(app: Express, deps: BrokerAuthRouteDeps
       );
     }
     // eslint-disable-next-line no-console
-    console.log(`[BrokerLogin] ${broker} session established by ${claimed.pending.startedBy}.`);
+    console.log(`[BrokerLogin] ${broker} session established by ${claimed.claim.pending.startedBy}.`);
     res.redirect(303, loginResultRedirect(deps.frontendUrl, broker, { ok: true }));
   });
 

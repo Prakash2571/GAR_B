@@ -36,11 +36,24 @@ session everywhere to buy nothing.
 
 It is authenticated instead by the **pending-login store**
 (`src/brokerAuth/pendingLogins.ts`): a login must have been *started* moments
-earlier by a request that DID carry a valid operator session, the entry is
-**single-use**, and it expires in 10 minutes. Zerodha's `state` nonce is
-additionally compared in constant time. Dhan round-trips nothing of ours, so its
-proof is existence + TTL + single-use only — weaker **by the broker's design**, and
-documented rather than hidden.
+earlier by a request that DID carry a valid operator session, a **successful**
+exchange spends the entry (strictly single-use), and it expires in 10 minutes.
+Zerodha's `state` nonce is additionally compared in constant time. Dhan round-trips
+nothing of ours, so its proof is existence + TTL + single-use only — weaker **by the
+broker's design**, and documented rather than hidden.
+
+**The claim is two-phase: claim → exchange → commit/release.** The entry is
+*reserved* before the token exchange and only *spent* once a session has actually
+been established; a failed exchange **releases** it. This is what stops an
+unauthenticated caller denying an operator their login: for Dhan there is no nonce to
+check, so any caller presenting a non-empty `tokenId` gets a claim, and if a claim
+destroyed the entry up front their junk callback would consume the operator's
+in-flight sign-in (whose own redirect would then be refused as expired). While a
+claim is outstanding nothing else may claim the same entry — so a replay cannot run a
+second exchange, and a flood cannot multiply outbound token exchanges — and an
+unresolved claim lapses after 60s so a crashed exchange cannot lock an operator out.
+A duplicate callback arriving during an exchange is refused with
+`login_in_progress`, which tells the operator to *wait* rather than start again.
 
 The callback also refuses while the process is not `ready`, because a login
 completing mid-boot could be silently discarded by `restore()` adopting the stored
@@ -51,8 +64,8 @@ session, anything it consumes an anonymous caller can consume. A request that la
 credential, carries a broker-reported denial, or presents a wrong/absent `state` is
 rejected **without** spending the operator's in-flight sign-in — otherwise one bare
 `GET` would deny them a login, repeatably, with an error blaming their own browser.
-Only a matched claim is spent (and then it is strictly single-use). The route is
-additionally rate limited to 20 requests/minute/IP.
+Only a claim whose exchange **succeeds** is spent (and then it is strictly
+single-use). The route is additionally rate limited to 20 requests/minute/IP.
 
 ### 2. `GET /api/tokens/zerodha` and `GET /api/tokens/dhan` — token exposure
 
@@ -172,6 +185,31 @@ cookie** via `requireOperator`. A session token supplied in the **query string i
 never accepted** — `getOperatorRole(req)` reads only the validated session the
 middleware attached, never a header or query token. This is structural, not a
 check that could be bypassed.
+
+**And it keeps authenticating for as long as the stream is open.** Every other
+route is checked per request, so revoking a session stops it working on the next
+call; a stream has ONE request and then lives for hours. Authenticating only at
+open meant a client that simply held its connection kept receiving full state
+snapshots after logout and after the session's hard expiry — a browser closing its
+own stream on logout is client-side courtesy, not enforcement. The heartbeat (20s,
+also the re-check cadence) now carries it, via `src/box/streamSession.ts`:
+
+| situation | what happens | why |
+| --- | --- | --- |
+| session **expired** | stream closed | decided LOCALLY from `expires_at`; no query, so it holds even when PostgreSQL is unreachable. There is no sliding renewal, so the deadline is known at open |
+| session **revoked** | stream closed | one indexed `validateSession` lookup per heartbeat — bounded, no listener, no extra polling |
+| session store **unreachable** | tolerated for 120s, then closed | a failed query is not evidence of a revocation, and disconnecting every operator on a database blip removes the live view exactly when it is needed. Bounded, so a stream cannot run unverified indefinitely |
+
+The bound on exposure is therefore **one heartbeat interval** of snapshots after a
+session dies, and that is stated rather than implied. A stream opened within a
+heartbeat of its expiry is closed on its own timer instead. Closure is
+server-initiated: a final `stream_closed` event names the reason, then the
+connection ends.
+
+Per-client output is separately bounded — see `src/box/sseWriter.ts`. Snapshots
+coalesce under backpressure, discrete events never silently drop, and a client that
+stays over its byte budget is disconnected rather than buffered, so one stalled
+viewer cannot grow memory in the process that also dispatches orders.
 
 ## CORS
 
