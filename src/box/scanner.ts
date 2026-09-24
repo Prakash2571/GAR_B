@@ -15,7 +15,14 @@
  */
 
 import type { BoxConfig } from "./config.js";
-import { configSnapshot, prefilterGrossThreshold, requiredNetProfit } from "./config.js";
+import {
+  configSnapshot,
+  entrySlippageAllowanceForLot,
+  exitSlippageAllowanceForLot,
+  prefilterGrossThresholdForLot,
+  requiredNetProfitForLot,
+  safetyBufferForLot,
+} from "./config.js";
 import {
   BoxChargeEstimator,
   buildEntryChargeLegs,
@@ -432,14 +439,19 @@ export class BoxScanner {
     }
 
     const openKeyTaken = this.deps.positions.getByKey(cand.key) !== undefined;
-    const threshold = prefilterGrossThreshold(this.deps.cfg);
+    // Lot-resolved: the prefilter must stay a lower bound on the SAME lot the net gate will use,
+    // otherwise it can discard a candidate that would have qualified.
+    const threshold = prefilterGrossThresholdForLot(this.deps.cfg, cand.lot_size);
     const passedPrefilter = passesGrossPrefilter(evaluation.gross_edge, threshold);
     if (passedPrefilter) this.stats.prefilterPasses++;
 
     this.publish(evaluation, {
       openKeyTaken,
       passedPrefilter,
-      decision: this.localDecisionFor(evaluation, this.deps.cfg.expectedEntrySlippage),
+      decision: this.localDecisionFor(
+        evaluation,
+        entrySlippageAllowanceForLot(this.deps.cfg, cand.lot_size),
+      ),
     });
 
     if (!this.discovering) return;
@@ -471,7 +483,10 @@ export class BoxScanner {
 
     // Only candidates that clear the fast local net-profit projection are worth
     // spending an execution pipeline on. This keeps the hot path cheap.
-    const localDecision = this.localDecisionFor(evaluation, this.deps.cfg.expectedEntrySlippage);
+    const localDecision = this.localDecisionFor(
+      evaluation,
+      entrySlippageAllowanceForLot(this.deps.cfg, cand.lot_size),
+    );
     if (!localDecision || !localDecision.qualifies) {
       if (localDecision && localDecision.reject === "below_expected_net_profit") {
         this.noteNetProfitRejection(cand, evaluation, localDecision);
@@ -525,7 +540,11 @@ export class BoxScanner {
       // PRE-EXECUTION PROJECTION: this is the DETECTION gross edge, so an expected
       // entry-slippage allowance is deducted alongside the future exit allowance.
       entrySlippageAllowance,
-      futureExitSlippageAllowance: this.deps.cfg.expectedExitSlippage,
+      futureExitSlippageAllowance: exitSlippageAllowanceForLot(
+        this.deps.cfg,
+        evaluation.candidate.lot_size,
+      ),
+      lotSize: evaluation.candidate.lot_size,
       cfg: this.deps.cfg,
     });
   }
@@ -612,7 +631,10 @@ export class BoxScanner {
     };
 
     try {
-      detectionDecision = this.localDecisionFor(detection, this.deps.cfg.expectedEntrySlippage);
+      detectionDecision = this.localDecisionFor(
+        detection,
+        entrySlippageAllowanceForLot(this.deps.cfg, cand.lot_size),
+      );
       stage = "execution";
       // Independent role orders in paper_legging and live modes.
       if (this.deps.cfg.executionMode === "paper_legging" || this.deps.cfg.executionMode === "live") {
@@ -811,9 +833,12 @@ export class BoxScanner {
         entry_slippage_allowance: 0,
         future_exit_slippage_allowance: 0,
         measured_entry_slippage: null,
-        safety_buffer: this.deps.cfg.safetyBuffer,
+        safety_buffer: safetyBufferForLot(this.deps.cfg, execution.candidate.lot_size),
         expected_net_profit: null,
-        min_expected_net_profit: requiredNetProfit(this.deps.cfg),
+        min_expected_net_profit: requiredNetProfitForLot(
+          this.deps.cfg,
+          execution.candidate.lot_size,
+        ),
         passes_gross_prefilter: false,
         qualifies: false,
         reject: "unpriced_charges",
@@ -832,8 +857,12 @@ export class BoxScanner {
       entryCharges: totals.entry,
       estimatedExitCharges: totals.exit,
       entrySlippageAllowance: 0,
-      futureExitSlippageAllowance: this.deps.cfg.expectedExitSlippage,
+      futureExitSlippageAllowance: exitSlippageAllowanceForLot(
+        this.deps.cfg,
+        execution.candidate.lot_size,
+      ),
       measuredEntrySlippage: measuredSlippage,
+      lotSize: execution.candidate.lot_size,
       cfg: this.deps.cfg,
     });
   }
@@ -1097,7 +1126,12 @@ export class BoxScanner {
     evaluation: BoxEvaluation,
     detail?: string,
   ): void {
-    if (!passesGrossPrefilter(evaluation.gross_edge, prefilterGrossThreshold(this.deps.cfg))) {
+    if (
+      !passesGrossPrefilter(
+        evaluation.gross_edge,
+        prefilterGrossThresholdForLot(this.deps.cfg, cand.lot_size),
+      )
+    ) {
       return;
     }
     const logKey = `${event}|${cand.key}`;
@@ -1160,11 +1194,19 @@ export class BoxScanner {
       gross_edge: evaluation.gross_edge,
       entry_charges: decision ? decision.entry_charges : null,
       estimated_exit_charges: decision ? decision.estimated_exit_charges : null,
-      execution_cost: decision ? decision.execution_cost : cfg.expectedEntrySlippage + cfg.expectedExitSlippage,
-      safety_buffer: cfg.safetyBuffer,
+      // Lot-resolved on the fallback path too: when there is no priced decision the published
+      // allowance must still describe THIS candidate's lot, or the board shows a cost that the
+      // gate would never have used.
+      execution_cost: decision
+        ? decision.execution_cost
+        : round2(
+            entrySlippageAllowanceForLot(cfg, cand.lot_size) +
+              exitSlippageAllowanceForLot(cfg, cand.lot_size),
+          ),
+      safety_buffer: safetyBufferForLot(cfg, cand.lot_size),
       projected_net_edge: expectedNet,
       expected_net_profit: expectedNet,
-      min_expected_net_profit: requiredNetProfit(cfg),
+      min_expected_net_profit: requiredNetProfitForLot(cfg, cand.lot_size),
       charge_origin: "local",
       entry_sides: evaluation.legs.map((l) => ({
         role: l.role,
@@ -1199,7 +1241,7 @@ export class BoxScanner {
         openKeyTaken: openKeys.has(cand.key),
         passedPrefilter: passesGrossPrefilter(
           evaluation.gross_edge,
-          prefilterGrossThreshold(this.deps.cfg),
+          prefilterGrossThresholdForLot(this.deps.cfg, cand.lot_size),
         ),
         decision: null,
         priceSource: "last_close",
@@ -1214,9 +1256,12 @@ export class BoxScanner {
    * cleared the gross prefilter, and anything already open.
    */
   listOpportunities(limit: number): BoxOpportunity[] {
-    const threshold = prefilterGrossThreshold(this.deps.cfg);
     const rows: BoxOpportunity[] = [];
     for (const opp of this.opportunities.values()) {
+      // Resolved per ROW, not once for the whole list: with lot-relative thresholds the figure
+      // differs by underlying, so a single shared threshold would judge every row by some other
+      // instrument's hurdle.
+      const threshold = prefilterGrossThresholdForLot(this.deps.cfg, opp.lot_size);
       const interesting =
         opp.status === "OPEN" ||
         opp.status === "PAPER_OPENED" ||

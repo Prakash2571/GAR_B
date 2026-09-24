@@ -31,6 +31,7 @@ import {
   clampStrikeLevel,
   configSnapshot,
   loadBoxConfig,
+  lotRelativeThresholdsEnabled,
   prefilterGrossThreshold,
   readTuning,
   requiredNetProfit,
@@ -2208,6 +2209,31 @@ export class BoxEngine {
         `freshness ${this.cfg.quoteMaxAgeMs}ms, ATM±${this.strikeLevel} of max ±${this.cfg.strikesEachSide}, ` +
         `market ${this.marketOpen ? "OPEN" : "CLOSED"}.`,
     );
+    /*
+     * Say plainly whether the thresholds are LOT-RELATIVE, because the two regimes screen a wide
+     * universe completely differently and the flat figures above do not reveal which is in force.
+     * Flat-only is called out as a warning, not silence: across a 150-name universe whose lots
+     * span ~1000x it is the configuration that traded only the largest lots.
+     */
+    if (lotRelativeThresholdsEnabled(this.cfg)) {
+      console.log(
+        `[Box] thresholds are LOT-RELATIVE — effective = max(flat, rate x lotSize) per candidate: ` +
+          `net ₹${this.cfg.minExpectedNetProfitPerUnit}/unit, ` +
+          `prefilter ₹${this.cfg.minGrossEdgePerUnit}/unit, ` +
+          `safety ₹${this.cfg.safetyBufferPerUnit}/unit, ` +
+          `entry slip ₹${this.cfg.expectedEntrySlippagePerUnit}/unit, ` +
+          `exit slip ₹${this.cfg.expectedExitSlippagePerUnit}/unit, ` +
+          `exit floor ₹${this.cfg.minExitNetPnlPerUnit}/unit.`,
+      );
+    } else {
+      console.warn(
+        `[Box] thresholds are FLAT RUPEES with no per-unit rates. Gross edge scales with lot size ` +
+          `but these gates do not, so the effective hurdle is ₹${requiredNetProfit(this.cfg)}/lotSize ` +
+          `per unit — far stricter on small lots than on large ones. Across a mixed universe that ` +
+          `concentrates every entry in the largest-lot names. Set BOX_MIN_EXPECTED_NET_PROFIT_PER_UNIT ` +
+          `(and the matching slippage rates) to apply one consistent per-unit policy.`,
+      );
+    }
     if (coherenceWarning !== null) console.warn(coherenceWarning);
     } catch (error) {
       // A failed live boot must be retryable after Mongo/session recovery.
@@ -7154,12 +7180,32 @@ export class BoxEngine {
 
   getConfig() {
     return {
-      /** THE ENTRY GATE — minimum expected NET profit (₹) after every cost. */
+      /**
+       * THE ENTRY GATE — minimum expected NET profit (₹) after every cost.
+       *
+       * The ABSOLUTE FLOOR. When a per-unit rate is set the figure a candidate is actually judged
+       * against is `max(this, rate x lotSize)`, so this alone does not describe the policy — read
+       * it together with `min_expected_net_profit_per_unit` and `lot_relative_thresholds`.
+       */
       min_expected_net_profit: requiredNetProfit(this.cfg),
       /** A cheap gross prefilter (₹), never the decision. */
       min_gross_edge: this.cfg.minGrossEdge,
       /** Legacy extra net floor; 0 means it does not raise the gate. */
       min_net_edge: this.cfg.minNetEdge,
+      /*
+       * PER-UNIT RATES (₹ per unit of quantity). 0 = inactive, i.e. the flat figure stands alone.
+       *
+       * Published so an operator can tell the two regimes apart without reading env: flat-only
+       * means the effective hurdle is `flat / lotSize` per unit, which differs ~1000x across an
+       * F&O universe and concentrates entries in the largest-lot names.
+       */
+      lot_relative_thresholds: lotRelativeThresholdsEnabled(this.cfg),
+      min_expected_net_profit_per_unit: this.cfg.minExpectedNetProfitPerUnit,
+      min_gross_edge_per_unit: this.cfg.minGrossEdgePerUnit,
+      safety_buffer_per_unit: this.cfg.safetyBufferPerUnit,
+      expected_entry_slippage_per_unit: this.cfg.expectedEntrySlippagePerUnit,
+      expected_exit_slippage_per_unit: this.cfg.expectedExitSlippagePerUnit,
+      min_exit_net_pnl_per_unit: this.cfg.minExitNetPnlPerUnit,
       /** Execution model and its simulated delays. */
       execution_mode: this.cfg.executionMode,
       simulated_decision_ms: this.cfg.simulatedDecisionMs,

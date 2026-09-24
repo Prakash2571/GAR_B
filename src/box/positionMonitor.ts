@@ -23,6 +23,7 @@
  */
 
 import type { BoxConfig } from "./config.js";
+import { exitSlippageAllowanceForLot } from "./config.js";
 import { NSE_SESSION_CLOSE_MINUTES } from "../marketCalendar.js";
 import type { BoxExecutionGateway } from "./executionGateway.js";
 import type { BoxMetrics } from "./metrics.js";
@@ -353,8 +354,10 @@ export class BoxPositionMonitor {
       entryEdge: pos.entry_gross_edge,
       // PRE-EXECUTION: judge the profit floor on realisable net (touch net minus
       // the expected exit-slippage allowance) so a marginal touch does not trigger
-      // an exit that would not realistically net enough.
-      executionCost: this.deps.cfg.expectedExitSlippage,
+      // an exit that would not realistically net enough. Lot-resolved, because the
+      // unwind cost is ticks x QUANTITY — a flat figure understates it by ~99% on a
+      // large-lot single stock, which is the direction that invents profit.
+      executionCost: exitSlippageAllowanceForLot(this.deps.cfg, pos.lot_size),
       useRealisableForFloor: this.deps.cfg.exitUseRealisableNet,
       openedAt: pos.opened_at,
       expirySafety: this.isInExpirySafetyWindow(pos),
@@ -384,7 +387,7 @@ export class BoxPositionMonitor {
       estimatedRemainingExitCharges: exitChargesTotalOverride !== undefined
         ? exitChargesTotalOverride
         : this.remainingExitChargesEstimate(pos, legs),
-      executionCost: this.deps.cfg.expectedExitSlippage,
+      executionCost: exitSlippageAllowanceForLot(this.deps.cfg, pos.lot_size),
     });
 
     return {
@@ -1315,7 +1318,7 @@ export class BoxPositionMonitor {
         now: Date.now(),
         direction: pos.direction ?? "LONG_BOX",
         entryEdge: pos.entry_gross_edge,
-        executionCost: this.deps.cfg.expectedExitSlippage,
+        executionCost: exitSlippageAllowanceForLot(this.deps.cfg, pos.lot_size),
         openedAt: pos.opened_at,
         expirySafety: this.isInExpirySafetyWindow(pos),
         cfg: this.deps.cfg,

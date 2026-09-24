@@ -226,6 +226,18 @@ const KNOBS: readonly KnobSpec[] = [
   // ---- Entry gate economics ----
   { key: "minExpectedNetProfit", envVar: "BOX_MIN_EXPECTED_NET_PROFIT", kind: "number", default: 1_200 },
   { key: "safetyBuffer", envVar: "BOX_SAFETY_BUFFER", kind: "number", default: 150 },
+
+  // ---- Entry gate economics, PER UNIT of quantity ----
+  // All default 0, which resolves every threshold back to its flat figure. Published here because
+  // the flat figures alone do not reveal which regime is in force, and the two screen a wide
+  // universe completely differently: flat-only means the effective hurdle is `flat / lotSize` per
+  // unit, which varies ~1000x across F&O and concentrates entries in the largest-lot names.
+  { key: "minExpectedNetProfitPerUnit", envVar: "BOX_MIN_EXPECTED_NET_PROFIT_PER_UNIT", kind: "number", default: 0 },
+  { key: "minGrossEdgePerUnit", envVar: "MIN_BOX_GROSS_EDGE_PER_UNIT", kind: "number", default: 0 },
+  { key: "safetyBufferPerUnit", envVar: "BOX_SAFETY_BUFFER_PER_UNIT", kind: "number", default: 0 },
+  { key: "expectedEntrySlippagePerUnit", envVar: "BOX_EXPECTED_ENTRY_SLIPPAGE_PER_UNIT", kind: "number", default: 0 },
+  { key: "expectedExitSlippagePerUnit", envVar: "BOX_EXPECTED_EXIT_SLIPPAGE_PER_UNIT", kind: "number", default: 0 },
+  { key: "minExitNetPnlPerUnit", envVar: "BOX_MIN_EXIT_NET_PNL_PER_UNIT", kind: "number", default: 0 },
 ] as const;
 
 const BOOL_TRUE = new Set(["1", "true", "yes"]);
